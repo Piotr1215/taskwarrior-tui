@@ -21,6 +21,9 @@ test: ## Run all tests
 test-repo: ## Run repo-specific tests
 	cargo test test_repo
 
+test-quick: ## Run tests excluding the failing UI test
+	cargo test -- --skip test_taskwarrior_tui
+
 test-verbose: ## Run tests with output
 	cargo test -- --nocapture
 
