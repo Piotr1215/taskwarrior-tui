@@ -3624,6 +3624,7 @@ impl TaskwarriorTui {
         "project:".to_string(),
         "priority:".to_string(),
         "due:".to_string(),
+        "repo:".to_string(),
         "scheduled:".to_string(),
         "wait:".to_string(),
         "depends:".to_string(),
@@ -3714,6 +3715,26 @@ impl TaskwarriorTui {
       for task in tasks {
         if let Some(date) = task.end() {
           self.completion_list.insert(("end".to_string(), get_formatted_datetime(date)));
+        }
+      }
+      // Add repo autocomplete from /home/decoder/loft directory
+      if let Ok(entries) = fs::read_dir("/home/decoder/loft") {
+        for entry in entries.flatten() {
+          if let Ok(metadata) = entry.metadata() {
+            if metadata.is_dir() {
+              if let Some(dir_name) = entry.file_name().to_str() {
+                // Skip hidden directories
+                if !dir_name.starts_with('.') {
+                  let r = if dir_name.contains(' ') {
+                    format!(r#""{}""#, dir_name)
+                  } else {
+                    dir_name.to_string()
+                  };
+                  self.completion_list.insert(("repo".to_string(), r));
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -4895,5 +4916,66 @@ mod tests {
       })
       .unwrap();
     println!("{}", buffer_view(terminal.backend().buffer()));
+  }
+
+  #[tokio::test]
+  async fn test_repo_completion_from_loft_directory() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+
+    // Set up the app in Add mode
+    app.handle_input(KeyCode::Char('a')).await.unwrap(); // Enter Add mode
+
+    // Type the test input
+    let input = "test task repo:";
+    for c in input.chars() {
+      app.handle_input(KeyCode::Char(c)).await.unwrap();
+    }
+
+    // Update completion list which should read from /home/decoder/loft
+    app.update_completion_list();
+
+    // Check that repo completions are populated
+    let has_repo_completions = app.completion_list.helper.candidates
+      .iter()
+      .any(|(context, _)| context == "repo");
+
+    assert!(has_repo_completions, "Should have repo completions");
+
+    // Check for some expected repositories from /home/decoder/loft
+    let expected_repos = vec!["loft-prod", "vcluster", "admin-apis"];
+    let completion_values: Vec<String> = app.completion_list.helper.candidates
+      .iter()
+      .filter(|(context, _)| context == "repo")
+      .map(|(_, value)| value.clone())
+      .collect();
+
+    for expected_repo in expected_repos {
+      assert!(
+        completion_values.iter().any(|v| v == expected_repo),
+        "Should have {} in repo completions, found: {:?}",
+        expected_repo,
+        completion_values
+      );
+    }
+
+    // Ensure hidden directories (starting with .) are not included
+    assert!(
+      !completion_values.iter().any(|v| v.starts_with('.')),
+      "Should not include hidden directories in completions"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_repo_attribute_in_completion_list() {
+    // Test that "repo:" is added to the attribute list for autocompletion
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.mode = Mode::Tasks(Action::Add);
+    app.update_completion_list();
+
+    let has_repo_attribute = app.completion_list.helper.candidates
+      .iter()
+      .any(|(context, value)| context == "attribute" && value == "repo:");
+
+    assert!(has_repo_attribute, "Should have 'repo:' in attribute completions");
   }
 }
