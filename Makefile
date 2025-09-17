@@ -34,7 +34,7 @@ clippy: ## Run clippy lints
 	cargo clippy -- -D warnings
 
 install: release ## Install the binary locally
-	cargo install --path . --locked
+	cargo install --path . --locked --force
 
 clean: ## Clean build artifacts
 	cargo clean
