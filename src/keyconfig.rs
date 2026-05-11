@@ -1,6 +1,6 @@
 use std::{collections::HashSet, error::Error, hash::Hash};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +33,9 @@ pub struct KeyConfig {
   pub help: KeyCode,
   pub filter: KeyCode,
   pub zoom: KeyCode,
+  pub transpose: KeyCode,
   pub context_menu: KeyCode,
+  pub report_menu: KeyCode,
   pub next_tab: KeyCode,
   pub previous_tab: KeyCode,
   pub priority_h: KeyCode,
@@ -80,7 +82,9 @@ impl Default for KeyConfig {
       help: KeyCode::Char('?'),
       filter: KeyCode::Char('/'),
       zoom: KeyCode::Char('z'),
+      transpose: KeyCode::Char('\\'),
       context_menu: KeyCode::Char('c'),
+      report_menu: KeyCode::Char('R'),
       next_tab: KeyCode::Char(']'),
       previous_tab: KeyCode::Char('['),
       priority_h: KeyCode::Char('H'),
@@ -133,7 +137,9 @@ impl KeyConfig {
     let annotate = Self::get_config("uda.taskwarrior-tui.keyconfig.annotate", data);
     let filter = Self::get_config("uda.taskwarrior-tui.keyconfig.filter", data);
     let zoom = Self::get_config("uda.taskwarrior-tui.keyconfig.zoom", data);
+    let transpose = Self::get_config("uda.taskwarrior-tui.keyconfig.transpose", data);
     let context_menu = Self::get_config("uda.taskwarrior-tui.keyconfig.context-menu", data);
+    let report_menu = Self::get_config("uda.taskwarrior-tui.keyconfig.report-menu", data);
     let next_tab = Self::get_config("uda.taskwarrior-tui.keyconfig.next-tab", data);
     let previous_tab = Self::get_config("uda.taskwarrior-tui.keyconfig.previous-tab", data);
     let shortcut0 = Self::get_config("uda.taskwarrior-tui.keyconfig.shortcut0", data);
@@ -163,7 +169,7 @@ impl KeyConfig {
     self.select_all = select_all.unwrap_or(self.select_all);
     self.undo = undo.unwrap_or(self.undo);
     self.edit = edit.unwrap_or(self.edit);
-    self.duplicate = edit.unwrap_or(self.duplicate);
+    self.duplicate = duplicate.unwrap_or(self.duplicate);
     self.modify = modify.unwrap_or(self.modify);
     self.shell = shell.unwrap_or(self.shell);
     self.log = log.unwrap_or(self.log);
@@ -171,7 +177,9 @@ impl KeyConfig {
     self.annotate = annotate.unwrap_or(self.annotate);
     self.filter = filter.unwrap_or(self.filter);
     self.zoom = zoom.unwrap_or(self.zoom);
+    self.transpose = transpose.unwrap_or(self.transpose);
     self.context_menu = context_menu.unwrap_or(self.context_menu);
+    self.report_menu = report_menu.unwrap_or(self.report_menu);
     self.next_tab = next_tab.unwrap_or(self.next_tab);
     self.previous_tab = previous_tab.unwrap_or(self.previous_tab);
     self.shortcut0 = shortcut0.unwrap_or(self.shortcut0);
@@ -215,7 +223,9 @@ impl KeyConfig {
       &self.help,
       &self.filter,
       &self.zoom,
+      &self.transpose,
       &self.context_menu,
+      &self.report_menu,
       &self.next_tab,
       &self.previous_tab,
     ];

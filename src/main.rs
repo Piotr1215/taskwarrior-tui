@@ -9,6 +9,7 @@ mod calendar;
 mod cli;
 mod completion;
 mod config;
+mod datetime;
 mod event;
 mod help;
 mod history;
@@ -33,19 +34,19 @@ use anyhow::Result;
 use app::{Mode, TaskwarriorTui};
 use crossterm::{
   cursor,
-  event::{DisableMouseCapture, EnableMouseCapture, EventStream},
+  event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture, EventStream},
   execute,
-  terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+  terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{debug, error, info, log_enabled, trace, warn, Level, LevelFilter};
+use log::{Level, LevelFilter, debug, error, info, log_enabled, trace, warn};
 use log4rs::{
   append::file::FileAppender,
   config::{Appender, Config, Logger, Root},
   encode::pattern::PatternEncoder,
 };
 use path_clean::PathClean;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{action::Action, event::Event, keyconfig::KeyConfig};
 
@@ -53,7 +54,7 @@ const LOG_PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)} | {l} | {f}:{L} | {m}{n}";
 
 pub fn destruct_terminal() {
   disable_raw_mode().unwrap();
-  execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).unwrap();
+  execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste).unwrap();
   execute!(io::stdout(), cursor::Show).unwrap();
 }
 
@@ -104,6 +105,21 @@ pub fn absolute_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
   Ok(absolute_path)
 }
 
+fn set_env_path_if_unset(key: &str, value: &str, path_name: &str) {
+  if env::var_os(key).is_none() {
+    let absolute_path = absolute_path(PathBuf::from(value)).unwrap_or_else(|_| panic!("Unable to get path for {path_name}"));
+
+    // SAFETY: this runs in `main` before the Tokio runtime is created and before
+    // any threads are spawned, so there is no concurrent access to the process
+    // environment while mutating it.
+    unsafe {
+      env::set_var(key, absolute_path);
+    }
+  } else {
+    warn!("{key} environment variable cannot be set.")
+  }
+}
+
 async fn tui_main(report: &str) -> Result<()> {
   panic::set_hook(Box::new(|panic_info| {
     destruct_terminal();
@@ -134,45 +150,19 @@ fn main() -> Result<()> {
   let report = matches.get_one::<String>("report").unwrap_or(&binding);
 
   if let Some(e) = config {
-    if env::var("TASKWARRIOR_TUI_CONFIG").is_err() {
-      // if environment variable is not set, this env::var returns an error
-      env::set_var(
-        "TASKWARRIOR_TUI_CONFIG",
-        absolute_path(PathBuf::from(e)).expect("Unable to get path for config"),
-      )
-    } else {
-      warn!("TASKWARRIOR_TUI_CONFIG environment variable cannot be set.")
-    }
+    set_env_path_if_unset("TASKWARRIOR_TUI_CONFIG", e, "config");
   }
 
   if let Some(e) = data {
-    if env::var("TASKWARRIOR_TUI_DATA").is_err() {
-      // if environment variable is not set, this env::var returns an error
-      env::set_var(
-        "TASKWARRIOR_TUI_DATA",
-        absolute_path(PathBuf::from(e)).expect("Unable to get path for data"),
-      )
-    } else {
-      warn!("TASKWARRIOR_TUI_DATA environment variable cannot be set.")
-    }
+    set_env_path_if_unset("TASKWARRIOR_TUI_DATA", e, "data");
   }
 
   if let Some(e) = taskrc {
-    if env::var("TASKRC").is_err() {
-      // if environment variable is not set, this env::var returns an error
-      env::set_var("TASKRC", absolute_path(PathBuf::from(e)).expect("Unable to get path for taskrc"))
-    } else {
-      warn!("TASKRC environment variable cannot be set.")
-    }
+    set_env_path_if_unset("TASKRC", e, "taskrc");
   }
 
   if let Some(e) = taskdata {
-    if env::var("TASKDATA").is_err() {
-      // if environment variable is not set, this env::var returns an error
-      env::set_var("TASKDATA", absolute_path(PathBuf::from(e)).expect("Unable to get path for taskdata"))
-    } else {
-      warn!("TASKDATA environment variable cannot be set.")
-    }
+    set_env_path_if_unset("TASKDATA", e, "taskdata");
   }
 
   initialize_logging();
@@ -186,7 +176,10 @@ fn main() -> Result<()> {
     .build()?
     .block_on(async { tui_main(report).await });
   if let Err(err) = r {
-    eprintln!("\x1b[0;31m[taskwarrior-tui error]\x1b[0m: {}\n\nIf you need additional help, please report as a github issue on https://github.com/kdheepak/taskwarrior-tui", err);
+    eprintln!(
+      "\x1b[0;31m[taskwarrior-tui error]\x1b[0m: {}\n\nIf you need additional help, please report as a github issue on https://github.com/kdheepak/taskwarrior-tui",
+      err
+    );
     std::process::exit(1);
   }
   Ok(())

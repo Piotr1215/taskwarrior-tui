@@ -4,9 +4,8 @@ use std::{
   iter::{self, Iterator},
 };
 
-use cassowary::{
-  strength::{MEDIUM, REQUIRED, WEAK},
-  Expression, Solver,
+use kasuari::{
+  Expression, Solver, Strength, Variable,
   WeightedRelation::{EQ, GE, LE},
 };
 use ratatui::{
@@ -17,6 +16,10 @@ use ratatui::{
 };
 use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
+
+const MEDIUM: Strength = Strength::MEDIUM;
+const REQUIRED: Strength = Strength::REQUIRED;
+const WEAK: Strength = Strength::WEAK;
 
 #[derive(Debug, Clone)]
 pub enum TableMode {
@@ -80,14 +83,14 @@ impl TaskwarriorTuiTableState {
   }
 
   pub fn toggle_mark(&mut self, index: Option<usize>) {
-    if let Some(i) = index {
-      if !self.marked.insert(i) {
-        self.marked.remove(&i);
-      }
+    if let Some(i) = index
+      && !self.marked.insert(i)
+    {
+      self.marked.remove(&i);
     }
   }
 
-  pub fn marked(&self) -> std::collections::hash_set::Iter<usize> {
+  pub fn marked(&'_ self) -> std::collections::hash_set::Iter<'_, usize> {
     self.marked.iter()
   }
 
@@ -325,7 +328,7 @@ where
     let mut ccs = Vec::new();
     let mut variables = Vec::new();
     for i in 0..self.widths.len() {
-      let var = cassowary::Variable::new();
+      let var = Variable::new();
       variables.push(var);
       var_indices.insert(var, i);
     }
@@ -347,7 +350,7 @@ where
           | f64::from(area.width - 2 - (self.column_spacing * (variables.len() as u16 - 1))),
       )
       .unwrap();
-    solver.add_constraints(&ccs).unwrap();
+    solver.add_constraints(ccs).unwrap();
     let mut solved_widths = vec![0; variables.len()];
     for &(var, value) in solver.fetch_changes() {
       let index = var_indices[&var];

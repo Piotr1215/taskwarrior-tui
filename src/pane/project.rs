@@ -1,6 +1,6 @@
 use std::fmt;
 
-use anyhow::{anyhow, Context as AnyhowContext, Result};
+use anyhow::{Context as AnyhowContext, Result, anyhow};
 
 const COL_WIDTH: usize = 21;
 const PROJECT_HEADER: &str = "Name";
@@ -115,10 +115,10 @@ impl ProjectsState {
     words.len() == 2 && words[0].chars().all(|c| c.is_numeric()) && (words[1] == "project" || words[1] == "projects")
   }
 
-  pub fn update_data(&mut self) -> Result<()> {
+  pub fn update_data(&mut self, task_exe: &str) -> Result<()> {
     self.list.clear();
     self.rows.clear();
-    let output = Command::new("task")
+    let output = Command::new(task_exe)
       .arg("summary")
       .output()
       .context("Unable to run `task summary`")

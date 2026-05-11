@@ -1,8 +1,8 @@
 % taskwarrior-tui(1)
 
 <!-- This is the taskwarrior-tui(1) man page, written in Markdown. -->
-<!-- To generate the roff version, run `just man`, -->
-<!-- and the man page will appear in the ‘target’ directory. -->
+<!-- To generate the roff version, run `mise run taskwarrior-tui:man`, -->
+<!-- and the man page will be written to `packaging/man/taskwarrior-tui.1`. -->
 
 
 NAME
@@ -128,6 +128,9 @@ Ctrl-y
 `c`
 : context switcher menu             - Open context switcher menu
 
+`R`
+: report switcher menu              - Open report switcher menu
+
 `?`
 : help                              - Help menu
 
@@ -195,6 +198,15 @@ Keybindings for context switcher:
 : {selected-=1}                     - Move back a context
 
 
+Keybindings for report switcher:
+
+`j`
+: {selected+=1}                     - Move forward a report
+
+`k`
+: {selected-=1}                     - Move back a report
+
+
 Keybindings for calendar:
 
 `j`
@@ -209,6 +221,14 @@ Keybindings for calendar:
 `K`
 : {selected-=10}                    - Move back a decade in calendar
 
+ENVIRONMENT
+===========
+
+`TASKWARRIOR_TUI_TASKWARRIOR_CLI`
+: Path to the `task` executable. Defaults to `task` (resolved via `PATH`).
+  Set this to use a non-standard installation of Taskwarrior, e.g.
+  `TASKWARRIOR_TUI_TASKWARRIOR_CLI=/usr/local/bin/task taskwarrior-tui`.
+
 EXIT STATUSES
 =============
 
@@ -219,7 +239,7 @@ EXIT STATUSES
 AUTHOR
 ======
 
-`taskwarrior-tui` is maintained by Dheepak ‘kdheepak’ Krishnamurthy and other contributors.
+`taskwarrior-tui` is maintained by Dheepak 'kdheepak' Krishnamurthy and other contributors.
 
 **Source code:** `https://github.com/kdheepak/taskwarrior-tui/` \
 **Contributors:** `https://github.com/kdheepak/taskwarrior-tui/graphs/contributors`

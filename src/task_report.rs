@@ -1,26 +1,24 @@
 use std::{error::Error, process::Command};
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{Datelike, Local, NaiveDateTime};
 use itertools::join;
 use task_hookrs::{task::Task, uda::UDAValue};
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
+use crate::{datetime, utils};
+
 pub fn format_date_time(dt: NaiveDateTime) -> String {
-  let dt = Local.from_local_datetime(&dt).unwrap();
-  dt.format("%Y-%m-%d %H:%M:%S").to_string()
+  datetime::format_local_date_time(&dt)
 }
 
-pub fn format_date(dt: NaiveDateTime) -> String {
-  let offset = Local.offset_from_utc_datetime(&dt);
-  let dt = DateTime::<Local>::from_naive_utc_and_offset(dt, offset);
-  dt.format("%Y-%m-%d").to_string()
+pub fn format_date(dt: NaiveDateTime, format: Option<String>) -> String {
+  let format_str = format.unwrap_or("%Y-%m-%d".to_string());
+  datetime::format_local_date(&dt, &format_str)
 }
 
 pub fn vague_format_date_time(from_dt: NaiveDateTime, to_dt: NaiveDateTime, with_remainder: bool) -> String {
-  let to_dt = Local.from_local_datetime(&to_dt).unwrap();
-  let from_dt = Local.from_local_datetime(&from_dt).unwrap();
   let mut seconds = (to_dt - from_dt).num_seconds();
   let minus = if seconds < 0 {
     seconds *= -1;
@@ -29,7 +27,7 @@ pub fn vague_format_date_time(from_dt: NaiveDateTime, to_dt: NaiveDateTime, with
     ""
   };
 
-  const YEAR: i64 =  60 * 60 * 24 * 365;
+  const YEAR: i64 = 60 * 60 * 24 * 365;
   const MONTH: i64 = 60 * 60 * 24 * 30;
   const WEEK: i64 = 60 * 60 * 24 * 7;
   const DAY: i64 = 60 * 60 * 24;
@@ -81,6 +79,36 @@ pub fn vague_format_date_time(from_dt: NaiveDateTime, to_dt: NaiveDateTime, with
   format!("{}{}s", minus, seconds)
 }
 
+fn taskwarrior_to_chrono(fmt: &str) -> String {
+  fmt
+    .chars()
+    .map(|c| match c {
+      'Y' => "%Y".to_string(),  // four-digit year
+      'y' => "%y".to_string(),  // two-digit year
+      'M' => "%m".to_string(),  // two-digit month
+      'm' => "%-m".to_string(), // minimal digit month
+      'D' => "%d".to_string(),  // two-digit day
+      'd' => "%-d".to_string(), // minimal-digit day
+      'A' => "%A".to_string(),  // short name of weekday
+      'a' => "%a".to_string(),  // long name of weekday
+      'B' => "%B".to_string(),  // long name of month
+      'b' => "%b".to_string(),  // short name of month
+      'V' => "%V".to_string(),  // two-digit week
+      'v' => "%-V".to_string(), // minimal-digit week
+      'J' => "%j".to_string(),  // three-digit Julian day (e.g. 023 or 365)
+      'j' => "%-j".to_string(), // Julian day (e.g. 23 or 365)
+      'H' => "%H".to_string(),  // two-digit hour
+      'h' => "%-H".to_string(), // minimal-digit hour
+      'N' => "%M".to_string(),  // two-digit minutes
+      'n' => "%-M".to_string(), // minimal-digit minutes
+      'S' => "%S".to_string(),  // two-digit seconds
+      's' => "%-S".to_string(), // minimal-digit seconds
+      'w' => "%u".to_string(),  // week day (e.g. 0 for Monday, 5 for Friday)
+      other => other.to_string(),
+    })
+    .collect()
+}
+
 pub struct TaskReportTable {
   pub labels: Vec<String>,
   pub columns: Vec<String>,
@@ -88,10 +116,11 @@ pub struct TaskReportTable {
   pub virtual_tags: Vec<String>,
   pub description_width: usize,
   pub date_time_vague_precise: bool,
+  pub date_format: String,
 }
 
 impl TaskReportTable {
-  pub fn new(data: &str, report: &str) -> Result<Self> {
+  pub fn new(data: &str, report: &str, task_exe: &str) -> Result<Self> {
     let virtual_tags = vec![
       "PROJECT",
       "BLOCKED",
@@ -135,19 +164,20 @@ impl TaskReportTable {
       virtual_tags: virtual_tags.iter().map(ToString::to_string).collect::<Vec<_>>(),
       description_width: 100,
       date_time_vague_precise: false,
+      date_format: "%Y-%m-%d".to_string(),
     };
-    task_report_table.export_headers(Some(data), report)?;
+    task_report_table.export_headers(Some(data), report, task_exe)?;
     Ok(task_report_table)
   }
 
-  pub fn export_headers(&mut self, data: Option<&str>, report: &str) -> Result<()> {
+  pub fn export_headers(&mut self, data: Option<&str>, report: &str, task_exe: &str) -> Result<()> {
     self.columns = vec![];
     self.labels = vec![];
 
     let data = if let Some(s) = data {
       s.to_string()
     } else {
-      let output = Command::new("task")
+      let output = Command::new(task_exe)
         .arg("show")
         .arg("rc.defaultwidth=0")
         .arg(format!("report.{}.columns", report))
@@ -164,7 +194,7 @@ impl TaskReportTable {
       }
     }
 
-    let output = Command::new("task")
+    let output = Command::new(task_exe)
       .arg("show")
       .arg("rc.defaultwidth=0")
       .arg(format!("report.{}.labels", report))
@@ -177,6 +207,20 @@ impl TaskReportTable {
         for label in label_names.split(',') {
           self.labels.push(label.to_string());
         }
+      }
+    }
+
+    let output = Command::new(task_exe)
+      .arg("show")
+      .arg("rc.defaultwidth=0")
+      .arg(format!("report.{}.dateformat", report))
+      .output()?;
+    let data = String::from_utf8_lossy(&output.stdout);
+
+    for line in data.split('\n') {
+      if line.starts_with(format!("report.{}.dateformat", report).as_str()) {
+        let taskwarrior_dateformat = line.split_once(' ').unwrap().1;
+        self.date_format = taskwarrior_to_chrono(taskwarrior_dateformat.trim());
       }
     }
 
@@ -196,7 +240,13 @@ impl TaskReportTable {
     }
     let num_labels = self.labels.len();
     let num_columns = self.columns.len();
-    assert!(num_labels == num_columns, "Must have the same number of labels (currently {}) and columns (currently {}). Compare their values as shown by \"task show report.{}.\" and fix your taskwarrior config.", num_labels, num_columns, report);
+    assert!(
+      num_labels == num_columns,
+      "Must have the same number of labels (currently {}) and columns (currently {}). Compare their values as shown by \"task show report.{}.\" and fix your taskwarrior config.",
+      num_labels,
+      num_columns,
+      report
+    );
 
     Ok(())
   }
@@ -258,7 +308,9 @@ impl TaskReportTable {
   }
 
   pub fn get_string_attribute(&self, attribute: &str, task: &Task, tasks: &[Task]) -> String {
-    match attribute {
+    let description = utils::display_control_chars(task.description());
+
+    let value = match attribute {
       "id" => task.id().unwrap_or_default().to_string(),
       "scheduled.relative" => match task.scheduled() {
         Some(v) => vague_format_date_time(
@@ -277,7 +329,7 @@ impl TaskReportTable {
         None => "".to_string(),
       },
       "scheduled" => match task.scheduled() {
-        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time())),
+        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time()), None),
         None => "".to_string(),
       },
       "due.relative" => match task.due() {
@@ -289,7 +341,7 @@ impl TaskReportTable {
         None => "".to_string(),
       },
       "due" => match task.due() {
-        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time())),
+        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time()), Some(self.date_format.clone())),
         None => "".to_string(),
       },
       "until.remaining" => match task.until() {
@@ -301,7 +353,7 @@ impl TaskReportTable {
         None => "".to_string(),
       },
       "until" => match task.until() {
-        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time())),
+        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time()), None),
         None => "".to_string(),
       },
       "entry.age" => vague_format_date_time(
@@ -309,7 +361,7 @@ impl TaskReportTable {
         Local::now().naive_utc(),
         self.date_time_vague_precise,
       ),
-      "entry" => format_date(NaiveDateTime::new(task.entry().date(), task.entry().time())),
+      "entry" => format_date(NaiveDateTime::new(task.entry().date(), task.entry().time()), None),
       "start.age" => match task.start() {
         Some(v) => vague_format_date_time(
           NaiveDateTime::new(v.date(), v.time()),
@@ -319,7 +371,7 @@ impl TaskReportTable {
         None => "".to_string(),
       },
       "start" => match task.start() {
-        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time())),
+        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time()), None),
         None => "".to_string(),
       },
       "end.age" => match task.end() {
@@ -331,7 +383,7 @@ impl TaskReportTable {
         None => "".to_string(),
       },
       "end" => match task.end() {
-        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time())),
+        Some(v) => format_date(NaiveDateTime::new(v.date(), v.time()), None),
         None => "".to_string(),
       },
       "status.short" => task.status().to_string().chars().next().unwrap().to_string(),
@@ -373,11 +425,7 @@ impl TaskReportTable {
       "tags.count" => match task.tags() {
         Some(v) => {
           let t = v.iter().filter(|t| !self.virtual_tags.contains(t)).count();
-          if t == 0 {
-            "".to_string()
-          } else {
-            t.to_string()
-          }
+          if t == 0 { "".to_string() } else { t.to_string() }
         }
         None => "".to_string(),
       },
@@ -411,7 +459,7 @@ impl TaskReportTable {
         } else {
           Default::default()
         };
-        format!("{} {}", task.description(), c)
+        format!("{} {}", description.clone(), c)
       }
       "description.truncated_count" => {
         let c = if let Some(a) = task.annotations() {
@@ -419,29 +467,29 @@ impl TaskReportTable {
         } else {
           Default::default()
         };
-        let d = task.description().to_string();
+        let d = description.to_string();
         let mut available_width = self.description_width;
         if self.description_width >= c.len() {
           available_width = self.description_width - c.len();
         }
         let (d, _) = d.unicode_truncate(available_width);
         let mut d = d.to_string();
-        if d != *task.description() {
+        if d != description {
           d = format!("{}\u{2026}", d);
         }
         format!("{}{}", d, c)
       }
       "description.truncated" => {
-        let d = task.description().to_string();
+        let d = description.to_string();
         let available_width = self.description_width;
         let (d, _) = d.unicode_truncate(available_width);
         let mut d = d.to_string();
-        if d != *task.description() {
+        if d != description {
           d = format!("{}\u{2026}", d);
         }
         d
       }
-      "description.desc" | "description" => task.description().to_string(),
+      "description.desc" | "description" => description.clone(),
       "urgency" => match &task.urgency() {
         Some(f) => format!("{:.2}", *f),
         None => "0.00".to_string(),
@@ -458,6 +506,8 @@ impl TaskReportTable {
           UDAValue::U64(u) => u.to_string(),
         }
       }
-    }
+    };
+
+    utils::display_control_chars(&value)
   }
 }

@@ -6,6 +6,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.12...v0.27.0) - 2026-04-09
+
+### Added
+
+- [**breaking**] auto functionality for task info show ([#743](https://github.com/kdheepak/taskwarrior-tui/pull/743))
+
+### Other
+
+- Add information about quick-tag to documentation ([#746](https://github.com/kdheepak/taskwarrior-tui/pull/746))
+- Update README.md ([#745](https://github.com/kdheepak/taskwarrior-tui/pull/745))
+- Add demo vhs tape ([#742](https://github.com/kdheepak/taskwarrior-tui/pull/742))
+
+## [0.26.12](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.11...v0.26.12) - 2026-04-08
+
+### Added
+
+- scroll task list with mouse wheel ([#738](https://github.com/kdheepak/taskwarrior-tui/pull/738))
+
+## [0.26.11](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.10...v0.26.11) - 2026-04-08
+
+### Added
+
+- add "timesheet" tab ([#728](https://github.com/kdheepak/taskwarrior-tui/pull/728))
+
+### Other
+
+- *(deps)* narrow `tokio`'s featureset; remove unused `tokio-stream` ([#731](https://github.com/kdheepak/taskwarrior-tui/pull/731))
+- *(deps)* `cassowary` -> `kasuari` ([#734](https://github.com/kdheepak/taskwarrior-tui/pull/734))
+- *(deps)* remove unused features; remove unused deps ([#732](https://github.com/kdheepak/taskwarrior-tui/pull/732))
+
+## [0.26.10](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.9...v0.26.10) - 2026-04-02
+
+### Fixed
+
+- Fix calendar crash on small windows ([#727](https://github.com/kdheepak/taskwarrior-tui/pull/727))
+- *(config)* parse color keys with spaces in attribute names ([#726](https://github.com/kdheepak/taskwarrior-tui/pull/726))
+- add auto-select for context and report menus ([#725](https://github.com/kdheepak/taskwarrior-tui/pull/725))
+- make enter select filtered report items when select-on-move ([#722](https://github.com/kdheepak/taskwarrior-tui/pull/722))
+
+## [0.26.9](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.8...v0.26.9) - 2026-04-01
+
+### Added
+
+- add support for `color.keyword` attribute ([#719](https://github.com/kdheepak/taskwarrior-tui/pull/719))
+- add support for bracketed paste and handle paste events ([#716](https://github.com/kdheepak/taskwarrior-tui/pull/716))
+- add caching for task details based on modified date and width ([#707](https://github.com/kdheepak/taskwarrior-tui/pull/707))
+
+### Fixed
+
+- use `due` from config rather than hardcoded 7 days ([#718](https://github.com/kdheepak/taskwarrior-tui/pull/718))
+- color rendering bugs with modifiers ([#709](https://github.com/kdheepak/taskwarrior-tui/pull/709))
+
+### Other
+
+- include taskwarrior-tui specific colors in the docs ([#667](https://github.com/kdheepak/taskwarrior-tui/pull/667))
+- *(deps)* remove `lazy_static` ([#710](https://github.com/kdheepak/taskwarrior-tui/pull/710))
+- *(deps)* bump the cargo-dependencies group with 2 updates ([#714](https://github.com/kdheepak/taskwarrior-tui/pull/714))
+- *(deps)* bump actions/cache from 4 to 5 ([#712](https://github.com/kdheepak/taskwarrior-tui/pull/712))
+- *(deps)* bump actions/download-artifact from 4 to 8 ([#713](https://github.com/kdheepak/taskwarrior-tui/pull/713))
+- *(deps)* bump jdx/mise-action from 3 to 4 ([#711](https://github.com/kdheepak/taskwarrior-tui/pull/711))
+
+## [0.26.8](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.7...v0.26.8) - 2026-03-30
+
+### Added
+
+- add close-on-select options for context and report menus ([#706](https://github.com/kdheepak/taskwarrior-tui/pull/706))
+- implement alternating line colors a la taskwarrior ([#702](https://github.com/kdheepak/taskwarrior-tui/pull/702))
+- set custom `task` executable location using an environment variable ([#696](https://github.com/kdheepak/taskwarrior-tui/pull/696))
+- *(ui)* add ghost text for unique completion result. ([#685](https://github.com/kdheepak/taskwarrior-tui/pull/685))
+- show `tag:` as a completion option for the filter ([#690](https://github.com/kdheepak/taskwarrior-tui/pull/690))
+
+### Fixed
+
+- *(date)* correct local datetime conversion and formatting logic ([#704](https://github.com/kdheepak/taskwarrior-tui/pull/704))
+
+### Other
+
+- *(datetime)* extract and centralize datetime formatting functions ([#705](https://github.com/kdheepak/taskwarrior-tui/pull/705))
+- add troubleshooting guide  ([#701](https://github.com/kdheepak/taskwarrior-tui/pull/701))
+- *(ci)* update concurrency group in docs workflow
+- *(docs)* migrate docs to Astro Starlight ([#699](https://github.com/kdheepak/taskwarrior-tui/pull/699))
+- migrate taskwarrior-tui tasks to toml config ([#698](https://github.com/kdheepak/taskwarrior-tui/pull/698))
+- update to rust 2024 edition ([#695](https://github.com/kdheepak/taskwarrior-tui/pull/695))
+- *(ci)* add i686-pc-windows-msvc target to build matrix ([#694](https://github.com/kdheepak/taskwarrior-tui/pull/694))
+- better locally reproducible mise tasks for testing and development ([#693](https://github.com/kdheepak/taskwarrior-tui/pull/693))
+- add tasks for managing and running test fixture data ([#691](https://github.com/kdheepak/taskwarrior-tui/pull/691))
+- *(ci)* update release-plz workflow to use rust-toolchain action instead of mise ([#689](https://github.com/kdheepak/taskwarrior-tui/pull/689))
+- common tooling for ci and local development using mise ([#687](https://github.com/kdheepak/taskwarrior-tui/pull/687))
+- Add continue-on-error to Homebrew bump step ([#686](https://github.com/kdheepak/taskwarrior-tui/pull/686))
+
+## [0.26.7](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.6...v0.26.7) - 2026-03-24
+
+### Fixed
+
+- perform full redraw after opening external applications ([#683](https://github.com/kdheepak/taskwarrior-tui/pull/683))
+
+## [0.26.6](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.5...v0.26.6) - 2026-01-26
+
+### Fixed
+
+- Apply color.uda.* configuration for all UDAs ([#652](https://github.com/kdheepak/taskwarrior-tui/pull/652))
+
+### Other
+
+- *(deps)* bump clechasseur/rs-cargo from 2 to 4 ([#665](https://github.com/kdheepak/taskwarrior-tui/pull/665))
+- *(deps)* bump unicode-truncate from 2.0.0 to 2.0.1 in the cargo-dependencies group ([#663](https://github.com/kdheepak/taskwarrior-tui/pull/663))
+- *(deps)* bump dawidd6/action-homebrew-bump-formula from 3 to 7 ([#662](https://github.com/kdheepak/taskwarrior-tui/pull/662))
+- *(deps)* bump actions/github-script from 7 to 8 ([#661](https://github.com/kdheepak/taskwarrior-tui/pull/661))
+- *(deps)* bump amannn/action-semantic-pull-request from 5 to 6 ([#660](https://github.com/kdheepak/taskwarrior-tui/pull/660))
+- *(deps)* bump actions/setup-python from 5 to 6 ([#658](https://github.com/kdheepak/taskwarrior-tui/pull/658))
+- *(deps)* bump actions/checkout from 4 to 6 ([#659](https://github.com/kdheepak/taskwarrior-tui/pull/659))
+- *(deps)* bump the cargo-dependencies group across 1 directory with 21 updates ([#657](https://github.com/kdheepak/taskwarrior-tui/pull/657))
+- *(deps)* bump actions/upload-artifact from 4 to 6 ([#576](https://github.com/kdheepak/taskwarrior-tui/pull/576))
+- update ratatui to `0.30.0` ([#655](https://github.com/kdheepak/taskwarrior-tui/pull/655))
+
+## [0.26.5](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.4...v0.26.5) - 2025-12-18
+
+### Added
+
+- add desktop entry under docs ([#650](https://github.com/kdheepak/taskwarrior-tui/pull/650))
+- help screen shows user keybindings ([#645](https://github.com/kdheepak/taskwarrior-tui/pull/645))
+
+### Fixed
+
+- Fixes duplicate key bug when assigning key to `edit` ([#644](https://github.com/kdheepak/taskwarrior-tui/pull/644))
+- README.md typo ([#640](https://github.com/kdheepak/taskwarrior-tui/pull/640))
+
+### Other
+
+- *(setup)* add just recipes for local test data ([#646](https://github.com/kdheepak/taskwarrior-tui/pull/646))
+
 ## [0.26.4](https://github.com/kdheepak/taskwarrior-tui/compare/v0.26.3...v0.26.4) - 2024-11-14
 
 ### Added

@@ -43,10 +43,44 @@ pub struct Uda {
   urgency: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskInfoLocation {
+  #[default]
+  Auto,
+  Bottom,
+  Right,
+}
+
+impl TaskInfoLocation {
+  pub const AUTO_WIDTH_THRESHOLD: u16 = 160;
+
+  fn from_config_value(value: &str) -> Option<Self> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+      Some(Self::Auto)
+    } else if value.eq_ignore_ascii_case("bottom") {
+      Some(Self::Bottom)
+    } else if value.eq_ignore_ascii_case("right") {
+      Some(Self::Right)
+    } else {
+      None
+    }
+  }
+
+  pub fn resolve(self, width: u16) -> Self {
+    match self {
+      Self::Auto if width <= Self::AUTO_WIDTH_THRESHOLD => Self::Bottom,
+      Self::Auto => Self::Right,
+      value => value,
+    }
+  }
+}
+
 #[derive(Debug)]
 pub struct Config {
   pub enabled: bool,
   pub color: HashMap<String, Style>,
+  pub color_keywords: Vec<(String, Style)>,
   pub filter: String,
   pub data_location: String,
   pub obfuscate: bool,
@@ -64,7 +98,8 @@ pub struct Config {
   pub uda_reset_filter_on_esc: bool,
   pub uda_task_detail_prefetch: usize,
   pub uda_task_report_use_all_tasks_for_completion: bool,
-  pub uda_task_report_show_info: bool,
+  pub uda_task_report_use_alternate_style: bool,
+  pub uda_task_report_info_show: bool,
   pub uda_task_report_looping: bool,
   pub uda_task_report_jump_to_task_on_add: bool,
   pub uda_selection_indicator: String,
@@ -83,6 +118,7 @@ pub struct Config {
   pub uda_selection_reverse: bool,
   pub uda_calendar_months_per_row: usize,
   pub uda_style_context_active: Style,
+  pub uda_style_report_menu_active: Style,
   pub uda_style_report_selection: Style,
   pub uda_style_calendar_title: Style,
   pub uda_style_calendar_today: Style,
@@ -90,16 +126,24 @@ pub struct Config {
   pub uda_style_command: Style,
   pub uda_style_report_completion_pane: Style,
   pub uda_style_report_completion_pane_highlight: Style,
+  pub uda_style_title: Style,
+  pub uda_style_title_border: Style,
+  pub uda_style_help_gauge: Style,
+  pub uda_style_command_error: Style,
   pub uda_shortcuts: Vec<String>,
   pub uda_change_focus_rotate: bool,
   pub uda_background_process: String,
   pub uda_background_process_period: usize,
   pub uda_quick_tag_name: String,
+  pub uda_task_report_info_location: TaskInfoLocation,
   pub uda_task_report_prompt_on_undo: bool,
   pub uda_task_report_prompt_on_delete: bool,
   pub uda_task_report_prompt_on_done: bool,
   pub uda_task_report_date_time_vague_more_precise: bool,
   pub uda_context_menu_select_on_move: bool,
+  pub uda_context_menu_close_on_select: bool,
+  pub uda_report_menu_select_on_move: bool,
+  pub uda_report_menu_close_on_select: bool,
   pub uda: Vec<Uda>,
 }
 
@@ -112,6 +156,10 @@ impl Config {
     let print_empty_columns = bool_collection.get("print_empty_columns").copied().unwrap_or(false);
 
     let color = Self::get_color_collection(data);
+    let color_keywords: Vec<(String, Style)> = color
+      .iter()
+      .filter_map(|(key, style)| key.strip_prefix("color.keyword.").map(|kw| (kw.to_string(), *style)))
+      .collect();
     let filter = Self::get_filter(data, report)?;
     let filter = if filter.trim_start().trim_end().is_empty() {
       filter
@@ -133,7 +181,8 @@ impl Config {
     let uda_reset_filter_on_esc = Self::get_uda_reset_filter_on_esc(data);
     let uda_task_detail_prefetch = Self::get_uda_task_detail_prefetch(data);
     let uda_task_report_use_all_tasks_for_completion = Self::get_uda_task_report_use_all_tasks_for_completion(data);
-    let uda_task_report_show_info = Self::get_uda_task_report_show_info(data);
+    let uda_task_report_use_alternate_style = Self::get_uda_task_report_use_alternate_style(data);
+    let uda_task_report_info_show = Self::get_uda_task_report_info_show(data);
     let uda_task_report_looping = Self::get_uda_task_report_looping(data);
     let uda_task_report_jump_to_task_on_add = Self::get_uda_task_report_jump_to_task_on_add(data);
     let uda_selection_indicator = Self::get_uda_selection_indicator(data);
@@ -157,8 +206,13 @@ impl Config {
     let uda_style_navbar = Self::get_uda_style("navbar", data);
     let uda_style_command = Self::get_uda_style("command", data);
     let uda_style_context_active = Self::get_uda_style("context.active", data);
+    let uda_style_report_menu_active = Self::get_uda_style("report-menu.active", data);
     let uda_style_report_completion_pane = Self::get_uda_style("report.completion-pane", data);
     let uda_style_report_completion_pane_highlight = Self::get_uda_style("report.completion-pane-highlight", data);
+    let uda_style_title = Self::get_uda_style("title", data);
+    let uda_style_title_border = Self::get_uda_style("title.border", data);
+    let uda_style_help_gauge = Self::get_uda_style("help.gauge", data);
+    let uda_style_command_error = Self::get_uda_style("command.error", data);
     let uda_shortcuts = Self::get_uda_shortcuts(data);
     let uda_background_process = Self::get_uda_background_process(data);
     let uda_background_process_period = Self::get_uda_background_process_period(data);
@@ -169,20 +223,30 @@ impl Config {
     let uda_style_calendar_today = uda_style_calendar_today.unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD));
     let uda_style_navbar = uda_style_navbar.unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
     let uda_style_command = uda_style_command.unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
-    let uda_style_context_active = uda_style_context_active.unwrap_or_default();
+    let uda_style_context_active = uda_style_context_active.unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD));
+    let uda_style_report_menu_active = uda_style_report_menu_active.unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD));
     let uda_style_report_completion_pane =
       uda_style_report_completion_pane.unwrap_or_else(|| Style::default().fg(Color::Black).bg(Color::Rgb(223, 223, 223)));
     let uda_style_report_completion_pane_highlight = uda_style_report_completion_pane_highlight.unwrap_or(uda_style_report_completion_pane);
+    let uda_style_title = uda_style_title.unwrap_or_else(|| Style::default().fg(Color::LightCyan));
+    let uda_style_title_border = uda_style_title_border.unwrap_or_else(|| Style::default().fg(Color::White));
+    let uda_style_help_gauge = uda_style_help_gauge.unwrap_or_else(|| Style::default().fg(Color::Gray));
+    let uda_style_command_error = uda_style_command_error.unwrap_or_else(|| Style::default().fg(Color::Red));
     let uda_quick_tag_name = Self::get_uda_quick_tag_name(data);
+    let uda_task_report_info_location = Self::get_uda_task_report_info_location(data);
     let uda_task_report_prompt_on_undo = Self::get_uda_task_report_prompt_on_undo(data);
     let uda_task_report_prompt_on_delete = Self::get_uda_task_report_prompt_on_delete(data);
     let uda_task_report_prompt_on_done = Self::get_uda_task_report_prompt_on_done(data);
     let uda_context_menu_select_on_move = Self::get_uda_context_menu_select_on_move(data);
+    let uda_context_menu_close_on_select = Self::get_uda_context_menu_close_on_select(data);
+    let uda_report_menu_select_on_move = Self::get_uda_report_menu_select_on_move(data);
+    let uda_report_menu_close_on_select = Self::get_uda_report_menu_close_on_select(data);
     let uda_task_report_date_time_vague_more_precise = Self::get_uda_task_report_date_time_vague_more_precise(data);
 
     Ok(Self {
       enabled,
       color,
+      color_keywords,
       filter,
       data_location,
       obfuscate,
@@ -201,7 +265,8 @@ impl Config {
       uda_reset_filter_on_esc,
       uda_task_detail_prefetch,
       uda_task_report_use_all_tasks_for_completion,
-      uda_task_report_show_info,
+      uda_task_report_use_alternate_style,
+      uda_task_report_info_show,
       uda_task_report_looping,
       uda_task_report_jump_to_task_on_add,
       uda_selection_indicator,
@@ -218,24 +283,33 @@ impl Config {
       uda_selection_reverse,
       uda_calendar_months_per_row,
       uda_style_report_selection,
-      uda_style_context_active,
+      uda_style_report_scrollbar,
+      uda_style_report_scrollbar_area,
       uda_style_calendar_title,
       uda_style_calendar_today,
       uda_style_navbar,
       uda_style_command,
+      uda_style_context_active,
+      uda_style_report_menu_active,
       uda_style_report_completion_pane,
       uda_style_report_completion_pane_highlight,
-      uda_style_report_scrollbar,
-      uda_style_report_scrollbar_area,
+      uda_style_title,
+      uda_style_title_border,
+      uda_style_help_gauge,
+      uda_style_command_error,
       uda_shortcuts,
       uda_background_process,
       uda_background_process_period,
       uda_quick_tag_name,
+      uda_task_report_info_location,
       uda_task_report_prompt_on_undo,
       uda_task_report_prompt_on_delete,
       uda_task_report_prompt_on_done,
-      uda_task_report_date_time_vague_more_precise,
       uda_context_menu_select_on_move,
+      uda_context_menu_close_on_select,
+      uda_report_menu_select_on_move,
+      uda_report_menu_close_on_select,
+      uda_task_report_date_time_vague_more_precise,
       uda: vec![],
     })
   }
@@ -274,163 +348,203 @@ impl Config {
   fn get_color_collection(data: &str) -> HashMap<String, Style> {
     let mut color_collection = HashMap::new();
     for line in data.split('\n') {
-      if line.starts_with("color.") {
-        let mut i = line.split(' ');
-        let attribute = i.next();
-        let line = i.collect::<Vec<_>>().join(" ");
-        let line = line.trim_start_matches(' ');
-        let tcolor = Self::get_tcolor(line);
-        if let Some(attr) = attribute {
-          color_collection.insert(attr.to_string(), tcolor);
-        };
+      if let Some((attribute, style)) = Self::parse_color_config(line) {
+        color_collection.insert(attribute, style);
       }
     }
     color_collection
   }
 
+  fn parse_color_config(line: &str) -> Option<(String, Style)> {
+    if !line.starts_with("color.") {
+      return None;
+    }
+
+    if let Some(delimiter) = Self::find_color_config_delimiter(line) {
+      let attribute = line[..delimiter].trim_end().to_string();
+      let style = Self::get_tcolor(line[delimiter..].trim_start());
+      return Some((attribute, style));
+    }
+
+    Some((line.trim_end().to_string(), Style::default()))
+  }
+
+  fn find_color_config_delimiter(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+      if bytes[i] == b' ' {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b' ' {
+          i += 1;
+        }
+        // `task show` prints config entries in aligned columns, so the key/value
+        // boundary is usually the first run of 2+ spaces. That lets us keep
+        // single spaces inside color keys such as `color.uda.foo.In Review`.
+        if i - start >= 2 {
+          return Some(start);
+        }
+      } else {
+        i += 1;
+      }
+    }
+
+    for (delimiter, _) in line.match_indices(' ') {
+      // Some inputs may not preserve the padded column gap. In that case, scan
+      // each space and choose the first suffix that parses as a valid
+      // Taskwarrior color expression, treating everything before it as the key.
+      if Self::parse_tcolor(line[delimiter..].trim_start()).is_some() {
+        return Some(delimiter);
+      }
+    }
+
+    None
+  }
+
   pub fn get_tcolor(line: &str) -> Style {
-    let (foreground, background) = line.split_at(line.to_lowercase().find("on ").unwrap_or(line.len()));
-    let (mut foreground, mut background) = (String::from(foreground), String::from(background));
-    background = background.replace("on ", "");
+    Self::parse_tcolor(line).unwrap_or_default()
+  }
+
+  fn parse_tcolor(line: &str) -> Option<Style> {
+    // Normalize spelling variants
+    let line = line.replace("grey", "gray");
+    let line = line.trim();
+
+    // Split on " on " to separate foreground from background.
+    // Also handle the background-only case where the string starts with "on ".
+    // We search case-insensitively but keep the original casing for parsing.
+    let lower = line.to_lowercase();
+    let (fg_raw, bg_raw) = if lower.starts_with("on ") {
+      // Background-only: "on blue", "on bright red", etc.
+      ("", &line[3..])
+    } else if let Some(pos) = lower.find(" on ") {
+      (&line[..pos], &line[pos + 4..])
+    } else {
+      (line, "")
+    };
+
     let mut modifiers = Modifier::empty();
-    if foreground.contains("bright") {
-      foreground = foreground.replace("bright ", "");
-      background = background.replace("bright ", "");
-      background.insert_str(0, "bright ");
-    }
-    foreground = foreground.replace("grey", "gray");
-    background = background.replace("grey", "gray");
-    if foreground.contains("underline") {
-      modifiers |= Modifier::UNDERLINED;
-    }
-    let foreground = foreground.replace("underline ", "");
-    // TODO: use bold, bright boolean flags
-    if foreground.contains("bold") {
+
+    // Parse modifiers from the foreground portion (taskwarrior puts them before "on")
+    if fg_raw.contains("bold") {
       modifiers |= Modifier::BOLD;
     }
-    // let foreground = foreground.replace("bold ", "");
-    if foreground.contains("inverse") {
+    if fg_raw.contains("underline") {
+      modifiers |= Modifier::UNDERLINED;
+    }
+    if fg_raw.contains("inverse") {
       modifiers |= Modifier::REVERSED;
     }
-    let foreground = foreground.replace("inverse ", "");
-    let mut style = Style::default();
-    if let Some(fg) = Self::get_color_foreground(foreground.as_str()) {
-      style = style.fg(fg);
+    if fg_raw.contains("italic") {
+      modifiers |= Modifier::ITALIC;
     }
-    if let Some(bg) = Self::get_color_background(background.as_str()) {
-      style = style.bg(bg);
+    if fg_raw.contains("strikethrough") {
+      modifiers |= Modifier::CROSSED_OUT;
+    }
+
+    // Strip all modifier keywords from the foreground color name.
+    // We split on whitespace and filter out recognized modifiers
+    let modifier_words: &[&str] = &["bold", "underline", "inverse", "italic", "strikethrough"];
+    let fg_color = fg_raw
+      .split_whitespace()
+      .filter(|word| !modifier_words.contains(&word.to_lowercase().as_str()))
+      .collect::<Vec<_>>()
+      .join(" ");
+    let fg_color = fg_color.trim();
+
+    // Strip leading "bright " from background (taskwarrior uses "on bright red")
+    let bg_color = bg_raw.trim_start_matches("bright ").trim();
+    let bg_is_bright = bg_raw.trim_start().starts_with("bright ");
+
+    let mut style = Style::default();
+    if !fg_color.is_empty() {
+      style = style.fg(Self::parse_color(fg_color)?);
+    }
+    if !bg_color.is_empty() {
+      style = style.bg(Self::parse_color_bg(bg_color, bg_is_bright)?);
     }
     style = style.add_modifier(modifiers);
-    style
+    Some(style)
   }
 
-  fn get_color_foreground(s: &str) -> Option<Color> {
-    let s = s.trim_start();
-    let s = s.trim_end();
-    if s.contains("color") {
-      let c = s.trim_start_matches("color").parse::<u8>().unwrap_or_default();
-      Some(Color::Indexed(c))
-    } else if s.contains("gray") {
-      let c = 232 + s.trim_start_matches("gray").parse::<u8>().unwrap_or_default();
-      Some(Color::Indexed(c))
-    } else if s.contains("rgb") {
-      let red = (s.as_bytes()[3] as char).to_digit(10).unwrap_or_default() as u8;
-      let green = (s.as_bytes()[4] as char).to_digit(10).unwrap_or_default() as u8;
-      let blue = (s.as_bytes()[5] as char).to_digit(10).unwrap_or_default() as u8;
-      let c = 16 + red * 36 + green * 6 + blue;
-      Some(Color::Indexed(c))
-    } else if s == "bold black" {
-      Some(Color::Indexed(8))
-    } else if s == "bold red" {
-      Some(Color::Indexed(9))
-    } else if s == "bold green" {
-      Some(Color::Indexed(10))
-    } else if s == "bold yellow" {
-      Some(Color::Indexed(11))
-    } else if s == "bold blue" {
-      Some(Color::Indexed(12))
-    } else if s == "bold magenta" {
-      Some(Color::Indexed(13))
-    } else if s == "bold cyan" {
-      Some(Color::Indexed(14))
-    } else if s == "bold white" {
-      Some(Color::Indexed(15))
-    } else if s == "black" {
-      Some(Color::Indexed(0))
-    } else if s == "red" {
-      Some(Color::Indexed(1))
-    } else if s == "green" {
-      Some(Color::Indexed(2))
-    } else if s == "yellow" {
-      Some(Color::Indexed(3))
-    } else if s == "blue" {
-      Some(Color::Indexed(4))
-    } else if s == "magenta" {
-      Some(Color::Indexed(5))
-    } else if s == "cyan" {
-      Some(Color::Indexed(6))
-    } else if s == "white" {
-      Some(Color::Indexed(7))
-    } else {
-      None
+  /// Parse a color name into a ratatui Color.
+  ///
+  /// Supports all Taskwarrior color formats:
+  /// - Named 16-color: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`
+  /// - High-intensity variants: `bright <name>` or `bold <name>` -> indices 8-15
+  /// - 256-color indexed: `color0` through `color255`
+  /// - Grayscale ramp: `gray0` through `gray23` (also `grey` spelling)
+  /// - RGB color cube: `rgb000` through `rgb555` (6x6x6)
+  fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    if s.is_empty() {
+      return None;
     }
+
+    // High-intensity named colors: "bright <name>" or "bold <name>"
+    let base = if let Some(rest) = s.strip_prefix("bright ") {
+      let idx = Self::named_color_index(rest.trim())?;
+      return Some(Color::Indexed(idx + 8));
+    } else if let Some(rest) = s.strip_prefix("bold ") {
+      let idx = Self::named_color_index(rest.trim())?;
+      return Some(Color::Indexed(idx + 8));
+    } else {
+      s
+    };
+
+    // 256-color indexed: "colorN"
+    if let Some(rest) = base.strip_prefix("color") {
+      let n = rest.parse::<u8>().ok()?;
+      return Some(Color::Indexed(n));
+    }
+
+    // Grayscale ramp: "grayN" (gray0-gray23 -> indexed 232-255)
+    if let Some(rest) = base.strip_prefix("gray") {
+      let n = rest.parse::<u8>().ok()?;
+      return Some(Color::Indexed(232 + n));
+    }
+
+    // RGB color cube: "rgbRGB" where each digit is 0-5
+    if let Some(rest) = base.strip_prefix("rgb") {
+      let bytes = rest.as_bytes();
+      if bytes.len() >= 3 {
+        let r = (bytes[0] as char).to_digit(6)? as u8;
+        let g = (bytes[1] as char).to_digit(6)? as u8;
+        let b = (bytes[2] as char).to_digit(6)? as u8;
+        return Some(Color::Indexed(16 + r * 36 + g * 6 + b));
+      }
+      return None;
+    }
+
+    // Plain named color
+    Self::named_color_index(base).map(Color::Indexed)
   }
 
-  fn get_color_background(s: &str) -> Option<Color> {
-    let s = s.trim_start();
-    let s = s.trim_end();
-    if s.contains("bright color") {
-      let s = s.trim_start_matches("bright ");
-      let c = s.trim_start_matches("color").parse::<u8>().unwrap_or_default();
-      Some(Color::Indexed(c.wrapping_shl(8)))
-    } else if s.contains("color") {
-      let c = s.trim_start_matches("color").parse::<u8>().unwrap_or_default();
-      Some(Color::Indexed(c))
-    } else if s.contains("gray") {
-      let s = s.trim_start_matches("bright ");
-      let c = 232 + s.trim_start_matches("gray").parse::<u8>().unwrap_or_default();
-      Some(Color::Indexed(c.wrapping_shl(8)))
-    } else if s.contains("rgb") {
-      let s = s.trim_start_matches("bright ");
-      let red = (s.as_bytes()[3] as char).to_digit(10).unwrap_or_default() as u8;
-      let green = (s.as_bytes()[4] as char).to_digit(10).unwrap_or_default() as u8;
-      let blue = (s.as_bytes()[5] as char).to_digit(10).unwrap_or_default() as u8;
-      let c = 16 + red * 36 + green * 6 + blue;
-      Some(Color::Indexed(c.wrapping_shl(8)))
-    } else if s == "bright black" {
-      Some(Color::Indexed(8))
-    } else if s == "bright red" {
-      Some(Color::Indexed(9))
-    } else if s == "bright green" {
-      Some(Color::Indexed(10))
-    } else if s == "bright yellow" {
-      Some(Color::Indexed(11))
-    } else if s == "bright blue" {
-      Some(Color::Indexed(12))
-    } else if s == "bright magenta" {
-      Some(Color::Indexed(13))
-    } else if s == "bright cyan" {
-      Some(Color::Indexed(14))
-    } else if s == "bright white" {
-      Some(Color::Indexed(15))
-    } else if s == "black" {
-      Some(Color::Indexed(0))
-    } else if s == "red" {
-      Some(Color::Indexed(1))
-    } else if s == "green" {
-      Some(Color::Indexed(2))
-    } else if s == "yellow" {
-      Some(Color::Indexed(3))
-    } else if s == "blue" {
-      Some(Color::Indexed(4))
-    } else if s == "magenta" {
-      Some(Color::Indexed(5))
-    } else if s == "cyan" {
-      Some(Color::Indexed(6))
-    } else if s == "white" {
-      Some(Color::Indexed(7))
-    } else {
-      None
+  /// Parse a background color. Handles the "bright" prefix for named colors
+  /// (e.g. "bright red" -> high-intensity red, index 8-15).
+  /// For indexed/gray/rgb colors the bright prefix is ignored (no bright variant exists).
+  fn parse_color_bg(s: &str, is_bright: bool) -> Option<Color> {
+    // For named colors with bright prefix, map to high-intensity variant (8-15)
+    if is_bright && let Some(idx) = Self::named_color_index(s) {
+      return Some(Color::Indexed(idx + 8));
+      // For colorN/gray/rgb with "bright" prefix, fall through to normal parsing
+      // (no bright variant for indexed colors — just use the index as-is)
+    }
+    Self::parse_color(s)
+  }
+
+  /// Map a plain color name to its 0-7 terminal index.
+  fn named_color_index(s: &str) -> Option<u8> {
+    match s.trim() {
+      "black" => Some(0),
+      "red" => Some(1),
+      "green" => Some(2),
+      "yellow" => Some(3),
+      "blue" => Some(4),
+      "magenta" => Some(5),
+      "cyan" => Some(6),
+      "white" => Some(7),
+      _ => None,
     }
   }
 
@@ -486,7 +600,7 @@ impl Config {
     data.split(',').map(ToString::to_string).collect::<Vec<_>>()
   }
 
-  fn get_filter(data: &str, report: &str) -> Result<String> {
+  pub fn get_filter(data: &str, report: &str) -> Result<String> {
     if report == "all" {
       Ok("".into())
     } else if let Some(s) = Self::get_config(format!("uda.taskwarrior-tui.task-report.{}.filter", report).as_str(), data) {
@@ -572,8 +686,16 @@ impl Config {
       .unwrap_or(false)
   }
 
-  fn get_uda_task_report_show_info(data: &str) -> bool {
-    Self::get_config("uda.taskwarrior-tui.task-report.show-info", data)
+  fn get_uda_task_report_use_alternate_style(data: &str) -> bool {
+    Self::get_config("uda.taskwarrior-tui.task-report.use-alternate-style", data)
+      .unwrap_or_default()
+      .get_bool()
+      .unwrap_or(true)
+  }
+
+  fn get_uda_task_report_info_show(data: &str) -> bool {
+    Self::get_config("uda.taskwarrior-tui.task-report.info-show", data)
+      .or_else(|| Self::get_config("uda.taskwarrior-tui.task-report.show-info", data))
       .unwrap_or_default()
       .get_bool()
       .unwrap_or(true)
@@ -612,6 +734,27 @@ impl Config {
       .unwrap_or_default()
       .get_bool()
       .unwrap_or(false)
+  }
+
+  fn get_uda_context_menu_close_on_select(data: &str) -> bool {
+    Self::get_config("uda.taskwarrior-tui.context-menu.close-on-select", data)
+      .unwrap_or_default()
+      .get_bool()
+      .unwrap_or(true)
+  }
+
+  fn get_uda_report_menu_select_on_move(data: &str) -> bool {
+    Self::get_config("uda.taskwarrior-tui.report-menu.select-on-move", data)
+      .unwrap_or_default()
+      .get_bool()
+      .unwrap_or(false)
+  }
+
+  fn get_uda_report_menu_close_on_select(data: &str) -> bool {
+    Self::get_config("uda.taskwarrior-tui.report-menu.close-on-select", data)
+      .unwrap_or_default()
+      .get_bool()
+      .unwrap_or(true)
   }
 
   fn get_uda_task_report_prompt_on_undo(data: &str) -> bool {
@@ -736,6 +879,19 @@ impl Config {
       Some(tag_name) => tag_name,
     }
   }
+
+  fn get_uda_task_report_info_location(data: &str) -> TaskInfoLocation {
+    Self::get_config("uda.taskwarrior-tui.task-report.info-location", data)
+      .as_deref()
+      .and_then(TaskInfoLocation::from_config_value)
+      .or_else(|| {
+        Self::get_config("uda.taskwarrior-tui.tasklist.vertical", data)
+          .unwrap_or_default()
+          .get_bool()
+          .map(|vertical| if vertical { TaskInfoLocation::Bottom } else { TaskInfoLocation::Right })
+      })
+      .unwrap_or_default()
+  }
 }
 
 #[cfg(test)]
@@ -743,54 +899,63 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_colors() {
-    let c = Config::get_tcolor("red on blue");
+  fn test_config_collects_keyword_colors() {
+    let data = [
+      "data.location /tmp/taskwarrior-tui-tests",
+      "rule.precedence.color keyword.,tag.,project.",
+      "uda.priority.values H,M,L,",
+      "report.next.filter status:pending",
+      "color.keyword.fixme red on blue",
+      "color.keyword.todo underline yellow",
+      "color.active green",
+    ]
+    .join("\n");
+
+    let config = Config::new(&data, "next").unwrap();
+
+    assert_eq!(config.color_keywords.len(), 2);
+    assert!(config.color_keywords.contains(&("fixme".to_string(), Config::get_tcolor("red on blue"))));
+    assert!(
+      config
+        .color_keywords
+        .contains(&("todo".to_string(), Config::get_tcolor("underline yellow")))
+    );
+  }
+
+  #[test]
+  fn test_config_collects_uda_colors_with_spaces_in_key() {
+    let data = [
+      "data.location /tmp/taskwarrior-tui-tests",
+      "rule.precedence.color uda.,tag.,project.",
+      "uda.priority.values H,M,L,",
+      "report.next.filter status:pending",
+      "color.uda.jirastatus.In Review  black on bright cyan",
+      "color.uda.jirastatus.To Do  bright white",
+    ]
+    .join("\n");
+
+    let config = Config::new(&data, "next").unwrap();
+
+    assert_eq!(
+      config.color.get("color.uda.jirastatus.In Review"),
+      Some(&Config::get_tcolor("black on bright cyan"))
+    );
+    assert_eq!(config.color.get("color.uda.jirastatus.To Do"), Some(&Config::get_tcolor("bright white")));
+  }
+
+  #[test]
+  fn test_named_colors_and_backgrounds() {
+    // --- Basic named colors ---
+    let c = Config::get_tcolor("red");
     assert_eq!(c.fg.unwrap(), Color::Indexed(1));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(4));
-
-    let c = Config::get_tcolor("bold red");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(9));
     assert!(c.bg.is_none());
-    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
-
-    let c = Config::get_tcolor("white on red");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(1));
 
     let c = Config::get_tcolor("blue");
     assert_eq!(c.fg.unwrap(), Color::Indexed(4));
     assert!(c.bg.is_none());
 
-    let c = Config::get_tcolor("black on bright green");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(10));
-
-    let c = Config::get_tcolor("magenta");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(5));
-    assert!(c.bg.is_none());
-
-    let c = Config::get_tcolor("white on green");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(2));
-
-    let c = Config::get_tcolor("black on white");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(7));
-
-    let c = Config::get_tcolor("black on bright white");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(15));
-
-    let c = Config::get_tcolor("bold white");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(15));
-    assert!(c.bg.is_none());
-
     let c = Config::get_tcolor("white");
     assert_eq!(c.fg.unwrap(), Color::Indexed(7));
-    assert!(c.bg.is_none());
-
-    let c = Config::get_tcolor("bold yellow");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(11));
     assert!(c.bg.is_none());
 
     let c = Config::get_tcolor("green");
@@ -801,25 +966,34 @@ mod tests {
     assert_eq!(c.fg.unwrap(), Color::Indexed(3));
     assert!(c.bg.is_none());
 
-    let c = Config::get_tcolor("red");
+    let c = Config::get_tcolor("magenta");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(5));
+    assert!(c.bg.is_none());
+
+    let c = Config::get_tcolor("cyan");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(6));
+    assert!(c.bg.is_none());
+
+    let c = Config::get_tcolor("black");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
+    assert!(c.bg.is_none());
+
+    // --- Foreground + background (named) ---
+    let c = Config::get_tcolor("red on blue");
     assert_eq!(c.fg.unwrap(), Color::Indexed(1));
-    assert!(c.bg.is_none());
+    assert_eq!(c.bg.unwrap(), Color::Indexed(4));
 
-    let c = Config::get_tcolor("bold red");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(9));
-    assert!(c.bg.is_none());
-
-    let c = Config::get_tcolor("on green");
-    assert!(c.fg.is_none());
-    assert_eq!(c.bg.unwrap(), Color::Indexed(2));
-
-    let c = Config::get_tcolor("on red");
-    assert!(c.fg.is_none());
+    let c = Config::get_tcolor("white on red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
     assert_eq!(c.bg.unwrap(), Color::Indexed(1));
 
-    let c = Config::get_tcolor("on yellow");
-    assert!(c.fg.is_none());
-    assert_eq!(c.bg.unwrap(), Color::Indexed(3));
+    let c = Config::get_tcolor("white on green");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(2));
+
+    let c = Config::get_tcolor("black on white");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(7));
 
     let c = Config::get_tcolor("black on red");
     assert_eq!(c.fg.unwrap(), Color::Indexed(0));
@@ -837,17 +1011,27 @@ mod tests {
     assert_eq!(c.fg.unwrap(), Color::Indexed(7));
     assert_eq!(c.bg.unwrap(), Color::Indexed(0));
 
-    let c = Config::get_tcolor("black on green");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
+    // --- Background-only ---
+    let c = Config::get_tcolor("on green");
+    assert!(c.fg.is_none());
     assert_eq!(c.bg.unwrap(), Color::Indexed(2));
 
-    let c = Config::get_tcolor("white on red");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    let c = Config::get_tcolor("on red");
+    assert!(c.fg.is_none());
     assert_eq!(c.bg.unwrap(), Color::Indexed(1));
 
-    let c = Config::get_tcolor("bold white on red");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(15));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(1));
+    let c = Config::get_tcolor("on yellow");
+    assert!(c.fg.is_none());
+    assert_eq!(c.bg.unwrap(), Color::Indexed(3));
+
+    // --- bright backgrounds (high-intensity, indices 8-15) ---
+    let c = Config::get_tcolor("black on bright green");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(10));
+
+    let c = Config::get_tcolor("black on bright white");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(15));
 
     let c = Config::get_tcolor("black on bright yellow");
     assert_eq!(c.fg.unwrap(), Color::Indexed(0));
@@ -857,17 +1041,232 @@ mod tests {
     assert_eq!(c.fg.unwrap(), Color::Indexed(0));
     assert_eq!(c.bg.unwrap(), Color::Indexed(9));
 
-    let c = Config::get_tcolor("bold white on bright blue");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(15));
-    assert_eq!(c.bg.unwrap(), Color::Indexed(12));
-
     let c = Config::get_tcolor("white on bright black");
     assert_eq!(c.fg.unwrap(), Color::Indexed(7));
     assert_eq!(c.bg.unwrap(), Color::Indexed(8));
+  }
+
+  #[test]
+  fn test_modifiers() {
+    // --- underline modifier ---
+    let c = Config::get_tcolor("underline red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+
+    let c = Config::get_tcolor("underline bold red on blue");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(4));
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    // --- inverse modifier ---
+    let c = Config::get_tcolor("inverse red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.add_modifier & Modifier::REVERSED, Modifier::REVERSED);
+
+    // --- italic modifier ---
+    let c = Config::get_tcolor("italic red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.add_modifier & Modifier::ITALIC, Modifier::ITALIC);
+
+    let c = Config::get_tcolor("italic red on blue");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(4));
+    assert_eq!(c.add_modifier & Modifier::ITALIC, Modifier::ITALIC);
+
+    // --- strikethrough modifier ---
+    let c = Config::get_tcolor("strikethrough red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.add_modifier & Modifier::CROSSED_OUT, Modifier::CROSSED_OUT);
+
+    // --- combined modifiers ---
+    let c = Config::get_tcolor("bold underline italic red on blue");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(4));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+    assert_eq!(c.add_modifier & Modifier::ITALIC, Modifier::ITALIC);
+  }
+
+  #[test]
+  fn test_256_grayscale_rgb() {
+    // --- 256-color indexed ---
+    let c = Config::get_tcolor("color0");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(0));
+
+    let c = Config::get_tcolor("color255");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(255));
+
+    let c = Config::get_tcolor("color100");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(100));
+
+    // colorN background (previously broken by wrapping_shl bug)
+    let c = Config::get_tcolor("white on color196");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(196));
+
+    // --- grayscale ramp (gray0-gray23 -> indexed 232-255) ---
+    let c = Config::get_tcolor("gray0");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(232));
+
+    let c = Config::get_tcolor("gray23");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(255));
+
+    let c = Config::get_tcolor("gray5");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(237));
+
+    // grey spelling variant
+    let c = Config::get_tcolor("grey5");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(237));
+
+    // gray background (previously broken by wrapping_shl bug)
+    let c = Config::get_tcolor("white on gray5");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(237));
+
+    let c = Config::get_tcolor("on gray23");
+    assert!(c.fg.is_none());
+    assert_eq!(c.bg.unwrap(), Color::Indexed(255));
+
+    // --- RGB color cube (rgb000-rgb555 -> indexed 16-231) ---
+    // rgb500 = 16 + 5*36 + 0*6 + 0 = 196
+    let c = Config::get_tcolor("rgb500");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(196));
+
+    // rgb050 = 16 + 0*36 + 5*6 + 0 = 46
+    let c = Config::get_tcolor("rgb050");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(46));
+
+    // rgb005 = 16 + 0 + 0 + 5 = 21
+    let c = Config::get_tcolor("rgb005");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(21));
+
+    // rgb550 = 16 + 5*36 + 5*6 + 0 = 226
+    let c = Config::get_tcolor("rgb550");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(226));
+
+    // rgb444 = 16 + 4*36 + 4*6 + 4 = 16 + 144 + 24 + 4 = 188
+    let c = Config::get_tcolor("rgb444");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(188));
+
+    // rgb background (previously broken by wrapping_shl bug)
+    let c = Config::get_tcolor("white on rgb500");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(196));
+
+    let c = Config::get_tcolor("on rgb444");
+    assert!(c.fg.is_none());
+    assert_eq!(c.bg.unwrap(), Color::Indexed(188));
+
+    // --- TokyoNight Moon representative colors ---
+    // color111 on color60
+    let c = Config::get_tcolor("color111 on color60");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(111));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(60));
+
+    // color203 (overdue/error red)
+    let c = Config::get_tcolor("color203");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(203));
+  }
+
+  /// Regression test: "bold red" must produce Indexed(1) + BOLD, not Indexed(9).
+  #[test]
+  fn test_bold_not_bright_regression() {
+    let c = Config::get_tcolor("bold red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert!(c.bg.is_none());
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("bold white");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert!(c.bg.is_none());
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("bold yellow");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(3));
+    assert!(c.bg.is_none());
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
 
     let c = Config::get_tcolor("bold blue");
-    assert_eq!(c.fg.unwrap(), Color::Indexed(12));
+    assert_eq!(c.fg.unwrap(), Color::Indexed(4));
     assert!(c.bg.is_none());
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("bold white on red");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("bold white on bright blue");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(7));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(12));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+  }
+
+  /// Regression test: trailing modifiers must not
+  /// cause the foreground color to be silently dropped.
+  #[test]
+  fn test_trailing_modifier_regression() {
+    // Single trailing modifier
+    let c = Config::get_tcolor("color209 bold");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(209));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("color117 bold");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(117));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("color111 bold");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(111));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("color61 underline");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(61));
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+
+    let c = Config::get_tcolor("color210 underline");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(210));
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+
+    let c = Config::get_tcolor("red italic");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(1));
+    assert_eq!(c.add_modifier & Modifier::ITALIC, Modifier::ITALIC);
+
+    let c = Config::get_tcolor("blue inverse");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(4));
+    assert_eq!(c.add_modifier & Modifier::REVERSED, Modifier::REVERSED);
+
+    let c = Config::get_tcolor("green strikethrough");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(2));
+    assert_eq!(c.add_modifier & Modifier::CROSSED_OUT, Modifier::CROSSED_OUT);
+
+    // Two trailing modifiers
+    let c = Config::get_tcolor("color150 bold underline");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(150));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+
+    let c = Config::get_tcolor("color210 bold underline");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(210));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+
+    // Trailing modifier with background
+    let c = Config::get_tcolor("color150 bold on color236");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(150));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(236));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+
+    let c = Config::get_tcolor("color210 underline on color234");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(210));
+    assert_eq!(c.bg.unwrap(), Color::Indexed(234));
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+
+    // Mixed: leading + trailing modifiers
+    let c = Config::get_tcolor("bold color150 underline");
+    assert_eq!(c.fg.unwrap(), Color::Indexed(150));
+    assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
+    assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
   }
 
   #[test]
@@ -895,5 +1294,112 @@ mod tests {
       "report.test.description test\nreport.test.filter filter and\n                   test",
     );
     assert_eq!(config.unwrap(), "filter and test");
+  }
+
+  #[test]
+  fn test_get_uda_task_report_use_alternate_style_defaults_to_true() {
+    assert!(Config::get_uda_task_report_use_alternate_style(""));
+  }
+
+  #[test]
+  fn test_get_uda_task_report_use_alternate_style_can_be_disabled() {
+    let data = "uda.taskwarrior-tui.task-report.use-alternate-style false";
+    assert!(!Config::get_uda_task_report_use_alternate_style(data));
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_show_defaults_to_true() {
+    assert!(Config::get_uda_task_report_info_show(""));
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_show_can_be_disabled() {
+    let data = "uda.taskwarrior-tui.task-report.info-show false";
+    assert!(!Config::get_uda_task_report_info_show(data));
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_show_supports_legacy_show_info_key() {
+    let data = "uda.taskwarrior-tui.task-report.show-info false";
+    assert!(!Config::get_uda_task_report_info_show(data));
+  }
+
+  #[test]
+  fn test_get_uda_report_menu_close_on_select_defaults_to_true() {
+    assert!(Config::get_uda_report_menu_close_on_select(""));
+  }
+
+  #[test]
+  fn test_get_uda_report_menu_close_on_select_can_be_disabled() {
+    let data = "uda.taskwarrior-tui.report-menu.close-on-select false";
+    assert!(!Config::get_uda_report_menu_close_on_select(data));
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_defaults_to_auto() {
+    assert_eq!(Config::get_uda_task_report_info_location(""), TaskInfoLocation::Auto);
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_parses_bottom() {
+    let data = "uda.taskwarrior-tui.task-report.info-location bottom";
+    assert_eq!(Config::get_uda_task_report_info_location(data), TaskInfoLocation::Bottom);
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_parses_right() {
+    let data = "uda.taskwarrior-tui.task-report.info-location right";
+    assert_eq!(Config::get_uda_task_report_info_location(data), TaskInfoLocation::Right);
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_supports_legacy_tasklist_vertical_true() {
+    let data = "uda.taskwarrior-tui.tasklist.vertical true";
+    assert_eq!(Config::get_uda_task_report_info_location(data), TaskInfoLocation::Bottom);
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_supports_legacy_tasklist_vertical_false() {
+    let data = "uda.taskwarrior-tui.tasklist.vertical false";
+    assert_eq!(Config::get_uda_task_report_info_location(data), TaskInfoLocation::Right);
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_prefers_new_key_over_legacy_key() {
+    let data = [
+      "uda.taskwarrior-tui.task-report.info-location right",
+      "uda.taskwarrior-tui.tasklist.vertical true",
+    ]
+    .join("\n");
+    assert_eq!(Config::get_uda_task_report_info_location(&data), TaskInfoLocation::Right);
+  }
+
+  #[test]
+  fn test_get_uda_task_report_info_location_invalid_values_fall_back_to_auto() {
+    let data = "uda.taskwarrior-tui.task-report.info-location sideways";
+    assert_eq!(Config::get_uda_task_report_info_location(data), TaskInfoLocation::Auto);
+  }
+
+  #[test]
+  fn test_task_info_location_auto_resolves_from_width() {
+    assert_eq!(
+      TaskInfoLocation::Auto.resolve(TaskInfoLocation::AUTO_WIDTH_THRESHOLD),
+      TaskInfoLocation::Bottom
+    );
+    assert_eq!(
+      TaskInfoLocation::Auto.resolve(TaskInfoLocation::AUTO_WIDTH_THRESHOLD + 1),
+      TaskInfoLocation::Right
+    );
+  }
+
+  #[test]
+  fn test_get_uda_context_menu_close_on_select_defaults_to_true() {
+    assert!(Config::get_uda_context_menu_close_on_select(""));
+  }
+
+  #[test]
+  fn test_get_uda_context_menu_close_on_select_can_be_disabled() {
+    let data = "uda.taskwarrior-tui.context-menu.close-on-select false";
+    assert!(!Config::get_uda_context_menu_close_on_select(data));
   }
 }

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use anyhow::{anyhow, Context as AnyhowContext, Result};
+use anyhow::{Context as AnyhowContext, Result, anyhow};
 
 const NAME: &str = "Name";
 const TYPE: &str = "Remaining";
@@ -59,6 +59,8 @@ pub struct ContextsState {
   pub report_height: u16,
   pub columns: Vec<String>,
   pub rows: Vec<ContextDetails>,
+  /// Current search query typed by the user inside the popup.
+  pub search: String,
 }
 
 impl ContextsState {
@@ -68,6 +70,7 @@ impl ContextsState {
       report_height: 0,
       columns: vec![NAME.to_string(), TYPE.to_string(), DEFINITION.to_string(), ACTIVE.to_string()],
       rows: vec![],
+      search: String::new(),
     }
   }
 
@@ -85,8 +88,25 @@ impl ContextsState {
     self.rows.len()
   }
 
-  pub fn update_data(&mut self) -> Result<()> {
-    let output = Command::new("task").arg("context").output()?;
+  /// Returns the indices into `self.rows` (after filtering to `type_ == "read"`)
+  /// that match the current search query.
+  /// An empty query matches everything. Matching is case-insensitive substring
+  /// on name or definition.
+  pub fn filtered_indices(&self) -> Vec<usize> {
+    let query = self.search.to_lowercase();
+    self
+      .rows
+      .iter()
+      .enumerate()
+      .filter(|(_, r)| {
+        r.type_ == "read" && (query.is_empty() || r.name.to_lowercase().contains(&query) || r.definition.to_lowercase().contains(&query))
+      })
+      .map(|(i, _)| i)
+      .collect()
+  }
+
+  pub fn update_data(&mut self, task_exe: &str) -> Result<()> {
+    let output = Command::new(task_exe).arg("context").output()?;
     let data = String::from_utf8_lossy(&output.stdout);
 
     self.rows = vec![];

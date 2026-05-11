@@ -3,10 +3,7 @@ name: CD
 on:
   release:
     types: [published]
-  push:
-    tags:
-      - v*
-      
+
 permissions:
   contents: write
 
@@ -20,10 +17,11 @@ jobs:
   homebrew:
     name: Bump Homebrew formula
     runs-on: macos-latest
+    continue-on-error: true
     steps:
       - name: Update Homebrew formula
         if: startsWith(github.ref, 'refs/tags/')
-        uses: dawidd6/action-homebrew-bump-formula@v3
+        uses: dawidd6/action-homebrew-bump-formula@v7
         with:
           token: ${{secrets.HOMEBREW_TOKEN}}
           formula: taskwarrior-tui
@@ -33,23 +31,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
-      - uses: clechasseur/rs-cargo@v2
+        uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: build
-          args: --release
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
+          shared-key: cargo-${{ runner.os }}
+      - run: cargo build --release
       - name: Build deb package
-        run: cargo deb -p taskwarrior-tui -o target/debian/taskwarrior-tui.deb
+        run: mise run taskwarrior-tui:package-deb
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: taskwarrior-tui-deb
           path: target/debian/taskwarrior-tui.deb
       - name: Releasing assets
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             target/debian/*.deb
@@ -61,25 +58,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
-      - uses: clechasseur/rs-cargo@v2
+        uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: build
-          args: --release
+          shared-key: cargo-${{ runner.os }}
+      - run: cargo build --release
       - name: Install rpm
-        run: sudo apt-get install rpm
-      - name: Install cargo-rpm
-        run: cargo install cargo-rpm
+        run: sudo apt-get update && sudo apt-get install -y rpm
       - name: Build rpm package
-        run: cargo rpm build
+        run: mise run taskwarrior-tui:package-rpm
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: taskwarrior-tui-rpm
           path: target/release/rpmbuild/RPMS/x86_64/taskwarrior-tui-*.x86_64.rpm
       - name: Releasing assets
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             target/release/rpmbuild/RPMS/x86_64/taskwarrior-tui-*.x86_64.rpm
@@ -91,12 +87,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
-      - uses: clechasseur/rs-cargo@v2
+        uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: build
-          args: --release
-      - name: Install cargo-aur
-        run: cargo install cargo-aur
+          shared-key: cargo-${{ runner.os }}
+      - run: cargo build --release
       - name: Build aur package
-        run: cargo aur
+        run: mise run taskwarrior-tui:package-aur

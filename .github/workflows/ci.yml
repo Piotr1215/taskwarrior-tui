@@ -2,82 +2,75 @@ on: [pull_request]
 
 name: CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
-          override: true
-      - uses: clechasseur/rs-cargo@v2
-        with:
-          command: check
+          shared-key: cargo-${{ runner.os }}
+      - run: mise run taskwarrior-tui:cargo-check
 
   test:
     name: Test Suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Taskwarrior
-        uses: ./.github/actions/install-taskwarrior
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          secret_gh_token: ${{ secrets.GITHUB_TOKEN }}
+          shared-key: cargo-${{ runner.os }}
+      - name: Restore cached Taskwarrior build
+        id: taskwarrior-cache
+        uses: actions/cache@v5
+        with:
+          path: tmp/taskwarrior-install
+          key: ${{ runner.os }}-taskwarrior-${{ hashFiles('.config/mise.toml', '.config/mise/tasks/taskwarrior-tui/build-taskwarrior') }}
+      - name: Install Taskwarrior build dependencies
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev uuid-runtime
+      - name: Build Taskwarrior from source
+        if: steps.taskwarrior-cache.outputs.cache-hit != 'true'
+        run: mise run taskwarrior-tui:build-taskwarrior
       - run: |
           # prepare taskwarrior, initial setup
-          task rc.confirmation=off || echo 0
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      - name: Install testdata
-        uses: actions/checkout@v4
-        with:
-          repository: kdheepak/taskwarrior-testdata
-          path: taskwarrior-testdata
-      - uses: clechasseur/rs-cargo@v2
-        with:
-          command: test
-          args: --workspace -- --nocapture
+          mise exec -- task rc.confirmation=off || echo 0
+      - run: mise run taskwarrior-tui:cargo-test
         env:
-          TASKRC: taskwarrior-testdata/.taskrc
-          TASKDATA: taskwarrior-testdata/.task
           RUST_BACKTRACE: full
 
 
   generate_coverage:
     uses: ./.github/workflows/generate_coverage.yml
-    # Avoid double-compiling taskwarrior if not cached, or wasting CI time if tests fail
     needs: test
 
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: nightly
-          override: true
-          components: rustfmt
-      - uses: clechasseur/rs-cargo@v2
-        with:
-          command: fmt
-          args: --all -- --check
+          shared-key: cargo-${{ runner.os }}
+      - run: mise run taskwarrior-tui:cargo-fmt
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
-          override: true
-          components: clippy
-      - uses: clechasseur/rs-cargo@v2
-        with:
-          command: clippy
-          args: -- -D warnings
+          shared-key: cargo-${{ runner.os }}
+      - run: mise run taskwarrior-tui:cargo-clippy

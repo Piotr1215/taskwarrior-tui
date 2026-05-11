@@ -14,3 +14,13 @@ tests/data
 flake.nix
 flake.lock
 .direnv/
+.envrc
+Makefile
+justfile
+.justfile
+tmp
+docs/.astro/
+docs/node_modules/
+site/
+*.gif
+*.mp4
