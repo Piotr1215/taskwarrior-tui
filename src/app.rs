@@ -207,6 +207,7 @@ pub struct TaskwarriorTui {
   pub event_loop: crate::event::EventLoop,
   pub requires_redraw: bool,
   pub changes: utils::Changeset,
+  pub projects_dirty: bool,
 }
 
 impl TaskwarriorTui {
@@ -293,6 +294,7 @@ impl TaskwarriorTui {
       event_loop,
       requires_redraw: false,
       changes: utils::Changeset::default(),
+      projects_dirty: true,
     };
 
     for c in app.config.filter.chars() {
@@ -1300,7 +1302,7 @@ impl TaskwarriorTui {
         self.export_all_tasks()?;
       }
       self.contexts.update_data()?;
-      self.projects.update_data()?;
+      self.projects_dirty = true;
       self.update_tags();
       self.task_details.clear();
       self.dirty = false;
@@ -1309,6 +1311,10 @@ impl TaskwarriorTui {
       // Some operations like export or summary change the taskwarrior database.
       // The export time therefore gets set at the end, to avoid an infinite update loop.
       self.last_export = Some(std::time::SystemTime::now());
+    }
+    if self.mode == Mode::Projects && self.projects_dirty {
+      self.projects.update_data()?;
+      self.projects_dirty = false;
     }
     self.cursor_fix();
     self.update_task_table_state();
@@ -1610,15 +1616,21 @@ impl TaskwarriorTui {
 
   pub fn tasks_changed_since(&mut self, prev: Option<SystemTime>) -> Result<bool> {
     if let Some(prev) = prev {
+      let now = SystemTime::now();
+      // Debounce: with active hooks the DB mtime can change several times per second.
+      // Re-exporting on every Tick blocks the UI thread (~170ms here) and causes
+      // navigation lag. Coalesce rapid changes into one export.
+      let min_interval = Duration::from_millis(self.config.uda_refresh_debounce_millis);
+      if now.duration_since(prev).unwrap_or_default() < min_interval {
+        return Ok(false);
+      }
       let mtime = self.get_task_database_mtime()?;
       if mtime > prev {
         Ok(true)
       } else {
-        // Unfortunately, we can not use std::time::Instant which is guaranteed to be monotonic,
-        // because we need to compare it to a file mtime as SystemTime, so as a safety for unexpected
-        // time shifts, cap maximum wait to 1 min
-        let now = SystemTime::now();
-        let max_delta = Duration::from_secs(60);
+        // Safety cap for unexpected clock shifts (cannot use Instant since we
+        // compare against a file mtime). Kept long to avoid periodic hitches.
+        let max_delta = Duration::from_secs(600);
         Ok(now.duration_since(prev)? > max_delta)
       }
     } else {
@@ -2049,30 +2061,6 @@ impl TaskwarriorTui {
     }
   }
 
-  pub fn task_virtual_tags(task_uuid: Uuid) -> Result<String, String> {
-    let output = std::process::Command::new("task").arg(format!("{}", task_uuid)).output();
-
-    match output {
-      Ok(output) => {
-        let data = String::from_utf8_lossy(&output.stdout);
-        for line in data.split('\n') {
-          for prefix in &["Virtual tags", "Virtual"] {
-            if line.starts_with(prefix) {
-              let line = line.to_string();
-              let line = line.replace(prefix, "");
-              return Ok(line);
-            }
-          }
-        }
-        Err(format!(
-          "Cannot find any tags for `task {}`. Check documentation for more information",
-          task_uuid
-        ))
-      }
-      Err(_) => Err(format!("Cannot run `task {}`. Check documentation for more information", task_uuid)),
-    }
-  }
-
   pub fn task_start_stop(&mut self) -> Result<(), String> {
     if self.tasks.is_empty() {
       return Ok(());
@@ -2081,12 +2069,10 @@ impl TaskwarriorTui {
     let task_uuids = self.selected_task_uuids();
 
     for task_uuid in &task_uuids {
-      let mut command = "start";
-      for tag in TaskwarriorTui::task_virtual_tags(*task_uuid).unwrap_or_default().split(' ') {
-        if tag == "ACTIVE" {
-          command = "stop";
-        }
-      }
+      let command = match self.task_by_uuid(*task_uuid) {
+        Some(t) if t.start().is_some() => "stop",
+        _ => "start",
+      };
 
       let output = std::process::Command::new("task").arg(task_uuid.to_string()).arg(command).output();
       if output.is_err() {

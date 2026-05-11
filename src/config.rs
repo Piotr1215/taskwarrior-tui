@@ -56,6 +56,7 @@ pub struct Config {
   pub rule_precedence_color: Vec<String>,
   pub uda_priority_values: Vec<String>,
   pub uda_tick_rate: u64,
+  pub uda_refresh_debounce_millis: u64,
   pub uda_auto_insert_double_quotes_on_add: bool,
   pub uda_auto_insert_double_quotes_on_annotate: bool,
   pub uda_auto_insert_double_quotes_on_log: bool,
@@ -123,6 +124,7 @@ impl Config {
     let rule_precedence_color = Self::get_rule_precedence_color(data);
     let uda_priority_values = Self::get_uda_priority_values(data);
     let uda_tick_rate = Self::get_uda_tick_rate(data);
+    let uda_refresh_debounce_millis = Self::get_uda_refresh_debounce_millis(data);
     let uda_change_focus_rotate = Self::get_uda_change_focus_rotate(data);
     let uda_auto_insert_double_quotes_on_add = Self::get_uda_auto_insert_double_quotes_on_add(data);
     let uda_auto_insert_double_quotes_on_annotate = Self::get_uda_auto_insert_double_quotes_on_annotate(data);
@@ -190,6 +192,7 @@ impl Config {
       rule_precedence_color,
       uda_priority_values,
       uda_tick_rate,
+      uda_refresh_debounce_millis,
       uda_change_focus_rotate,
       uda_auto_insert_double_quotes_on_add,
       uda_auto_insert_double_quotes_on_annotate,
@@ -546,6 +549,13 @@ impl Config {
       .unwrap_or_default()
       .parse::<u64>()
       .unwrap_or(250)
+  }
+
+  fn get_uda_refresh_debounce_millis(data: &str) -> u64 {
+    Self::get_config("uda.taskwarrior-tui.refresh-debounce-millis", data)
+      .unwrap_or_default()
+      .parse::<u64>()
+      .unwrap_or(1000)
   }
 
   fn get_uda_task_detail_prefetch(data: &str) -> usize {
