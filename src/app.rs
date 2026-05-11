@@ -182,6 +182,7 @@ pub struct TaskwarriorTui {
   pub requires_redraw: bool,
   pub changes: utils::Changeset,
   pub projects_dirty: bool,
+  pub timesheet_dirty: bool,
   pub task_info_location_override: Option<TaskInfoLocation>,
   pub task_info_location_override_width: Option<u16>,
   pub task_exe: String,
@@ -282,6 +283,7 @@ impl TaskwarriorTui {
       requires_redraw: false,
       changes: utils::Changeset::default(),
       projects_dirty: true,
+      timesheet_dirty: true,
       task_exe,
       timesheet_data: String::new(),
       timesheet_scroll: 0,
@@ -1680,7 +1682,7 @@ impl TaskwarriorTui {
       self.contexts.update_data(&self.task_exe)?;
       self.reports.update_data(&self.report, &Self::task_show_output(&self.task_exe)?);
       self.projects_dirty = true;
-      self.update_timesheet()?;
+      self.timesheet_dirty = true;
       self.update_tags();
       self.task_details.clear();
       self.task_details_modified.clear();
@@ -1694,6 +1696,10 @@ impl TaskwarriorTui {
     if self.mode == Mode::Projects && self.projects_dirty {
       self.projects.update_data(&self.task_exe)?;
       self.projects_dirty = false;
+    }
+    if self.mode == Mode::Timesheet && self.timesheet_dirty {
+      self.update_timesheet()?;
+      self.timesheet_dirty = false;
     }
     self.cursor_fix();
     self.update_task_table_state();
