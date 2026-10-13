@@ -67,19 +67,62 @@ const MAX_LINE: usize = 4096;
 // project completion, about 0.7s per action on a 45k-task database.
 const QUIET: &str = "rc.verbose=nothing";
 
+// Write commands that can touch several tasks, run without asking.
+const NO_PROMPTS: [&str; 5] = [
+  "rc.bulk=0",
+  "rc.confirmation=off",
+  "rc.dependency.confirmation=off",
+  "rc.recurrence.confirmation=off",
+  QUIET,
+];
+
 // A taskwarrior write or report export can take seconds on a large database,
 // more while other processes use it. The UI loop hands both to one background
 // thread instead of waiting, and that thread runs them in the order queued, so
 // an export always sees every write queued before it.
 enum Job {
-  Write {
-    label: &'static str,
-    report_errors: bool,
-    cmd: std::process::Command,
-  },
-  Export {
-    cmd: std::process::Command,
-  },
+  Write(Box<TaskWrite>),
+  Export { cmd: std::process::Command },
+}
+
+// The row to select once a write has run, read from its output.
+#[derive(Clone, Copy)]
+enum Select {
+  Nothing,
+  UndoneTask,
+  CreatedTask,
+}
+
+struct TaskWrite {
+  label: &'static str,
+  report_errors: bool,
+  select: Select,
+  cmd: std::process::Command,
+  // Runs when `cmd` named a task by an id that no longer belongs to it.
+  retry: Option<std::process::Command>,
+}
+
+impl TaskWrite {
+  fn new(label: &'static str, report_errors: bool, select: Select, (cmd, retry): (std::process::Command, Option<std::process::Command>)) -> Self {
+    Self {
+      label,
+      report_errors,
+      select,
+      cmd,
+      retry,
+    }
+  }
+
+  fn run(&mut self) -> io::Result<std::process::Output> {
+    let output = self.cmd.output();
+    // A filter that matches no task exits 1 and, with footnotes off, prints
+    // nothing.
+    let missed = matches!(&output, Ok(o) if o.status.code() == Some(1) && o.stdout.is_empty() && o.stderr.is_empty());
+    match self.retry.as_mut() {
+      Some(retry) if missed => retry.output(),
+      _ => output,
+    }
+  }
 }
 
 // `seq` is the queue position of the job that produced the result.
@@ -87,6 +130,7 @@ enum JobResult {
   Write {
     label: &'static str,
     report_errors: bool,
+    select: Select,
     output: io::Result<std::process::Output>,
   },
   Export {
@@ -108,14 +152,11 @@ impl Worker {
     std::thread::spawn(move || {
       for (seq, job) in queue {
         let result = match job {
-          Job::Write {
-            label,
-            report_errors,
-            mut cmd,
-          } => JobResult::Write {
-            label,
-            report_errors,
-            output: cmd.output(),
+          Job::Write(mut write) => JobResult::Write {
+            output: write.run(),
+            label: write.label,
+            report_errors: write.report_errors,
+            select: write.select,
           },
           Job::Export { mut cmd } => JobResult::Export {
             seq,
@@ -587,12 +628,36 @@ impl TaskwarriorTui {
     Ok(seq)
   }
 
+  // Builds `task <before> <filter> <after>` for the given tasks. One task with
+  // an id is filtered as `<id> uuid:<uuid>`, which taskwarrior answers from
+  // pending tasks alone: about 35ms against 185ms for a bare UUID, which loads
+  // every task in the database. The uuid: term stops an id renumbered since the
+  // last export from hitting another task; the write then matches nothing, and
+  // the bare UUID command returned beside it runs instead.
+  fn task_command(&self, before: &[&str], uuids: &[Uuid], after: &[String]) -> (std::process::Command, Option<std::process::Command>) {
+    let build = |filter: &[String]| {
+      let mut cmd = std::process::Command::new(&self.task_exe);
+      cmd.args(before).args(filter).args(after);
+      cmd
+    };
+    let bare: Vec<String> = uuids.iter().map(ToString::to_string).collect();
+    match uuids {
+      [uuid] => match self.task_by_uuid(*uuid).and_then(|t| t.id()) {
+        Some(id) if id > 0 => (build(&[id.to_string(), format!("uuid:{uuid}")]), Some(build(&bare))),
+        _ => (build(&bare), None),
+      },
+      _ => (build(&bare), None),
+    }
+  }
+
   // Queues a taskwarrior write. Rows in `hide` leave the table at once rather
   // than after the write and the export behind it have run.
-  fn queue_write(&mut self, label: &'static str, report_errors: bool, mut cmd: std::process::Command, hide: &[Uuid]) {
+  fn queue_write(&mut self, mut write: TaskWrite, hide: &[Uuid]) {
     #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    match self.queue(Job::Write { label, report_errors, cmd }) {
+    for cmd in std::iter::once(&mut write.cmd).chain(write.retry.as_mut()) {
+      std::os::unix::process::CommandExt::process_group(cmd, 0);
+    }
+    match self.queue(Job::Write(Box::new(write))) {
       Ok(seq) => {
         self.writes_in_flight += 1;
         self.last_write_seq = seq;
@@ -606,9 +671,9 @@ impl TaskwarriorTui {
         }
       }
       Err(job) => {
-        if let Job::Write { mut cmd, .. } = *job {
-          let output = cmd.output();
-          self.apply_write_result(label, report_errors, output);
+        if let Job::Write(mut write) = *job {
+          let output = write.run();
+          self.apply_write_result(write.label, write.report_errors, write.select, output);
         }
       }
     }
@@ -633,9 +698,12 @@ impl TaskwarriorTui {
     }
   }
 
-  fn apply_write_result(&mut self, label: &str, report_errors: bool, output: io::Result<std::process::Output>) {
+  fn apply_write_result(&mut self, label: &str, report_errors: bool, select: Select, output: io::Result<std::process::Output>) {
     let error = match output {
-      Ok(o) if o.status.success() => return,
+      Ok(o) if o.status.success() => {
+        self.select_written(select, &String::from_utf8_lossy(&o.stdout));
+        return;
+      }
       Ok(o) => format!(
         "{} failed. {}{}",
         label,
@@ -651,6 +719,30 @@ impl TaskwarriorTui {
     }
   }
 
+  // Runs before the export queued behind the write, so that export lands on
+  // the row picked here.
+  fn select_written(&mut self, select: Select, stdout: &str) {
+    match select {
+      Select::Nothing => {}
+      Select::UndoneTask => {
+        let re = Regex::new(r"(?P<task_uuid>[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})").unwrap();
+        if let Some(caps) = re.captures(stdout)
+          && let Ok(uuid) = Uuid::parse_str(&caps["task_uuid"])
+        {
+          self.current_selection_uuid = Some(uuid);
+        }
+      }
+      Select::CreatedTask => {
+        let re = Regex::new(r"Created task (?P<task_id>\d+)\.").unwrap();
+        if self.config.uda_task_report_jump_to_task_on_add
+          && let Some(caps) = re.captures(stdout)
+        {
+          self.current_selection_id = Some(caps["task_id"].parse::<u64>().unwrap_or_default());
+        }
+      }
+    }
+  }
+
   // Applies a worker result without awaiting, so wait_for_writes can use it.
   // Returns true when the tasks table was reloaded.
   fn apply_job_result(&mut self, result: JobResult) -> bool {
@@ -658,10 +750,11 @@ impl TaskwarriorTui {
       JobResult::Write {
         label,
         report_errors,
+        select,
         output,
       } => {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
-        self.apply_write_result(label, report_errors, output);
+        self.apply_write_result(label, report_errors, select, output);
         false
       }
       JobResult::Export { seq, desc, output } => {
@@ -710,8 +803,9 @@ impl TaskwarriorTui {
     Ok(())
   }
 
-  // Blocks until every queued write has run. Undo, add, edit and shortcuts
-  // call this first so they never overtake a write still in the queue.
+  // Blocks until every queued write has run. Edit, shortcuts and shell
+  // commands call this first so they never overtake a write still in the
+  // queue; writes keep their order in the queue itself.
   fn wait_for_writes(&mut self) {
     while self.writes_in_flight > 0 {
       let Some(worker) = self.worker.as_mut() else {
@@ -2710,23 +2804,17 @@ impl TaskwarriorTui {
   }
 
   pub fn task_log(&mut self) -> Result<(), String> {
-    self.wait_for_writes();
     let mut command = std::process::Command::new(&self.task_exe);
 
-    command.arg("log");
+    command.arg(QUIET).arg("log");
 
     let shell = self.command.as_str();
 
     match shlex::split(shell) {
       Some(cmd) => {
-        for s in cmd {
-          command.arg(&s);
-        }
-        let output = command.output();
-        match output {
-          Ok(_) => Ok(()),
-          Err(_) => Err(format!("Cannot run `task log {}`. Check documentation for more information", shell)),
-        }
+        command.args(cmd);
+        self.queue_write(TaskWrite::new("Log", false, Select::Nothing, (command, None)), &[]);
+        Ok(())
       }
       None => Err(format!("Unable to run `{:?}`: shlex::split(`{}`) failed.", command, shell)),
     }
@@ -2830,45 +2918,14 @@ impl TaskwarriorTui {
 
     let task_uuids = self.selected_task_uuids();
 
-    let mut command = std::process::Command::new(&self.task_exe);
-    command.arg("rc.bulk=0");
-    command.arg("rc.confirmation=off");
-    command.arg("rc.dependency.confirmation=off");
-    command.arg("rc.recurrence.confirmation=off");
-    command.arg(QUIET);
-    for task_uuid in &task_uuids {
-      command.arg(task_uuid.to_string());
-    }
-    command.arg("modify");
-
     let shell = self.modify.as_str().to_string();
 
     let r = match shlex::split(&shell) {
       Some(cmd) => {
-        for s in cmd {
-          command.arg(&s);
-        }
-        if self.worker.is_some() {
-          self.queue_write("Modify", true, command, &[]);
-          if !self.config.uda_task_report_jump_to_task_on_modify {
-            self.selection_follow = false;
-          }
-          return Ok(());
-        }
-        let output = command.output();
-        match output {
-          Ok(o) => {
-            if o.status.success() {
-              Ok(())
-            } else {
-              Err(format!("Modify failed. {}", String::from_utf8_lossy(&o.stdout)))
-            }
-          }
-          Err(_) => Err(format!(
-            "Cannot run `task {:?} modify {}`. Check documentation for more information",
-            task_uuids, shell,
-          )),
-        }
+        let after = [vec!["modify".to_string()], cmd].concat();
+        let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &after);
+        self.queue_write(TaskWrite::new("Modify", true, Select::Nothing, cmd), &[]);
+        Ok(())
       }
       None => Err(format!("Cannot shlex split `{}`", shell)),
     };
@@ -2887,46 +2944,14 @@ impl TaskwarriorTui {
 
     let task_uuids = self.selected_task_uuids();
 
-    let mut command = std::process::Command::new(&self.task_exe);
-    command.arg("rc.bulk=0");
-    command.arg("rc.confirmation=off");
-    command.arg("rc.dependency.confirmation=off");
-    command.arg("rc.recurrence.confirmation=off");
-    command.arg(QUIET);
-    for task_uuid in &task_uuids {
-      command.arg(task_uuid.to_string());
-    }
-    command.arg("annotate");
-
     let shell = self.command.as_str().to_string();
 
     let r = match shlex::split(&shell) {
       Some(cmd) => {
-        for s in cmd {
-          command.arg(&s);
-        }
-        if self.worker.is_some() {
-          self.queue_write("Annotate", true, command, &[]);
-          if let [uuid] = task_uuids.as_slice() {
-            self.current_selection_uuid = Some(*uuid);
-          }
-          return Ok(());
-        }
-        let output = command.output();
-        match output {
-          Ok(o) => {
-            if o.status.success() {
-              Ok(())
-            } else {
-              Err(format!("Annotate failed. {}", String::from_utf8_lossy(&o.stdout)))
-            }
-          }
-          Err(_) => Err(format!(
-            "Cannot run `task {} annotate {}`. Check documentation for more information",
-            task_uuids.iter().map(ToString::to_string).collect::<Vec<String>>().join(" "),
-            shell
-          )),
-        }
+        let after = [vec!["annotate".to_string()], cmd].concat();
+        let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &after);
+        self.queue_write(TaskWrite::new("Annotate", true, Select::Nothing, cmd), &[]);
+        Ok(())
       }
       None => Err(format!("Cannot shlex split `{}`", shell)),
     };
@@ -2938,35 +2963,18 @@ impl TaskwarriorTui {
   }
 
   pub fn task_add(&mut self) -> Result<(), String> {
-    self.wait_for_writes();
     let mut command = std::process::Command::new(&self.task_exe);
-    command.arg("add");
+    // new-id keeps the "Created task N." line jump-on-add reads and drops the
+    // project footnote.
+    command.arg("rc.verbose=new-id").arg("add");
 
     let shell = self.command.as_str();
 
     match shlex::split(shell) {
       Some(cmd) => {
-        for s in cmd {
-          command.arg(&s);
-        }
-        let output = command.output();
-        match output {
-          Ok(output) => {
-            if output.status.code() == Some(0) {
-              let data = String::from_utf8_lossy(&output.stdout);
-              let re = Regex::new(r"^Created task (?P<task_id>\d+).\n$").unwrap();
-              if self.config.uda_task_report_jump_to_task_on_add
-                && let Some(caps) = re.captures(&data)
-              {
-                self.current_selection_id = Some(caps["task_id"].parse::<u64>().unwrap_or_default());
-              }
-              Ok(())
-            } else {
-              Err(format!("Error: {}", String::from_utf8_lossy(&output.stderr)))
-            }
-          }
-          Err(e) => Err(format!("Cannot run `{:?}`: {}", command, e)),
-        }
+        command.args(cmd);
+        self.queue_write(TaskWrite::new("Add", true, Select::CreatedTask, (command, None)), &[]);
+        Ok(())
       }
       None => Err(format!("Unable to run `{:?}`: shlex::split(`{}`) failed.", command, shell)),
     }
@@ -2985,16 +2993,8 @@ impl TaskwarriorTui {
         _ => "start",
       };
 
-      let mut cmd = std::process::Command::new(&self.task_exe);
-      cmd.arg(QUIET).arg(task_uuid.to_string()).arg(command);
-      if self.worker.is_some() {
-        self.queue_write("Start/stop", false, cmd, &[]);
-        continue;
-      }
-      let output = cmd.output();
-      if output.is_err() {
-        return Err(format!("Error running `task {}` for task `{}`.", command, task_uuid));
-      }
+      let cmd = self.task_command(&[QUIET], &[*task_uuid], &[command.to_string()]);
+      self.queue_write(TaskWrite::new("Start/stop", false, Select::Nothing, cmd), &[]);
     }
 
     if let [uuid] = task_uuids.as_slice() {
@@ -3023,17 +3023,8 @@ impl TaskwarriorTui {
           }
         }
 
-        let mut cmd = std::process::Command::new(&self.task_exe);
-        cmd.arg(QUIET).arg(task_uuid.to_string()).arg("modify").arg(tag_to_set);
-        if self.worker.is_some() {
-          self.queue_write("Quick tag", false, cmd, &[]);
-          continue;
-        }
-        let output = cmd.output();
-
-        if output.is_err() {
-          return Err(format!("Error running `task modify {}` for task `{}`.", tag_to_set, task_uuid,));
-        }
+        let cmd = self.task_command(&[QUIET], &[*task_uuid], &["modify".to_string(), tag_to_set.clone()]);
+        self.queue_write(TaskWrite::new("Quick tag", false, Select::Nothing, cmd), &[]);
       }
     }
 
@@ -3051,34 +3042,11 @@ impl TaskwarriorTui {
 
     let task_uuids = self.selected_task_uuids();
 
-    let mut cmd = std::process::Command::new(&self.task_exe);
-    cmd
-      .arg("rc.bulk=0")
-      .arg("rc.confirmation=off")
-      .arg("rc.dependency.confirmation=off")
-      .arg("rc.recurrence.confirmation=off")
-      .arg(QUIET);
-    for task_uuid in &task_uuids {
-      cmd.arg(task_uuid.to_string());
-    }
-    cmd.arg("delete");
-    if self.worker.is_some() {
-      self.queue_write("Delete", false, cmd, &task_uuids);
-      self.current_selection_uuid = None;
-      self.current_selection_id = None;
-      return Ok(());
-    }
-    let output = cmd.output();
-    let r = match output {
-      Ok(_) => Ok(()),
-      Err(_) => Err(format!(
-        "Cannot run `task delete` for tasks `{}`. Check documentation for more information",
-        task_uuids.iter().map(ToString::to_string).collect::<Vec<String>>().join(" ")
-      )),
-    };
+    let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &["delete".to_string()]);
+    self.queue_write(TaskWrite::new("Delete", false, Select::Nothing, cmd), &task_uuids);
     self.current_selection_uuid = None;
     self.current_selection_id = None;
-    r
+    Ok(())
   }
 
   pub fn task_done(&mut self) -> Result<(), String> {
@@ -3086,131 +3054,48 @@ impl TaskwarriorTui {
       return Ok(());
     }
     let task_uuids = self.selected_task_uuids();
-    let mut cmd = std::process::Command::new(&self.task_exe);
-    cmd
-      .arg("rc.bulk=0")
-      .arg("rc.confirmation=off")
-      .arg("rc.dependency.confirmation=off")
-      .arg("rc.recurrence.confirmation=off")
-      .arg(QUIET);
-    for task_uuid in &task_uuids {
-      cmd.arg(task_uuid.to_string());
-    }
-    cmd.arg("done");
-    if self.worker.is_some() {
-      self.queue_write("Done", false, cmd, &task_uuids);
-      self.current_selection_uuid = None;
-      self.current_selection_id = None;
-      return Ok(());
-    }
-    let output = cmd.output();
-    let r = match output {
-      Ok(_) => Ok(()),
-      Err(_) => Err(format!(
-        "Cannot run `task done` for task `{}`. Check documentation for more information",
-        task_uuids.iter().map(ToString::to_string).collect::<Vec<String>>().join(" ")
-      )),
-    };
+    let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &["done".to_string()]);
+    self.queue_write(TaskWrite::new("Done", false, Select::Nothing, cmd), &task_uuids);
     self.current_selection_uuid = None;
     self.current_selection_id = None;
-    r
+    Ok(())
   }
 
   pub fn task_priority(&mut self, priority: &str) -> Result<(), String> {
     if self.tasks.is_empty() {
       return Ok(());
     }
-    let mut priority_arg = String::from("priority:");
-    priority_arg.push_str(priority);
     let task_uuids = self.selected_task_uuids();
-    let mut cmd = std::process::Command::new(&self.task_exe);
-    cmd
-      .arg("rc.bulk=0")
-      .arg("rc.confirmation=off")
-      .arg("rc.dependency.confirmation=off")
-      .arg("rc.recurrence.confirmation=off")
-      .arg(QUIET)
-      .arg("modify")
-      .arg(&priority_arg);
-    for task_uuid in &task_uuids {
-      cmd.arg(task_uuid.to_string());
-    }
-    if self.worker.is_some() {
-      self.queue_write("Modify priority", false, cmd, &[]);
-      self.current_selection_uuid = None;
-      self.current_selection_id = None;
-      return Ok(());
-    }
-    let output = cmd.output();
-    let r = match output {
-      Ok(_) => Ok(()),
-      Err(_) => Err(format!(
-        "Cannot run `task modify priority` for task `{}`. Check documentation for more information",
-        task_uuids.iter().map(ToString::to_string).collect::<Vec<String>>().join(" ")
-      )),
-    };
+    let after = ["modify".to_string(), format!("priority:{}", priority)];
+    let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &after);
+    self.queue_write(TaskWrite::new("Modify priority", false, Select::Nothing, cmd), &[]);
     self.current_selection_uuid = None;
     self.current_selection_id = None;
-    r
+    Ok(())
   }
 
   pub fn task_undo(&mut self) -> Result<(), String> {
-    self.wait_for_writes();
-    let output = std::process::Command::new(&self.task_exe).arg("rc.confirmation=off").arg("undo").output();
-
-    match output {
-      Ok(output) => {
-        let data = String::from_utf8_lossy(&output.stdout);
-        let re = Regex::new(r"(?P<task_uuid>[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})").unwrap();
-        if let Some(caps) = re.captures(&data)
-          && let Ok(uuid) = Uuid::parse_str(&caps["task_uuid"])
-        {
-          self.current_selection_uuid = Some(uuid);
-        }
-        Ok(())
-      }
-      Err(_) => Err("Cannot run `task undo`. Check documentation for more information".to_string()),
-    }
+    let mut cmd = std::process::Command::new(&self.task_exe);
+    cmd.arg("rc.confirmation=off").arg(QUIET).arg("undo");
+    self.queue_write(TaskWrite::new("Undo", false, Select::UndoneTask, (cmd, None)), &[]);
+    Ok(())
   }
 
   pub fn task_duplicate(&mut self) -> Result<(), String> {
-    self.wait_for_writes();
     if self.tasks.is_empty() {
       return Ok(());
     }
 
     let task_uuids = self.selected_task_uuids();
 
-    let mut command = std::process::Command::new(&self.task_exe);
-    command.arg("rc.bulk=0");
-    command.arg("rc.confirmation=off");
-    command.arg("rc.dependency.confirmation=off");
-    command.arg("rc.recurrence.confirmation=off");
-    for task_uuid in &task_uuids {
-      command.arg(task_uuid.to_string());
-    }
-    command.arg("duplicate");
-
-    let output = command.output();
-    let r = match output {
-      Ok(o) => {
-        if o.status.success() {
-          Ok(())
-        } else {
-          Err(format!("Modify failed. {}", String::from_utf8_lossy(&o.stdout)))
-        }
-      }
-      Err(_) => Err(format!(
-        "Cannot run `task {:?} duplicate`. Check documentation for more information",
-        task_uuids,
-      )),
-    };
+    let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &["duplicate".to_string()]);
+    self.queue_write(TaskWrite::new("Duplicate", true, Select::Nothing, cmd), &[]);
 
     if let [uuid] = task_uuids.as_slice() {
       self.current_selection_uuid = Some(*uuid);
     }
 
-    r
+    Ok(())
   }
 
   pub async fn task_edit(&mut self) -> Result<(), String> {
@@ -3222,13 +3107,23 @@ impl TaskwarriorTui {
     self.pause_tui().await.unwrap();
 
     let selected = self.current_selection;
-    let task_id = self.tasks[selected].id().unwrap_or_default();
     let task_uuid = *self.tasks[selected].uuid();
+    // Filtered as in task_command, but with the id taskwarrior holds now: the
+    // table's id can predate the writes just run.
+    let task_id = std::process::Command::new(&self.task_exe)
+      .arg("_get")
+      .arg(format!("{}.id", task_uuid))
+      .output()
+      .ok()
+      .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+      .unwrap_or_default();
+    let filter = if task_id > 0 {
+      vec![task_id.to_string(), format!("uuid:{}", task_uuid)]
+    } else {
+      vec![task_uuid.to_string()]
+    };
 
-    let r = std::process::Command::new(&self.task_exe)
-      .arg(format!("{}", task_uuid))
-      .arg("edit")
-      .spawn();
+    let r = std::process::Command::new(&self.task_exe).args(&filter).arg("edit").spawn();
 
     let r = match r {
       Ok(child) => {
@@ -5291,6 +5186,8 @@ mod tests {
     test_draw_command_shows_control_characters().await;
     test_write_commands_turn_off_footnotes().await;
     test_done_runs_in_background().await;
+    test_write_names_one_task_by_guarded_id().await;
+    test_undo_and_add_run_in_background().await;
 
     teardown();
   }
@@ -5435,14 +5332,101 @@ mod tests {
     app.task_priority("H").unwrap();
     app.task_delete().unwrap();
     app.task_done().unwrap();
+    app.task_duplicate().unwrap();
+    app.task_log().unwrap();
+    app.task_undo().unwrap();
 
     let calls = std::fs::read_to_string(&log).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
-    assert_eq!(calls.len(), 7, "{calls:?}");
+    assert_eq!(calls.len(), 10, "{calls:?}");
     for call in calls {
       assert!(call.split(' ').any(|arg| arg == QUIET), "missing {QUIET}: {call}");
     }
+  }
+
+  async fn test_write_names_one_task_by_guarded_id() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The stub logs each call. While `miss` exists, a uuid: filter matches
+    // nothing, as after taskwarrior renumbers the task.
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("argv.log");
+    let miss = dir.join("miss");
+    let stub = dir.join("task");
+    std::fs::write(
+      &stub,
+      format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in *uuid:*) [ -e '{}' ] && exit 1 ;; esac\nexit 0\n",
+        log.display(),
+        miss.display()
+      ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.task_exe = stub.display().to_string();
+    let task = app.task_current().unwrap();
+    let (id, uuid) = (task.id().unwrap(), *task.uuid());
+
+    app.task_done().unwrap();
+    std::fs::write(&miss, "").unwrap();
+    app.task_done().unwrap();
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let calls: Vec<Vec<&str>> = calls.lines().map(|c| c.split(' ').collect()).collect();
+    let (id, guard, uuid) = (id.to_string(), format!("uuid:{uuid}"), uuid.to_string());
+    let guarded = [id.as_str(), &guard, "done"];
+    let bare = [uuid.as_str(), "done"];
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[0].ends_with(&guarded), "{:?}", calls[0]);
+    assert!(calls[1].ends_with(&guarded), "{:?}", calls[1]);
+    assert!(calls[2].ends_with(&bare), "a missed id was not retried by uuid: {:?}", calls[2]);
+    assert!(app.error.is_none(), "{:?}", app.error);
+  }
+
+  async fn test_undo_and_add_run_in_background() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let undone = Uuid::new_v4();
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-undo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("task");
+    std::fs::write(
+      &stub,
+      format!(
+        "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    undo) sleep 1; echo '{undone} Update property'; exit 0 ;;\n    add) sleep 1; echo 'Created task 7.'; exit 0 ;;\n  esac\ndone\nexit 0\n"
+      ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.task_exe = stub.display().to_string();
+    app.worker = Some(Worker::spawn());
+    app.config.uda_task_report_jump_to_task_on_add = true;
+    app.command.update("a new task", 10, &mut app.changes);
+
+    let start = Instant::now();
+    app.task_undo().unwrap();
+    app.task_add().unwrap();
+    assert!(start.elapsed() < Duration::from_millis(500), "undo and add waited {:?}", start.elapsed());
+
+    for _ in 0..2 {
+      let worker = app.worker.as_mut().unwrap();
+      let result = tokio::time::timeout(Duration::from_secs(30), worker.results.recv())
+        .await
+        .expect("worker result")
+        .expect("worker running");
+      app.apply_job_result(result);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(app.current_selection_uuid, Some(undone));
+    assert_eq!(app.current_selection_id, Some(7));
+    assert_eq!(app.writes_in_flight, 0);
   }
 
   async fn test_task_tags() {
