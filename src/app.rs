@@ -132,6 +132,16 @@ impl Worker {
   }
 }
 
+// Clears the screen and resets the back buffer, so the next draw repaints every
+// cell. terminal.clear() would do the same, but it first queries the cursor
+// position, and that query times out while the event stream is reading stdin:
+// after a resize, and after a shortcut, edit or shell command hands the
+// terminal back.
+fn repaint_all<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+  let size = terminal.size()?;
+  terminal.resize(Rect::new(0, 0, size.width, size.height))
+}
+
 enum Step {
   Event(Event<KeyCode>),
   Job(JobResult),
@@ -518,7 +528,7 @@ impl TaskwarriorTui {
     let mut hangup = Hangup::new()?;
     loop {
       if self.requires_redraw {
-        terminal.clear()?;
+        repaint_all(terminal)?;
         self.requires_redraw = false;
       }
       terminal.draw(|f| self.draw(f))?;
@@ -547,12 +557,7 @@ impl TaskwarriorTui {
           }
           Event::Resize => {
             debug!("Resize event");
-            // resize() clears the screen and resets the back buffer, so the next
-            // draw repaints every cell. terminal.clear() would do the same, but it
-            // first queries the cursor position, and that query times out while
-            // the event stream is reading stdin.
-            let size = terminal.size()?;
-            terminal.resize(Rect::new(0, 0, size.width, size.height))?;
+            repaint_all(terminal)?;
           }
           Event::Tick => {
             debug!("Tick event");
@@ -5288,6 +5293,68 @@ mod tests {
     test_done_runs_in_background().await;
 
     teardown();
+  }
+
+  // A terminal that cannot answer a cursor position query, as when the event
+  // stream is reading stdin.
+  struct NoCursorQuery(TestBackend);
+
+  impl Backend for NoCursorQuery {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+      I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+      self.0.draw(content).map_err(|e| match e {})
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+      self.0.hide_cursor().map_err(|e| match e {})
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+      self.0.show_cursor().map_err(|e| match e {})
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+      Err(io::Error::other("The cursor position could not be read within a normal duration"))
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+      self.0.set_cursor_position(position).map_err(|e| match e {})
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+      self.0.clear().map_err(|e| match e {})
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+      self.0.clear_region(clear_type).map_err(|e| match e {})
+    }
+
+    fn size(&self) -> io::Result<ratatui::layout::Size> {
+      self.0.size().map_err(|e| match e {})
+    }
+
+    fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+      self.0.window_size().map_err(|e| match e {})
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+      self.0.flush().map_err(|e| match e {})
+    }
+  }
+
+  #[test]
+  fn test_repaint_all_does_not_read_cursor_position() {
+    let mut terminal = Terminal::new(NoCursorQuery(TestBackend::new(20, 4))).unwrap();
+    terminal.draw(|f| f.render_widget(Paragraph::new("before"), f.area())).unwrap();
+    assert!(terminal.clear().is_err(), "the stub must reject cursor queries");
+
+    repaint_all(&mut terminal).unwrap();
+    terminal.draw(|f| f.render_widget(Paragraph::new("after"), f.area())).unwrap();
+    assert!(buffer_view(terminal.backend().0.buffer()).contains("after"));
   }
 
   async fn test_done_runs_in_background() {
