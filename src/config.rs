@@ -132,6 +132,7 @@ pub struct Config {
   pub uda_style_help_gauge: Style,
   pub uda_style_command_error: Style,
   pub uda_shortcuts: Vec<String>,
+  pub uda_shortcuts_background: Vec<usize>,
   pub uda_change_focus_rotate: bool,
   pub uda_background_process: String,
   pub uda_background_process_period: usize,
@@ -216,6 +217,7 @@ impl Config {
     let uda_style_help_gauge = Self::get_uda_style("help.gauge", data);
     let uda_style_command_error = Self::get_uda_style("command.error", data);
     let uda_shortcuts = Self::get_uda_shortcuts(data);
+    let uda_shortcuts_background = Self::get_uda_shortcuts_background(data);
     let uda_background_process = Self::get_uda_background_process(data);
     let uda_background_process_period = Self::get_uda_background_process_period(data);
     let uda_style_report_selection = uda_style_report_selection.unwrap_or_default();
@@ -301,6 +303,7 @@ impl Config {
       uda_style_help_gauge,
       uda_style_command_error,
       uda_shortcuts,
+      uda_shortcuts_background,
       uda_background_process,
       uda_background_process_period,
       uda_quick_tag_name,
@@ -340,6 +343,17 @@ impl Config {
       v.push(s);
     }
     v
+  }
+
+  // Shortcuts that run in the write queue instead of taking the terminal, as
+  // `uda.taskwarrior-tui.shortcuts.background=5,6,9`.
+  fn get_uda_shortcuts_background(data: &str) -> Vec<usize> {
+    Self::get_config("uda.taskwarrior-tui.shortcuts.background", data)
+      .unwrap_or_default()
+      .split(',')
+      .filter_map(|s| s.trim().parse::<usize>().ok())
+      .filter(|s| *s <= 9)
+      .collect()
   }
 
   fn get_uda_style(config: &str, data: &str) -> Option<Style> {
@@ -1277,6 +1291,13 @@ mod tests {
     assert_eq!(c.fg.unwrap(), Color::Indexed(150));
     assert_eq!(c.add_modifier & Modifier::BOLD, Modifier::BOLD);
     assert_eq!(c.add_modifier & Modifier::UNDERLINED, Modifier::UNDERLINED);
+  }
+
+  #[test]
+  fn test_get_uda_shortcuts_background() {
+    let data = "uda.taskwarrior-tui.shortcuts.5 ~/toggle.sh\nuda.taskwarrior-tui.shortcuts.background 5, 6,9,12,x\n";
+    assert_eq!(Config::get_uda_shortcuts_background(data), [5, 6, 9]);
+    assert!(Config::get_uda_shortcuts_background("uda.taskwarrior-tui.shortcuts.5 ~/toggle.sh\n").is_empty());
   }
 
   #[test]

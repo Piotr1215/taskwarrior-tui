@@ -2850,18 +2850,15 @@ impl TaskwarriorTui {
     });
   }
 
-  pub async fn task_shortcut(&mut self, s: usize) -> Result<(), String> {
-    self.wait_for_writes();
-    self.pause_tui().await.unwrap();
-
-    let task_uuids = if self.tasks.is_empty() { vec![] } else { self.selected_task_uuids() };
-
+  // The shortcut's command line with the selected tasks' UUIDs appended.
+  fn shortcut_shell(&self, s: usize) -> Result<String, String> {
     let shell = &self.config.uda_shortcuts[s];
 
     if shell.is_empty() {
-      self.resume_tui().await.unwrap();
       return Err("Trying to run empty shortcut.".to_string());
     }
+
+    let task_uuids = if self.tasks.is_empty() { vec![] } else { self.selected_task_uuids() };
 
     let shell = format!(
       "{} {}",
@@ -2869,7 +2866,39 @@ impl TaskwarriorTui {
       task_uuids.iter().map(ToString::to_string).collect::<Vec<String>>().join(" ")
     );
 
-    let shell = shellexpand::tilde(&shell).into_owned();
+    Ok(shellexpand::tilde(&shell).into_owned())
+  }
+
+  // A shortcut listed in uda.taskwarrior-tui.shortcuts.background runs in the
+  // write queue: the TUI keeps the terminal and the next key, and the shortcut
+  // still runs after every write queued before it.
+  fn task_shortcut_background(&mut self, s: usize) -> Result<(), String> {
+    let shell = self.shortcut_shell(s)?;
+    let Some(cmd) = shlex::split(&shell).filter(|cmd| !cmd.is_empty()) else {
+      return Err(format!("Unable to run shortcut number {}: shlex::split(`{}`) failed.", s, shell));
+    };
+    let mut command = std::process::Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    self.queue_write(TaskWrite::new("Shortcut", true, Select::Nothing, (command, None)), &[]);
+
+    if !self.config.uda_task_report_jump_to_task_on_modify {
+      self.selection_follow = false;
+    }
+
+    Ok(())
+  }
+
+  pub async fn task_shortcut(&mut self, s: usize) -> Result<(), String> {
+    if self.config.uda_shortcuts_background.contains(&s) {
+      return self.task_shortcut_background(s);
+    }
+
+    self.wait_for_writes();
+
+    let shell = self.shortcut_shell(s)?;
+
+    self.pause_tui().await.unwrap();
+
     let r = match shlex::split(&shell) {
       Some(cmd) => {
         let mut command = std::process::Command::new(&cmd[0]);
@@ -5188,6 +5217,7 @@ mod tests {
     test_done_runs_in_background().await;
     test_write_names_one_task_by_guarded_id().await;
     test_undo_and_add_run_in_background().await;
+    test_background_shortcut_keeps_the_terminal().await;
 
     teardown();
   }
@@ -5386,6 +5416,42 @@ mod tests {
     assert!(calls[1].ends_with(&guarded), "{:?}", calls[1]);
     assert!(calls[2].ends_with(&bare), "a missed id was not retried by uuid: {:?}", calls[2]);
     assert!(app.error.is_none(), "{:?}", app.error);
+  }
+
+  async fn test_background_shortcut_keeps_the_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-shortcut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("argv.log");
+    let script = dir.join("shortcut.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nsleep 1\necho \"$*\" >> '{}'\n", log.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.worker = Some(Worker::spawn());
+    app.config.uda_shortcuts[5] = script.display().to_string();
+    app.config.uda_shortcuts_background = vec![5];
+    let uuid = app.selected_task_uuids()[0];
+
+    let start = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), app.task_shortcut(5))
+      .await
+      .expect("shortcut returned")
+      .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(500), "shortcut waited {:?}", start.elapsed());
+
+    let worker = app.worker.as_mut().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(30), worker.results.recv())
+      .await
+      .expect("worker result")
+      .expect("worker running");
+    app.apply_job_result(result);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(calls.trim(), uuid.to_string());
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(app.writes_in_flight, 0);
   }
 
   async fn test_undo_and_add_run_in_background() {

@@ -118,6 +118,14 @@ For example, you can add the `personal` tag to the currently selected task with 
 task rc.bulk=0 rc.confirmation=off rc.dependency.confirmation=off rc.recurrence.confirmation=off "$@" modify +personal
 ```
 
+A shortcut normally takes over the terminal until its script exits. A script that only changes tasks and needs no input can run in the background instead, queued behind the TUI's own writes, so the next key is handled at once:
+
+```plaintext
+uda.taskwarrior-tui.shortcuts.background=1,5
+```
+
+A background shortcut gets no terminal input, and its output shows only when it fails.
+
 By default, shortcuts are linked to the `1-9` number row keys. They can be customized as any other keys through `uda.taskwarrior-tui.keyconfig.shortcut1=<key>`. For example:
 
 ```plaintext
