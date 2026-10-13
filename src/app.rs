@@ -153,6 +153,7 @@ pub struct TaskwarriorTui {
   pub current_selection: usize,
   pub current_selection_uuid: Option<Uuid>,
   pub current_selection_id: Option<u64>,
+  pub selection_follow: bool,
   pub task_report_table: TaskReportTable,
   pub calendar_year: i32,
   pub mode: Mode,
@@ -247,6 +248,7 @@ impl TaskwarriorTui {
       current_selection: 0,
       current_selection_uuid: None,
       current_selection_id: None,
+      selection_follow: true,
       current_context_filter: "".to_string(),
       current_context: "".to_string(),
       command: LineBuffer::with_capacity(MAX_LINE),
@@ -386,6 +388,15 @@ impl TaskwarriorTui {
           Event::Paste(paste) => {
             debug!("Received paste of {} bytes", paste.len());
             self.handle_paste(&paste);
+          }
+          Event::Resize => {
+            debug!("Resize event");
+            // resize() clears the screen and resets the back buffer, so the next
+            // draw repaints every cell. terminal.clear() would do the same, but it
+            // first queries the cursor position, and that query times out while
+            // the event stream is reading stdin.
+            let size = terminal.size()?;
+            terminal.resize(Rect::new(0, 0, size.width, size.height))?;
           }
           Event::Tick => {
             debug!("Tick event");
@@ -1565,7 +1576,8 @@ impl TaskwarriorTui {
     }
 
     // now start trimming
-    while (widths.iter().sum::<usize>() as u16) >= maximum_column_width - (headers.len()) as u16 {
+    let trim_target = maximum_column_width.saturating_sub(headers.len() as u16) as usize;
+    while widths.iter().sum::<usize>() >= trim_target {
       let index = widths.iter().position(|i| i == widths.iter().max().unwrap_or(&0)).unwrap_or_default();
       if widths[index] == 1 {
         break;
@@ -1667,12 +1679,14 @@ impl TaskwarriorTui {
     if force || self.dirty || self.tasks_changed_since(self.last_export).unwrap_or(true) {
       self.get_context()?;
       let task_uuids = self.selected_task_uuids();
-      if self.current_selection_uuid.is_none()
+      if self.selection_follow
+        && self.current_selection_uuid.is_none()
         && self.current_selection_id.is_none()
         && let [uuid] = task_uuids.as_slice()
       {
         self.current_selection_uuid = Some(*uuid);
       }
+      self.selection_follow = true;
 
       self.task_report_table.export_headers(None, &self.report, &self.task_exe)?;
       self.export_tasks()?;
@@ -2459,8 +2473,8 @@ impl TaskwarriorTui {
       None => Err(format!("Unable to run shortcut number {}: shlex::split(`{}`) failed.", s, shell)),
     };
 
-    if let [uuid] = task_uuids.as_slice() {
-      self.current_selection_uuid = Some(*uuid);
+    if !self.config.uda_task_report_jump_to_task_on_modify {
+      self.selection_follow = false;
     }
 
     self.resume_tui().await.unwrap();
@@ -2510,8 +2524,8 @@ impl TaskwarriorTui {
       None => Err(format!("Cannot shlex split `{}`", shell)),
     };
 
-    if let [uuid] = task_uuids.as_slice() {
-      self.current_selection_uuid = Some(*uuid);
+    if !self.config.uda_task_report_jump_to_task_on_modify {
+      self.selection_follow = false;
     }
 
     r
