@@ -67,6 +67,119 @@ const MAX_LINE: usize = 4096;
 // project completion, about 0.7s per action on a 45k-task database.
 const QUIET: &str = "rc.verbose=nothing";
 
+// A taskwarrior write or report export can take seconds on a large database,
+// more while other processes use it. The UI loop hands both to one background
+// thread instead of waiting, and that thread runs them in the order queued, so
+// an export always sees every write queued before it.
+enum Job {
+  Write {
+    label: &'static str,
+    report_errors: bool,
+    cmd: std::process::Command,
+  },
+  Export {
+    cmd: std::process::Command,
+  },
+}
+
+// `seq` is the queue position of the job that produced the result.
+enum JobResult {
+  Write {
+    label: &'static str,
+    report_errors: bool,
+    output: io::Result<std::process::Output>,
+  },
+  Export {
+    seq: u64,
+    desc: String,
+    output: io::Result<std::process::Output>,
+  },
+}
+
+struct Worker {
+  jobs: mpsc::Sender<(u64, Job)>,
+  results: tokio::sync::mpsc::UnboundedReceiver<JobResult>,
+}
+
+impl Worker {
+  fn spawn() -> Self {
+    let (jobs, queue) = mpsc::channel::<(u64, Job)>();
+    let (tx, results) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+      for (seq, job) in queue {
+        let result = match job {
+          Job::Write {
+            label,
+            report_errors,
+            mut cmd,
+          } => JobResult::Write {
+            label,
+            report_errors,
+            output: cmd.output(),
+          },
+          Job::Export { mut cmd } => JobResult::Export {
+            seq,
+            desc: format!("{:?}", cmd),
+            output: cmd.output(),
+          },
+        };
+        if tx.send(result).is_err() {
+          break;
+        }
+      }
+    });
+    Self { jobs, results }
+  }
+}
+
+enum Step {
+  Event(Event<KeyCode>),
+  Job(JobResult),
+  Hangup,
+}
+
+// Closing the terminal sends SIGHUP to the TUI's process group, which would
+// drop writes still queued. The TUI catches it, and SIGTERM, to run them
+// before it exits; queue_write starts each write in its own process group so
+// one already running is not killed with the TUI's.
+#[cfg(unix)]
+struct Hangup {
+  hangup: tokio::signal::unix::Signal,
+  terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Hangup {
+  fn new() -> io::Result<Self> {
+    use tokio::signal::unix::{SignalKind, signal};
+    Ok(Self {
+      hangup: signal(SignalKind::hangup())?,
+      terminate: signal(SignalKind::terminate())?,
+    })
+  }
+
+  async fn recv(&mut self) {
+    tokio::select! {
+      _ = self.hangup.recv() => {},
+      _ = self.terminate.recv() => {},
+    }
+  }
+}
+
+#[cfg(not(unix))]
+struct Hangup;
+
+#[cfg(not(unix))]
+impl Hangup {
+  fn new() -> io::Result<Self> {
+    Ok(Self)
+  }
+
+  async fn recv(&mut self) {
+    std::future::pending::<()>().await
+  }
+}
+
 static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 static TASKWARRIOR_VERSION_SUPPORTED: LazyLock<Versioning> = LazyLock::new(|| Versioning::new("3.0.0").unwrap());
 
@@ -195,6 +308,14 @@ pub struct TaskwarriorTui {
   pub timesheet_data: String,
   pub timesheet_scroll: u16,
   pub timesheet_line_count: u16,
+  worker: Option<Worker>,
+  job_seq: u64,
+  writes_in_flight: usize,
+  last_write_seq: u64,
+  export_in_flight: Option<u64>,
+  refresh_again: bool,
+  // Rows removed before their write ran, keyed to the write's queue position.
+  hidden_tasks: HashMap<Uuid, u64>,
 }
 
 impl TaskwarriorTui {
@@ -295,6 +416,13 @@ impl TaskwarriorTui {
       timesheet_data: String::new(),
       timesheet_scroll: 0,
       timesheet_line_count: 0,
+      worker: None,
+      job_seq: 0,
+      writes_in_flight: 0,
+      last_write_seq: 0,
+      export_in_flight: None,
+      refresh_again: false,
+      hidden_tasks: HashMap::new(),
     };
 
     for c in app.config.filter.chars() {
@@ -377,14 +505,37 @@ impl TaskwarriorTui {
   }
 
   pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    if self.worker.is_none() {
+      self.worker = Some(Worker::spawn());
+    }
+    let r = self.run_loop(terminal).await;
+    // However the loop ended, writes already queued still run.
+    self.wait_for_writes();
+    r
+  }
+
+  async fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    let mut hangup = Hangup::new()?;
     loop {
       if self.requires_redraw {
         terminal.clear()?;
         self.requires_redraw = false;
       }
       terminal.draw(|f| self.draw(f))?;
-      // Handle input
-      if let Some(event) = self.next().await {
+      let step = match self.worker.as_mut() {
+        Some(worker) => tokio::select! {
+          event = self.event_loop.rx.recv() => event.map(Step::Event),
+          Some(result) = worker.results.recv() => Some(Step::Job(result)),
+          () = hangup.recv() => Some(Step::Hangup),
+        },
+        None => self.event_loop.rx.recv().await.map(Step::Event),
+      };
+      if let Some(Step::Hangup) = step {
+        debug!("Hangup, exiting");
+        break;
+      } else if let Some(Step::Job(result)) = step {
+        self.handle_job_result(result).await?;
+      } else if let Some(Step::Event(event)) = step {
         match event {
           Event::Input(input) => {
             debug!("Received input = {:?}", input);
@@ -418,6 +569,159 @@ impl TaskwarriorTui {
       }
     }
     Ok(())
+  }
+
+  // Hands the job back when there is no worker to run it.
+  fn queue(&mut self, job: Job) -> Result<u64, Box<Job>> {
+    let Some(worker) = self.worker.as_ref() else {
+      return Err(Box::new(job));
+    };
+    let seq = self.job_seq + 1;
+    worker.jobs.send((seq, job)).map_err(|e| Box::new(e.0.1))?;
+    self.job_seq = seq;
+    Ok(seq)
+  }
+
+  // Queues a taskwarrior write. Rows in `hide` leave the table at once rather
+  // than after the write and the export behind it have run.
+  fn queue_write(&mut self, label: &'static str, report_errors: bool, mut cmd: std::process::Command, hide: &[Uuid]) {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    match self.queue(Job::Write { label, report_errors, cmd }) {
+      Ok(seq) => {
+        self.writes_in_flight += 1;
+        self.last_write_seq = seq;
+        if !hide.is_empty() {
+          for uuid in hide {
+            self.hidden_tasks.insert(*uuid, seq);
+          }
+          self.tasks.retain(|t| !hide.contains(t.uuid()));
+          self.cursor_fix();
+          self.update_task_table_state();
+        }
+      }
+      Err(job) => {
+        if let Job::Write { mut cmd, .. } = *job {
+          let output = cmd.output();
+          self.apply_write_result(label, report_errors, output);
+        }
+      }
+    }
+  }
+
+  fn request_export(&mut self) {
+    // An export queued after the last write already covers it; ask for one
+    // more round only, for changes made outside this TUI since it was queued.
+    if let Some(seq) = self.export_in_flight
+      && seq > self.last_write_seq
+    {
+      self.refresh_again = true;
+      return;
+    }
+    match self.queue(Job::Export { cmd: self.export_command() }) {
+      Ok(seq) => self.export_in_flight = Some(seq),
+      Err(_) => {
+        if let Err(e) = self.export_tasks() {
+          self.error = Some(e.to_string());
+        }
+      }
+    }
+  }
+
+  fn apply_write_result(&mut self, label: &str, report_errors: bool, output: io::Result<std::process::Output>) {
+    let error = match output {
+      Ok(o) if o.status.success() => return,
+      Ok(o) => format!(
+        "{} failed. {}{}",
+        label,
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+      ),
+      Err(e) => format!("Cannot run `task {}`: {}", label, e),
+    };
+    warn!("{}", error);
+    if report_errors {
+      self.error = Some(error);
+      self.mode = Mode::Tasks(Action::Error);
+    }
+  }
+
+  // Applies a worker result without awaiting, so wait_for_writes can use it.
+  // Returns true when the tasks table was reloaded.
+  fn apply_job_result(&mut self, result: JobResult) -> bool {
+    match result {
+      JobResult::Write {
+        label,
+        report_errors,
+        output,
+      } => {
+        self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
+        self.apply_write_result(label, report_errors, output);
+        false
+      }
+      JobResult::Export { seq, desc, output } => {
+        if self.export_in_flight == Some(seq) {
+          self.export_in_flight = None;
+        }
+        // Writes queued before this export are in its output, so their rows
+        // no longer need hiding.
+        self.hidden_tasks.retain(|_, write| *write > seq);
+        match output {
+          Ok(output) => {
+            if self.selection_follow
+              && self.current_selection_uuid.is_none()
+              && self.current_selection_id.is_none()
+              && let [uuid] = self.selected_task_uuids().as_slice()
+            {
+              self.current_selection_uuid = Some(*uuid);
+            }
+            self.selection_follow = true;
+            self.apply_export(&desc, &output);
+            self.update_tags();
+            self.task_details.clear();
+            self.task_details_modified.clear();
+            self.last_export = Some(std::time::SystemTime::now());
+            self.cursor_fix();
+            self.update_task_table_state();
+            self.selection_fix();
+          }
+          Err(e) => self.error = Some(format!("Cannot run `{}`: {}", desc, e)),
+        }
+        true
+      }
+    }
+  }
+
+  async fn handle_job_result(&mut self, result: JobResult) -> Result<()> {
+    if self.apply_job_result(result) {
+      if self.task_report_info_show {
+        self.update_task_details().await?;
+      }
+      if self.refresh_again && self.export_in_flight.is_none() {
+        self.refresh_again = false;
+        self.update(true).await?;
+      }
+    }
+    Ok(())
+  }
+
+  // Blocks until every queued write has run. Undo, add, edit and shortcuts
+  // call this first so they never overtake a write still in the queue.
+  fn wait_for_writes(&mut self) {
+    while self.writes_in_flight > 0 {
+      let Some(worker) = self.worker.as_mut() else {
+        return;
+      };
+      match worker.results.try_recv() {
+        Ok(result) => {
+          self.apply_job_result(result);
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+          self.writes_in_flight = 0;
+        }
+      }
+    }
   }
 
   pub fn reset_command(&mut self) {
@@ -1681,20 +1985,31 @@ impl TaskwarriorTui {
 
   pub async fn update(&mut self, force: bool) -> Result<()> {
     trace!("self.update({:?});", force);
-    if force || self.dirty || self.tasks_changed_since(self.last_export).unwrap_or(true) {
+    // While a queued export is outstanding its result will reflect the change
+    // a tick would notice, so only an explicit refresh queues another.
+    let changed = self.export_in_flight.is_none() && self.tasks_changed_since(self.last_export).unwrap_or(true);
+    if force || self.dirty || changed {
       self.get_context()?;
-      let task_uuids = self.selected_task_uuids();
-      if self.selection_follow
-        && self.current_selection_uuid.is_none()
-        && self.current_selection_id.is_none()
-        && let [uuid] = task_uuids.as_slice()
-      {
-        self.current_selection_uuid = Some(*uuid);
+      // With the worker the export lands later, so the row to follow is
+      // picked when it lands, not now.
+      if self.worker.is_none() {
+        let task_uuids = self.selected_task_uuids();
+        if self.selection_follow
+          && self.current_selection_uuid.is_none()
+          && self.current_selection_id.is_none()
+          && let [uuid] = task_uuids.as_slice()
+        {
+          self.current_selection_uuid = Some(*uuid);
+        }
+        self.selection_follow = true;
       }
-      self.selection_follow = true;
 
       self.task_report_table.export_headers(None, &self.report, &self.task_exe)?;
-      self.export_tasks()?;
+      if self.worker.is_some() {
+        self.request_export();
+      } else {
+        self.export_tasks()?;
+      }
       if self.config.uda_task_report_use_all_tasks_for_completion {
         self.export_all_tasks()?;
       }
@@ -2246,6 +2561,14 @@ impl TaskwarriorTui {
   }
 
   pub fn export_tasks(&mut self) -> Result<()> {
+    let mut task = self.export_command();
+    info!("Running `{:#?}`", task);
+    let output = task.output()?;
+    self.apply_export(&format!("{:?}", task), &output);
+    Ok(())
+  }
+
+  fn export_command(&self) -> std::process::Command {
     let mut task = std::process::Command::new(&self.task_exe);
 
     task
@@ -2278,15 +2601,22 @@ impl TaskwarriorTui {
       task.arg(&self.report);
     }
 
-    info!("Running `{:#?}`", task);
-    let output = task.output()?;
+    task
+  }
+
+  fn apply_export(&mut self, task: &str, output: &std::process::Output) {
     let data = String::from_utf8_lossy(&output.stdout);
     let error = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() {
       let imported = import(data.as_bytes());
       match imported {
-        Ok(imported) => {
+        Ok(mut imported) => {
+          // Rows removed optimistically stay hidden until an export that ran
+          // after their write arrives; see JobResult::Export.
+          if !self.hidden_tasks.is_empty() {
+            imported.retain(|t| !self.hidden_tasks.contains_key(t.uuid()));
+          }
           self.tasks = imported;
           info!("Imported {} tasks", self.tasks.len());
           self.error = None;
@@ -2296,17 +2626,15 @@ impl TaskwarriorTui {
           }
         }
         Err(err) => {
-          self.error = Some(format!("Unable to parse output of `{:?}`:\n`{:?}`", task, data));
+          self.error = Some(format!("Unable to parse output of `{}`:\n`{:?}`", task, data));
           self.mode = Mode::Tasks(Action::Error);
           debug!("Unable to parse output:\n\n{}", data);
           debug!("Error: {:?}", err);
         }
       }
     } else {
-      self.error = Some(format!("Cannot run `{:?}` - ({}) error:\n{}", &task, output.status, error));
+      self.error = Some(format!("Cannot run `{}` - ({}) error:\n{}", task, output.status, error));
     }
-
-    Ok(())
   }
 
   pub fn selected_task_uuids(&self) -> Vec<Uuid> {
@@ -2330,6 +2658,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_subprocess(&mut self) -> Result<(), String> {
+    self.wait_for_writes();
     let task_uuids = if self.tasks.is_empty() { vec![] } else { self.selected_task_uuids() };
 
     let shell = self.command.as_str();
@@ -2376,6 +2705,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_log(&mut self) -> Result<(), String> {
+    self.wait_for_writes();
     let mut command = std::process::Command::new(&self.task_exe);
 
     command.arg("log");
@@ -2428,6 +2758,7 @@ impl TaskwarriorTui {
   }
 
   pub async fn task_shortcut(&mut self, s: usize) -> Result<(), String> {
+    self.wait_for_writes();
     self.pause_tui().await.unwrap();
 
     let task_uuids = if self.tasks.is_empty() { vec![] } else { self.selected_task_uuids() };
@@ -2505,12 +2836,19 @@ impl TaskwarriorTui {
     }
     command.arg("modify");
 
-    let shell = self.modify.as_str();
+    let shell = self.modify.as_str().to_string();
 
-    let r = match shlex::split(shell) {
+    let r = match shlex::split(&shell) {
       Some(cmd) => {
         for s in cmd {
           command.arg(&s);
+        }
+        if self.worker.is_some() {
+          self.queue_write("Modify", true, command, &[]);
+          if !self.config.uda_task_report_jump_to_task_on_modify {
+            self.selection_follow = false;
+          }
+          return Ok(());
         }
         let output = command.output();
         match output {
@@ -2555,12 +2893,19 @@ impl TaskwarriorTui {
     }
     command.arg("annotate");
 
-    let shell = self.command.as_str();
+    let shell = self.command.as_str().to_string();
 
-    let r = match shlex::split(shell) {
+    let r = match shlex::split(&shell) {
       Some(cmd) => {
         for s in cmd {
           command.arg(&s);
+        }
+        if self.worker.is_some() {
+          self.queue_write("Annotate", true, command, &[]);
+          if let [uuid] = task_uuids.as_slice() {
+            self.current_selection_uuid = Some(*uuid);
+          }
+          return Ok(());
         }
         let output = command.output();
         match output {
@@ -2588,6 +2933,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_add(&mut self) -> Result<(), String> {
+    self.wait_for_writes();
     let mut command = std::process::Command::new(&self.task_exe);
     command.arg("add");
 
@@ -2634,11 +2980,13 @@ impl TaskwarriorTui {
         _ => "start",
       };
 
-      let output = std::process::Command::new(&self.task_exe)
-        .arg(QUIET)
-        .arg(task_uuid.to_string())
-        .arg(command)
-        .output();
+      let mut cmd = std::process::Command::new(&self.task_exe);
+      cmd.arg(QUIET).arg(task_uuid.to_string()).arg(command);
+      if self.worker.is_some() {
+        self.queue_write("Start/stop", false, cmd, &[]);
+        continue;
+      }
+      let output = cmd.output();
       if output.is_err() {
         return Err(format!("Error running `task {}` for task `{}`.", command, task_uuid));
       }
@@ -2652,7 +3000,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_quick_tag(&mut self) -> Result<(), String> {
-    let tag_name = &self.config.uda_quick_tag_name;
+    let tag_name = &self.config.uda_quick_tag_name.clone();
     let ptag_name = format!("+{}", tag_name);
     let ntag_name = format!("-{}", tag_name);
     if self.tasks.is_empty() {
@@ -2670,12 +3018,13 @@ impl TaskwarriorTui {
           }
         }
 
-        let output = std::process::Command::new(&self.task_exe)
-          .arg(QUIET)
-          .arg(task_uuid.to_string())
-          .arg("modify")
-          .arg(tag_to_set)
-          .output();
+        let mut cmd = std::process::Command::new(&self.task_exe);
+        cmd.arg(QUIET).arg(task_uuid.to_string()).arg("modify").arg(tag_to_set);
+        if self.worker.is_some() {
+          self.queue_write("Quick tag", false, cmd, &[]);
+          continue;
+        }
+        let output = cmd.output();
 
         if output.is_err() {
           return Err(format!("Error running `task modify {}` for task `{}`.", tag_to_set, task_uuid,));
@@ -2708,6 +3057,12 @@ impl TaskwarriorTui {
       cmd.arg(task_uuid.to_string());
     }
     cmd.arg("delete");
+    if self.worker.is_some() {
+      self.queue_write("Delete", false, cmd, &task_uuids);
+      self.current_selection_uuid = None;
+      self.current_selection_id = None;
+      return Ok(());
+    }
     let output = cmd.output();
     let r = match output {
       Ok(_) => Ok(()),
@@ -2737,6 +3092,12 @@ impl TaskwarriorTui {
       cmd.arg(task_uuid.to_string());
     }
     cmd.arg("done");
+    if self.worker.is_some() {
+      self.queue_write("Done", false, cmd, &task_uuids);
+      self.current_selection_uuid = None;
+      self.current_selection_id = None;
+      return Ok(());
+    }
     let output = cmd.output();
     let r = match output {
       Ok(_) => Ok(()),
@@ -2769,6 +3130,12 @@ impl TaskwarriorTui {
     for task_uuid in &task_uuids {
       cmd.arg(task_uuid.to_string());
     }
+    if self.worker.is_some() {
+      self.queue_write("Modify priority", false, cmd, &[]);
+      self.current_selection_uuid = None;
+      self.current_selection_id = None;
+      return Ok(());
+    }
     let output = cmd.output();
     let r = match output {
       Ok(_) => Ok(()),
@@ -2783,6 +3150,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_undo(&mut self) -> Result<(), String> {
+    self.wait_for_writes();
     let output = std::process::Command::new(&self.task_exe).arg("rc.confirmation=off").arg("undo").output();
 
     match output {
@@ -2801,6 +3169,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_duplicate(&mut self) -> Result<(), String> {
+    self.wait_for_writes();
     if self.tasks.is_empty() {
       return Ok(());
     }
@@ -2840,6 +3209,7 @@ impl TaskwarriorTui {
   }
 
   pub async fn task_edit(&mut self) -> Result<(), String> {
+    self.wait_for_writes();
     if self.tasks.is_empty() {
       return Ok(());
     }
@@ -4915,8 +5285,65 @@ mod tests {
     test_multiline_paste_in_add_prompt_does_not_submit().await;
     test_draw_command_shows_control_characters().await;
     test_write_commands_turn_off_footnotes().await;
+    test_done_runs_in_background().await;
 
     teardown();
+  }
+
+  async fn test_done_runs_in_background() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The stub logs each done and export, makes done slow and leaves the task
+    // pending, and hands everything else to the real task.
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-async-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("calls.log");
+    let stub = dir.join("task");
+    std::fs::write(
+      &stub,
+      format!(
+        "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    done) echo done >> '{0}'; sleep 1; exit 0 ;;\n    export) echo export >> '{0}' ;;\n  esac\ndone\nexec task \"$@\"\n",
+        log.display()
+      ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.task_exe = stub.display().to_string();
+    app.worker = Some(Worker::spawn());
+    let uuid = app.selected_task_uuids()[0];
+
+    async fn next_result(app: &mut TaskwarriorTui) {
+      let worker = app.worker.as_mut().unwrap();
+      let result = tokio::time::timeout(Duration::from_secs(30), worker.results.recv())
+        .await
+        .expect("worker result")
+        .expect("worker running");
+      app.handle_job_result(result).await.unwrap();
+    }
+
+    // An export is already queued when `d` is pressed.
+    app.update(true).await.unwrap();
+    let start = Instant::now();
+    app.task_done().unwrap();
+    assert!(start.elapsed() < Duration::from_millis(500), "done waited {:?}", start.elapsed());
+    assert!(app.task_by_uuid(uuid).is_none(), "row still shown after done");
+
+    next_result(&mut app).await;
+    assert!(app.task_by_uuid(uuid).is_none(), "an export queued before done showed the row again");
+
+    next_result(&mut app).await;
+    assert_eq!(app.writes_in_flight, 0);
+
+    // The stub left the task pending, so an export after the write shows it.
+    app.update(true).await.unwrap();
+    next_result(&mut app).await;
+    assert!(app.task_by_uuid(uuid).is_some(), "an export after done still hides the row");
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(calls.lines().collect::<Vec<_>>(), ["export", "done", "export"]);
   }
 
   async fn test_write_commands_turn_off_footnotes() {
