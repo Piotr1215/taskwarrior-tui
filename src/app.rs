@@ -62,6 +62,11 @@ use crate::{
 
 const MAX_LINE: usize = 4096;
 
+// Write commands whose output is discarded run with footnotes off. The project
+// footnote alone makes taskwarrior load every task in the database to compute
+// project completion, about 0.7s per action on a 45k-task database.
+const QUIET: &str = "rc.verbose=nothing";
+
 static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 static TASKWARRIOR_VERSION_SUPPORTED: LazyLock<Versioning> = LazyLock::new(|| Versioning::new("3.0.0").unwrap());
 
@@ -2494,6 +2499,7 @@ impl TaskwarriorTui {
     command.arg("rc.confirmation=off");
     command.arg("rc.dependency.confirmation=off");
     command.arg("rc.recurrence.confirmation=off");
+    command.arg(QUIET);
     for task_uuid in &task_uuids {
       command.arg(task_uuid.to_string());
     }
@@ -2543,6 +2549,7 @@ impl TaskwarriorTui {
     command.arg("rc.confirmation=off");
     command.arg("rc.dependency.confirmation=off");
     command.arg("rc.recurrence.confirmation=off");
+    command.arg(QUIET);
     for task_uuid in &task_uuids {
       command.arg(task_uuid.to_string());
     }
@@ -2628,6 +2635,7 @@ impl TaskwarriorTui {
       };
 
       let output = std::process::Command::new(&self.task_exe)
+        .arg(QUIET)
         .arg(task_uuid.to_string())
         .arg(command)
         .output();
@@ -2663,6 +2671,7 @@ impl TaskwarriorTui {
         }
 
         let output = std::process::Command::new(&self.task_exe)
+          .arg(QUIET)
           .arg(task_uuid.to_string())
           .arg("modify")
           .arg(tag_to_set)
@@ -2693,7 +2702,8 @@ impl TaskwarriorTui {
       .arg("rc.bulk=0")
       .arg("rc.confirmation=off")
       .arg("rc.dependency.confirmation=off")
-      .arg("rc.recurrence.confirmation=off");
+      .arg("rc.recurrence.confirmation=off")
+      .arg(QUIET);
     for task_uuid in &task_uuids {
       cmd.arg(task_uuid.to_string());
     }
@@ -2721,7 +2731,8 @@ impl TaskwarriorTui {
       .arg("rc.bulk=0")
       .arg("rc.confirmation=off")
       .arg("rc.dependency.confirmation=off")
-      .arg("rc.recurrence.confirmation=off");
+      .arg("rc.recurrence.confirmation=off")
+      .arg(QUIET);
     for task_uuid in &task_uuids {
       cmd.arg(task_uuid.to_string());
     }
@@ -2752,6 +2763,7 @@ impl TaskwarriorTui {
       .arg("rc.confirmation=off")
       .arg("rc.dependency.confirmation=off")
       .arg("rc.recurrence.confirmation=off")
+      .arg(QUIET)
       .arg("modify")
       .arg(&priority_arg);
     for task_uuid in &task_uuids {
@@ -4902,8 +4914,41 @@ mod tests {
     test_taskwarrior_tui_history().await;
     test_multiline_paste_in_add_prompt_does_not_submit().await;
     test_draw_command_shows_control_characters().await;
+    test_write_commands_turn_off_footnotes().await;
 
     teardown();
+  }
+
+  async fn test_write_commands_turn_off_footnotes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-quiet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("argv.log");
+    let stub = dir.join("task");
+    std::fs::write(&stub, format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display())).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.task_exe = stub.display().to_string();
+    app.modify.update("due:today", 9, &mut app.changes);
+    app.command.update("a note", 6, &mut app.changes);
+
+    app.task_modify().unwrap();
+    app.task_annotate().unwrap();
+    app.task_start_stop().unwrap();
+    app.task_quick_tag().unwrap();
+    app.task_priority("H").unwrap();
+    app.task_delete().unwrap();
+    app.task_done().unwrap();
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let calls: Vec<&str> = calls.lines().collect();
+    assert_eq!(calls.len(), 7, "{calls:?}");
+    for call in calls {
+      assert!(call.split(' ').any(|arg| arg == QUIET), "missing {QUIET}: {call}");
+    }
   }
 
   async fn test_task_tags() {
