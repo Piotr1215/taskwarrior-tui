@@ -296,6 +296,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     .split(popup_layout[1])[1]
 }
 
+// A report may relabel its description column, as `Desc`, so the column name
+// decides too. The context and report menus have no columns and match on label.
+fn is_description_column(header: &str, column: Option<&String>) -> bool {
+  header == "Description" || header == "Definition" || column.is_some_and(|c| c.split('.').next() == Some("description"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
   Tasks(Action),
@@ -1603,9 +1609,11 @@ impl TaskwarriorTui {
       .collect();
 
     let maximum_column_width = chunks[1].width;
-    let widths = self.calculate_widths(
+    let widths = Self::calculate_widths(
+      &self.config,
       &filtered_rows,
       &headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+      &[],
       maximum_column_width,
     );
     let constraints: Vec<Constraint> = widths
@@ -1691,9 +1699,11 @@ impl TaskwarriorTui {
       .collect();
 
     let maximum_column_width = chunks[1].width;
-    let widths = self.calculate_widths(
+    let widths = Self::calculate_widths(
+      &self.config,
       &filtered_rows,
       &headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+      &[],
       maximum_column_width,
     );
     let constraints: Vec<Constraint> = widths
@@ -1956,7 +1966,7 @@ impl TaskwarriorTui {
     base_style.patch(self.style_for_task(task))
   }
 
-  pub fn calculate_widths(&self, tasks: &[Vec<String>], headers: &[String], maximum_column_width: u16) -> Vec<usize> {
+  pub fn calculate_widths(config: &Config, tasks: &[Vec<String>], headers: &[String], columns: &[String], maximum_column_width: u16) -> Vec<usize> {
     // naive implementation of calculate widths
     let mut widths = headers.iter().map(String::len).collect::<Vec<usize>>();
 
@@ -1967,16 +1977,23 @@ impl TaskwarriorTui {
     }
 
     for (i, header) in headers.iter().enumerate() {
-      if header == "Description" || header == "Definition" {
+      if is_description_column(header, columns.get(i)) {
         // always give description or definition the most room to breath
         widths[i] = maximum_column_width as usize;
         break;
       }
     }
+    // capped columns stop growing, so trimming leaves the room to the description
+    for (i, column) in columns.iter().enumerate() {
+      let attribute = column.split('.').next().unwrap_or(column);
+      if let Some(max) = config.uda_task_report_column_max_width.get(attribute) {
+        widths[i] = std::cmp::min(widths[i], *max);
+      }
+    }
     for (i, header) in headers.iter().enumerate() {
       if i == 0 {
         // always give ID a couple of extra for indicator
-        widths[i] += self.config.uda_selection_indicator.as_str().width();
+        widths[i] += config.uda_selection_indicator.as_str().width();
         // if let TableMode::MultipleSelection = self.task_table_state.mode() {
         //     widths[i] += 2
         // };
@@ -1997,7 +2014,7 @@ impl TaskwarriorTui {
   }
 
   fn draw_task_report(&mut self, f: &mut Frame, rect: Rect) {
-    let (tasks, headers) = self.get_task_report();
+    let (tasks, headers, columns) = self.get_task_report();
 
     if tasks.is_empty() {
       f.render_widget(Block::default(), rect);
@@ -2005,10 +2022,10 @@ impl TaskwarriorTui {
     }
 
     let maximum_column_width = rect.width;
-    let widths = self.calculate_widths(&tasks, &headers, maximum_column_width);
+    let widths = Self::calculate_widths(&self.config, &tasks, &headers, &columns, maximum_column_width);
 
     for (i, header) in headers.iter().enumerate() {
-      if header == "Description" || header == "Definition" {
+      if is_description_column(header, columns.get(i)) {
         self.task_report_table.description_width = widths[i] - 1;
         break;
       }
@@ -2076,10 +2093,9 @@ impl TaskwarriorTui {
     }
   }
 
-  fn get_task_report(&mut self) -> (Vec<Vec<String>>, Vec<String>) {
+  fn get_task_report(&mut self) -> (Vec<Vec<String>>, Vec<String>, Vec<String>) {
     self.task_report_table.generate_table(&self.tasks);
-    let (tasks, headers) = self.task_report_table.simplify_table();
-    (tasks, headers)
+    self.task_report_table.simplify_table()
   }
 
   pub async fn update(&mut self, force: bool) -> Result<()> {
@@ -4724,19 +4740,18 @@ impl TaskwarriorTui {
       // Add repo autocomplete from /home/decoder/loft directory
       if let Ok(entries) = fs::read_dir("/home/decoder/loft") {
         for entry in entries.flatten() {
-          if let Ok(metadata) = entry.metadata() {
-            if metadata.is_dir() {
-              if let Some(dir_name) = entry.file_name().to_str() {
-                // Skip hidden directories
-                if !dir_name.starts_with('.') {
-                  let r = if dir_name.contains(' ') {
-                    format!(r#""{}""#, dir_name)
-                  } else {
-                    dir_name.to_string()
-                  };
-                  self.completion_list.insert(("repo".to_string(), r));
-                }
-              }
+          if let Ok(metadata) = entry.metadata()
+            && metadata.is_dir()
+            && let Some(dir_name) = entry.file_name().to_str()
+          {
+            // Skip hidden directories
+            if !dir_name.starts_with('.') {
+              let r = if dir_name.contains(' ') {
+                format!(r#""{}""#, dir_name)
+              } else {
+                dir_name.to_string()
+              };
+              self.completion_list.insert(("repo".to_string(), r));
             }
           }
         }
@@ -4912,6 +4927,43 @@ mod tests {
   #[test]
   fn test_centered_rect() {
     assert_eq!(centered_rect(50, 50, Rect::new(0, 0, 100, 100)), Rect::new(25, 25, 50, 50));
+  }
+
+  // The least `task show` output Config::new accepts, plus extra lines.
+  fn width_test_config(extra: &[&str]) -> Config {
+    let mut data = vec![
+      "data.location /tmp/taskwarrior-tui-tests",
+      "rule.precedence.color keyword.,tag.,project.",
+      "uda.priority.values H,M,L,",
+      "report.next.filter status:pending",
+    ];
+    data.extend_from_slice(extra);
+    Config::new(&data.join("\n"), "next").unwrap()
+  }
+
+  #[test]
+  fn test_calculate_widths_caps_a_column_and_gives_a_relabeled_description_the_room() {
+    let config = width_test_config(&["uda.taskwarrior-tui.task-report.column-max-width.project 8"]);
+    let headers = ["ID", "Proj", "Desc"].map(String::from);
+    let columns = ["id", "project.parent", "description.desc"].map(String::from);
+    let tasks = vec![vec!["1".to_string(), "cloud-infrastructure-maintenance".to_string(), "short".to_string()]];
+
+    let widths = TaskwarriorTui::calculate_widths(&config, &tasks, &headers, &columns, 60);
+
+    // ID gains the selection indicator, the project stops at its cap and the
+    // description fills the rest of the 60 cells less one separator per column.
+    assert_eq!(widths, vec![4, 8, 44]);
+  }
+
+  #[test]
+  fn test_calculate_widths_without_columns_matches_the_definition_label() {
+    let config = width_test_config(&[]);
+    let headers = ["Name", "Definition", "Active"].map(String::from);
+    let tasks = vec![vec!["work".to_string(), "+work".to_string(), "yes".to_string()]];
+
+    let widths = TaskwarriorTui::calculate_widths(&config, &tasks, &headers, &[], 40);
+
+    assert_eq!(widths, vec![6, 24, 6]);
   }
 
   #[tokio::test]
@@ -7269,6 +7321,11 @@ mod tests {
 
   #[tokio::test]
   async fn test_repo_completion_from_loft_directory() {
+    // Repo completion reads one machine's checkouts, which a CI runner lacks.
+    if !Path::new("/home/decoder/loft").is_dir() {
+      eprintln!("skipping: /home/decoder/loft is not a directory");
+      return;
+    }
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
 
     // Set up the app in Add mode
@@ -7284,15 +7341,16 @@ mod tests {
     app.update_completion_list();
 
     // Check that repo completions are populated
-    let has_repo_completions = app.completion_list.helper.candidates
-      .iter()
-      .any(|(context, _)| context == "repo");
+    let has_repo_completions = app.completion_list.helper.candidates.iter().any(|(context, _)| context == "repo");
 
     assert!(has_repo_completions, "Should have repo completions");
 
     // Check for some expected repositories from /home/decoder/loft
     let expected_repos = vec!["loft-prod", "vcluster", "admin-apis"];
-    let completion_values: Vec<String> = app.completion_list.helper.candidates
+    let completion_values: Vec<String> = app
+      .completion_list
+      .helper
+      .candidates
       .iter()
       .filter(|(context, _)| context == "repo")
       .map(|(_, value)| value.clone())
@@ -7321,7 +7379,10 @@ mod tests {
     app.mode = Mode::Tasks(Action::Add);
     app.update_completion_list();
 
-    let has_repo_attribute = app.completion_list.helper.candidates
+    let has_repo_attribute = app
+      .completion_list
+      .helper
+      .candidates
       .iter()
       .any(|(context, value)| context == "attribute" && value == "repo:");
 

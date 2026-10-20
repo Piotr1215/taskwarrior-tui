@@ -87,6 +87,17 @@ uda.taskwarrior-tui.quick-tag.name=next
 
 Do not include a leading `+`. `taskwarrior-tui` adds and removes the tag for you, so `next` becomes `+next` or `-next` when you trigger the quick-tag action.
 
+## Cap Report Column Widths
+
+When a report is wider than the screen, its widest columns shrink together, so long project names or tag lists take room from the description. Cap a column to stop it growing:
+
+```plaintext
+uda.taskwarrior-tui.task-report.column-max-width.project=20
+uda.taskwarrior-tui.task-report.column-max-width.tags=24
+```
+
+Name the column as it appears in `report.<name>.columns`, without its format: `project` caps `project.parent` too. Longer values are clipped, and the description takes the room the cap frees. No column is capped by default.
+
 ## Configure User-Defined Shortcuts
 
 You can configure shortcuts from your Taskwarrior `taskrc` file (default: `~/.taskrc`) by mapping them to executable files:

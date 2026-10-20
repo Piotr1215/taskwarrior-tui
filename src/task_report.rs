@@ -268,10 +268,10 @@ impl TaskReportTable {
     }
   }
 
-  pub fn simplify_table(&mut self) -> (Vec<Vec<String>>, Vec<String>) {
+  pub fn simplify_table(&mut self) -> (Vec<Vec<String>>, Vec<String>, Vec<String>) {
     // find which columns are empty
     if self.tasks.is_empty() {
-      return (vec![], vec![]);
+      return (vec![], vec![], vec![]);
     }
 
     let mut null_columns = vec![0; self.tasks[0].len()];
@@ -304,7 +304,16 @@ impl TaskReportTable {
       .map(|(_, e)| e.clone())
       .collect();
 
-    (tasks, headers)
+    // and the column names, so widths can follow per column settings
+    let columns: Vec<String> = self
+      .columns
+      .iter()
+      .enumerate()
+      .filter(|&(i, _)| null_columns[i] != 0)
+      .map(|(_, e)| e.clone())
+      .collect();
+
+    (tasks, headers, columns)
   }
 
   pub fn get_string_attribute(&self, attribute: &str, task: &Task, tasks: &[Task]) -> String {

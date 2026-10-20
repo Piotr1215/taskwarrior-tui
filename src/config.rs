@@ -142,6 +142,7 @@ pub struct Config {
   pub uda_task_report_prompt_on_delete: bool,
   pub uda_task_report_prompt_on_done: bool,
   pub uda_task_report_date_time_vague_more_precise: bool,
+  pub uda_task_report_column_max_width: HashMap<String, usize>,
   pub uda_context_menu_select_on_move: bool,
   pub uda_context_menu_close_on_select: bool,
   pub uda_report_menu_select_on_move: bool,
@@ -246,6 +247,7 @@ impl Config {
     let uda_report_menu_select_on_move = Self::get_uda_report_menu_select_on_move(data);
     let uda_report_menu_close_on_select = Self::get_uda_report_menu_close_on_select(data);
     let uda_task_report_date_time_vague_more_precise = Self::get_uda_task_report_date_time_vague_more_precise(data);
+    let uda_task_report_column_max_width = Self::get_uda_task_report_column_max_width(data);
 
     Ok(Self {
       enabled,
@@ -316,6 +318,7 @@ impl Config {
       uda_report_menu_select_on_move,
       uda_report_menu_close_on_select,
       uda_task_report_date_time_vague_more_precise,
+      uda_task_report_column_max_width,
       uda: vec![],
     })
   }
@@ -744,6 +747,20 @@ impl Config {
       .unwrap_or_default()
       .get_bool()
       .unwrap_or(false)
+  }
+
+  // Widest a task report column may grow, keyed by the column's attribute
+  // without its format, as `uda.taskwarrior-tui.task-report.column-max-width.project=20`.
+  fn get_uda_task_report_column_max_width(data: &str) -> HashMap<String, usize> {
+    let prefix = "uda.taskwarrior-tui.task-report.column-max-width.";
+    data
+      .split('\n')
+      .filter_map(|line| {
+        let (column, width) = line.strip_prefix(prefix)?.split_once(char::is_whitespace)?;
+        let width = width.trim().parse::<usize>().ok().filter(|w| *w > 0)?;
+        Some((column.to_string(), width))
+      })
+      .collect()
   }
 
   fn get_uda_task_report_prompt_on_done(data: &str) -> bool {
@@ -1431,6 +1448,22 @@ mod tests {
     assert_eq!(
       TaskInfoLocation::Auto.resolve(TaskInfoLocation::AUTO_WIDTH_THRESHOLD + 1),
       TaskInfoLocation::Right
+    );
+  }
+
+  #[test]
+  fn test_get_uda_task_report_column_max_width_keeps_positive_widths() {
+    let data = [
+      "uda.taskwarrior-tui.task-report.column-max-width.project  20",
+      "uda.taskwarrior-tui.task-report.column-max-width.tags     25",
+      "uda.taskwarrior-tui.task-report.column-max-width.due      0",
+      "uda.taskwarrior-tui.task-report.column-max-width.repo     wide",
+    ]
+    .join("\n");
+
+    assert_eq!(
+      Config::get_uda_task_report_column_max_width(&data),
+      HashMap::from([("project".to_string(), 20), ("tags".to_string(), 25)])
     );
   }
 
