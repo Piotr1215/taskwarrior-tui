@@ -357,7 +357,7 @@ impl Config {
     v
   }
 
-  fn get_uda_legends(data: &str) -> HashMap<String, String> {
+  pub(crate) fn get_uda_legends(data: &str) -> HashMap<String, String> {
     data
       .lines()
       .filter_map(|line| {

@@ -59,7 +59,7 @@ impl Default for KeyConfig {
   fn default() -> Self {
     Self {
       quit: KeyCode::Char('q'),
-      refresh: KeyCode::Char('r'),
+      refresh: KeyCode::Ctrl('r'),
       go_to_bottom: KeyCode::Char('G'),
       go_to_top: KeyCode::Char('g'),
       down: KeyCode::Char('j'),
@@ -86,7 +86,7 @@ impl Default for KeyConfig {
       zoom: KeyCode::Char('z'),
       transpose: KeyCode::Char('\\'),
       context_menu: KeyCode::Char('c'),
-      report_menu: KeyCode::Char('R'),
+      report_menu: KeyCode::Char('r'),
       next_tab: KeyCode::Char(']'),
       previous_tab: KeyCode::Char('['),
       priority_h: KeyCode::Char('H'),

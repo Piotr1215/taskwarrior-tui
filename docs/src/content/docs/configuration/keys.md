@@ -9,7 +9,7 @@ Configure `taskwarrior-tui` using `~/.taskrc`:
 
 ```plaintext
 uda.taskwarrior-tui.keyconfig.quit=q
-uda.taskwarrior-tui.keyconfig.refresh=r
+# Refresh defaults to Ctrl+R.
 uda.taskwarrior-tui.keyconfig.go-to-bottom=G
 uda.taskwarrior-tui.keyconfig.go-to-top=g
 uda.taskwarrior-tui.keyconfig.down=j
@@ -31,7 +31,11 @@ uda.taskwarrior-tui.keyconfig.annotate=A
 uda.taskwarrior-tui.keyconfig.filter=/
 uda.taskwarrior-tui.keyconfig.zoom=z
 uda.taskwarrior-tui.keyconfig.context-menu=c
-uda.taskwarrior-tui.keyconfig.report-menu=R
+uda.taskwarrior-tui.keyconfig.report-menu=r
 uda.taskwarrior-tui.keyconfig.next-tab=]
 uda.taskwarrior-tui.keyconfig.previous-tab=[
 ```
+
+Press `r` to choose a report. Type to filter its name or effective filter, use the
+arrow keys to move, and press Enter to load it. The Active column marks the current
+report. Press `Ctrl+R` to refresh the task list.

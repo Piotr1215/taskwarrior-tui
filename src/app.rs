@@ -1724,12 +1724,12 @@ impl TaskwarriorTui {
     let indices = self.reports.filtered_indices();
     let selected_filtered = self.reports.table_state.current_selection().unwrap_or(0);
 
-    let headers = ["Name", "Description", "Active"];
+    let headers = ["Name", "Filter", "Active"];
     let filtered_rows: Vec<Vec<String>> = indices
       .iter()
       .map(|&ri| {
         let r = &self.reports.rows[ri];
-        vec![r.name.clone(), r.description.clone(), r.active.clone()]
+        vec![r.name.clone(), r.filter.clone(), r.active.clone()]
       })
       .collect();
 
@@ -2477,6 +2477,7 @@ impl TaskwarriorTui {
 
   fn select_report(&mut self, report: &str, data: &str) -> Result<()> {
     self.report = report.to_string();
+    self.config.uda_legends = Config::get_uda_legends(data);
     self.project_filter_before = None;
     self.config.filter = Config::get_filter(data, &self.report)?;
     if !self.config.filter.trim().is_empty() {
@@ -2998,7 +2999,7 @@ impl TaskwarriorTui {
     let mut command = std::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
     command.env("TASKWARRIOR_TUI_REPORT", &self.report);
-    command.env("TASKWARRIOR_TUI_VIEW_VERSION", "3");
+    command.env("TASKWARRIOR_TUI_VIEW_VERSION", "4");
     Ok(command)
   }
 
