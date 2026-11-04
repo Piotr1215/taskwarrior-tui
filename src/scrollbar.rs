@@ -32,7 +32,7 @@ impl Scrollbar {
 
 impl Widget for Scrollbar {
   fn render(self, area: Rect, buf: &mut Buffer) {
-    if area.height <= 2 {
+    if area.height == 0 {
       return;
     }
 
@@ -46,17 +46,14 @@ impl Widget for Scrollbar {
       return;
     };
 
-    let (top, height) = { (area.top() + 3, area.height.saturating_sub(4)) };
+    let (top, height) = (area.top(), area.height);
 
     for y in top..(top + height) {
       buf.set_string(right, y, self.area_symbol.clone(), self.area_style);
     }
 
-    let progress = self.pos as f64 / self.len as f64;
-    let progress = if progress > 1.0 { 1.0 } else { progress };
-    let pos = height as f64 * progress;
-
-    let pos = pos as i64 as u16;
+    let progress = self.pos.min(self.len.saturating_sub(1)) as f64 / self.len.saturating_sub(1).max(1) as f64;
+    let pos = (height.saturating_sub(1) as f64 * progress) as u16;
 
     buf.set_string(right, top + pos, self.pos_symbol, self.pos_style);
   }

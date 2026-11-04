@@ -10,7 +10,11 @@ Keybindings:
 
 Keybindings for task report:
 
+    {{refresh}}:                              - Refresh task report
+
     {{filter}}: task {string}                     - Filter task report
+
+    {{project_filter}}:                         - Filter by selected project
 
     {{add}}: task add {string}                 - Add new task
 
@@ -86,6 +90,8 @@ Keybindings for task report:
 
     {{report_menu}}: report switcher menu               - Open report switcher menu
 
+    {{gordon}}: send selected task to Gordon - Send without Enter
+
     {{help}}: help                              - Help menu
 
 Keybindings for filter / command prompt:
@@ -134,11 +140,17 @@ Keybindings for context switcher:
 
 Keybindings for report switcher:
 
-    {{down}}: {selected+=1}                     - Move forward a report
+    Down: {selected+=1}                 - Move forward a report
 
-    {{up}}: {selected-=1}                     - Move back a report
+    Up: {selected-=1}                   - Move back a report
 
     Enter: task report {selected}       - Select highlighted report
+
+    1-9: task report {number}           - Select numbered row and close
+
+    Type:                              - Filter report names and filters
+
+    Order: uda.taskwarrior-tui.report.<name>.order=<n>, lowest first
 
 Keybindings for calendar:
 

@@ -128,8 +128,16 @@ Ctrl-y
 `c`
 : context switcher menu             - Open context switcher menu
 
-`R`
+`r`
 : report switcher menu              - Open report switcher menu
+
+`Ctrl + r`
+: refresh                           - Refresh task report
+
+`Ctrl + g`
+: send selected task to Gordon without Enter
+
+Configure `uda.taskwarrior-tui.gordon.command=~/.local/bin/send-task-to-gordon` in the Taskwarrior configuration. The command defaults to empty and runs in the background without input, with the selected task's full UUID appended as one argument. Remap the key with a single character, for example `uda.taskwarrior-tui.keyconfig.gordon=Q`.
 
 `?`
 : help                              - Help menu
@@ -200,11 +208,31 @@ Keybindings for context switcher:
 
 Keybindings for report switcher:
 
-`j`
+`Down`
 : {selected+=1}                     - Move forward a report
 
-`k`
+`Up`
 : {selected-=1}                     - Move back a report
+
+`Enter`
+: Select the highlighted report.
+
+`1-9`
+: Load the numbered row and close the picker. Numbers follow the filtered list.
+  These digits select reports instead of entering search text.
+
+Type other characters to filter report names and effective filters. The Active
+column marks the current report.
+
+Name matches come before filter-only matches, so searching `waiting` puts that
+report ahead of filters containing `-WAITING`. The list refreshes when opened.
+Only task-table reports are listed; native charts and aggregate commands stay
+outside the picker. Waiting tasks remain subject to the active context.
+
+Set `uda.taskwarrior-tui.report.<name>.order=<integer>` in taskrc to put reports
+first, lowest number first. Equal numbers sort alphabetically. Reports without
+an order follow alphabetically. Unknown names and invalid values are ignored.
+Without order settings, all reports sort alphabetically.
 
 
 Keybindings for calendar:

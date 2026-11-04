@@ -47,6 +47,10 @@ uda.taskwarrior-tui.context-menu.select-on-move=false
 uda.taskwarrior-tui.context-menu.close-on-select=true
 uda.taskwarrior-tui.report-menu.select-on-move=false
 uda.taskwarrior-tui.report-menu.close-on-select=true
+# Put frequently used reports first in the report picker (lowest integer first).
+uda.taskwarrior-tui.report.inbox.order=1
+uda.taskwarrior-tui.report.handoffs.order=2
+uda.taskwarrior-tui.report.current.order=3
 uda.taskwarrior-tui.tabs.change-focus-rotate=false
 uda.taskwarrior-tui.quick-tag.name=next
 # UI chrome styles (support all Taskwarrior color formats)
@@ -57,6 +61,12 @@ uda.taskwarrior-tui.style.command.error= # default: Red foreground
 ```
 
 See [color configuration](./colors.md) for supported color formats and additional TUI style keys such as `uda.taskwarrior-tui.style.navbar` and `uda.taskwarrior-tui.style.command`.
+
+Set `uda.taskwarrior-tui.report.<name>.order=<integer>` to place a report near the
+top of the picker. Lower numbers come first. Reports with the same number sort
+alphabetically, followed by reports with no order, also alphabetically. Unknown
+report names and invalid values are ignored. Without order settings, all reports
+sort alphabetically. Row numbers follow this order and restart at 1 when filtered.
 
 The `uda.taskwarrior-tui.task-report.next.filter` variable defines the default view at program startup. Set this to any preconfigured report from `task reports`, or create your own report in Taskwarrior and specify its name here.
 
@@ -115,7 +125,7 @@ To make a file executable:
 1. Run `chmod +x /path/to/script` to modify the executable flag.
 2. Add `#!/usr/bin/env bash`, `#!/usr/bin/env python`, or whatever is appropriate for your script.
 
-By default, keys `1`-`9` are available to run shortcuts.
+By default, keys `0`-`9` are available to run shortcuts.
 
 When you hit the shortcut, the script will be executed with `selected_tasks_uuid` as an argument:
 
@@ -137,7 +147,35 @@ uda.taskwarrior-tui.shortcuts.background=1,5
 
 A background shortcut gets no terminal input, and its output shows only when it fails.
 
-By default, shortcuts are linked to the `1-9` number row keys. They can be customized as any other keys through `uda.taskwarrior-tui.keyconfig.shortcut1=<key>`. For example:
+Every shortcut receives the active report name in `TASKWARRIOR_TUI_REPORT`, including background shortcuts. A script can use this variable to give the same key a different action in each report. Selected task UUIDs are still passed as arguments.
+
+Configure a one-line key legend for each report:
+
+```ini
+uda.taskwarrior-tui.legend.default=1 open | 2 views | ^P project
+uda.taskwarrior-tui.legend.handoffs=1 open | 2 views | 3 brief | 4 note | 5 promote | 6 reply | 7 ack
+```
+
+The active report name and legend share the heading above the filter, using the existing row. In tmux, the pane title also follows the active report. It changes when you select a report. A report without its own legend uses `legend.default`; an empty report legend hides it. Leave these settings unset to hide all legends. Long legends are clipped to the pane width.
+
+A foreground shortcut can switch reports by writing a configured report name to `$TASKWARRIOR_TUI_REPORT_REQUEST` and exiting successfully:
+
+```sh
+printf '%s\n' handoffs > "$TASKWARRIOR_TUI_REPORT_REQUEST"
+```
+
+The TUI switches in place when the shortcut returns. An unknown report produces an error. The request file is temporary and is removed after each invocation; background shortcuts cannot request a report switch.
+
+Reports can override the read context and detail pane without changing Taskwarrior's global context:
+
+```ini
+uda.taskwarrior-tui.report.handoffs.context=none
+uda.taskwarrior-tui.report.handoffs.show-info=false
+```
+
+Other reports use the normal context and `task-report.show-info` setting. Task writes still use the selected UUIDs, and do not change the global context.
+
+By default, shortcuts are linked to the `0-9` number row keys. They can be customized as any other keys through `uda.taskwarrior-tui.keyconfig.shortcut1=<key>`. For example:
 
 ```plaintext
 uda.taskwarrior-tui.keyconfig.shortcut1=n
@@ -198,3 +236,15 @@ You can also set it permanently in your shell profile:
 ```bash
 export TASKWARRIOR_TUI_TASKWARRIOR_CLI=/usr/local/bin/task
 ```
+
+In the normal task report, `Ctrl+P` adds the selected task's project to the visible filter. Press it again to restore the previous filter. Changing reports clears this temporary project scope. In input prompts, `Ctrl+P` keeps its completion-navigation behavior.
+
+## Send a task to Gordon
+
+Set a command in your Taskwarrior configuration:
+
+```plaintext
+uda.taskwarrior-tui.gordon.command=~/.local/bin/send-task-to-gordon
+```
+
+Press `Ctrl+G` to send the selected task without pressing Enter. The command runs in the background without input, with the selected task's full UUID appended as one argument. The command defaults to empty.

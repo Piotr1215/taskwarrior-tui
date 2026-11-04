@@ -10,6 +10,7 @@ use crate::event::KeyCode;
 pub struct KeyConfig {
   pub quit: KeyCode,
   pub refresh: KeyCode,
+  pub gordon: KeyCode,
   pub go_to_bottom: KeyCode,
   pub go_to_top: KeyCode,
   pub down: KeyCode,
@@ -32,6 +33,7 @@ pub struct KeyConfig {
   pub annotate: KeyCode,
   pub help: KeyCode,
   pub filter: KeyCode,
+  pub project_filter: KeyCode,
   pub zoom: KeyCode,
   pub transpose: KeyCode,
   pub context_menu: KeyCode,
@@ -58,7 +60,8 @@ impl Default for KeyConfig {
   fn default() -> Self {
     Self {
       quit: KeyCode::Char('q'),
-      refresh: KeyCode::Char('r'),
+      refresh: KeyCode::Ctrl('r'),
+      gordon: KeyCode::Ctrl('g'),
       go_to_bottom: KeyCode::Char('G'),
       go_to_top: KeyCode::Char('g'),
       down: KeyCode::Char('j'),
@@ -81,10 +84,11 @@ impl Default for KeyConfig {
       annotate: KeyCode::Char('A'),
       help: KeyCode::Char('?'),
       filter: KeyCode::Char('/'),
+      project_filter: KeyCode::Ctrl('p'),
       zoom: KeyCode::Char('z'),
       transpose: KeyCode::Char('\\'),
       context_menu: KeyCode::Char('c'),
-      report_menu: KeyCode::Char('R'),
+      report_menu: KeyCode::Char('r'),
       next_tab: KeyCode::Char(']'),
       previous_tab: KeyCode::Char('['),
       priority_h: KeyCode::Char('H'),
@@ -115,6 +119,7 @@ impl KeyConfig {
   pub fn update(&mut self, data: &str) -> Result<()> {
     let quit = Self::get_config("uda.taskwarrior-tui.keyconfig.quit", data);
     let refresh = Self::get_config("uda.taskwarrior-tui.keyconfig.refresh", data);
+    let gordon = Self::get_config("uda.taskwarrior-tui.keyconfig.gordon", data);
     let go_to_bottom = Self::get_config("uda.taskwarrior-tui.keyconfig.go-to-bottom", data);
     let go_to_top = Self::get_config("uda.taskwarrior-tui.keyconfig.go-to-top", data);
     let down = Self::get_config("uda.taskwarrior-tui.keyconfig.down", data);
@@ -136,6 +141,7 @@ impl KeyConfig {
     let add = Self::get_config("uda.taskwarrior-tui.keyconfig.add", data);
     let annotate = Self::get_config("uda.taskwarrior-tui.keyconfig.annotate", data);
     let filter = Self::get_config("uda.taskwarrior-tui.keyconfig.filter", data);
+    let project_filter = Self::get_config("uda.taskwarrior-tui.keyconfig.project-filter", data);
     let zoom = Self::get_config("uda.taskwarrior-tui.keyconfig.zoom", data);
     let transpose = Self::get_config("uda.taskwarrior-tui.keyconfig.transpose", data);
     let context_menu = Self::get_config("uda.taskwarrior-tui.keyconfig.context-menu", data);
@@ -155,6 +161,7 @@ impl KeyConfig {
 
     self.quit = quit.unwrap_or(self.quit);
     self.refresh = refresh.unwrap_or(self.refresh);
+    self.gordon = gordon.unwrap_or(self.gordon);
     self.go_to_bottom = go_to_bottom.unwrap_or(self.go_to_bottom);
     self.go_to_top = go_to_top.unwrap_or(self.go_to_top);
     self.down = down.unwrap_or(self.down);
@@ -176,6 +183,7 @@ impl KeyConfig {
     self.add = add.unwrap_or(self.add);
     self.annotate = annotate.unwrap_or(self.annotate);
     self.filter = filter.unwrap_or(self.filter);
+    self.project_filter = project_filter.unwrap_or(self.project_filter);
     self.zoom = zoom.unwrap_or(self.zoom);
     self.transpose = transpose.unwrap_or(self.transpose);
     self.context_menu = context_menu.unwrap_or(self.context_menu);
@@ -200,6 +208,7 @@ impl KeyConfig {
     let mut elements = vec![
       &self.quit,
       &self.refresh,
+      &self.gordon,
       &self.go_to_bottom,
       &self.go_to_top,
       &self.down,
@@ -222,6 +231,7 @@ impl KeyConfig {
       &self.annotate,
       &self.help,
       &self.filter,
+      &self.project_filter,
       &self.zoom,
       &self.transpose,
       &self.context_menu,
@@ -268,4 +278,13 @@ fn has_just_one_char(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn gordon_key_defaults_to_ctrl_g_and_accepts_custom_character() {
+    assert_eq!(KeyConfig::new("").unwrap().gordon, KeyCode::Ctrl('g'));
+    assert_eq!(
+      KeyConfig::new("uda.taskwarrior-tui.keyconfig.gordon Q\n").unwrap().gordon,
+      KeyCode::Char('Q')
+    );
+  }
 }

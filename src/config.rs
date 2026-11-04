@@ -89,6 +89,7 @@ pub struct Config {
   pub weekstart: bool,
   pub rule_precedence_color: Vec<String>,
   pub uda_priority_values: Vec<String>,
+  pub uda_gordon_command: String,
   pub uda_tick_rate: u64,
   pub uda_refresh_debounce_millis: u64,
   pub uda_auto_insert_double_quotes_on_add: bool,
@@ -133,6 +134,9 @@ pub struct Config {
   pub uda_style_command_error: Style,
   pub uda_shortcuts: Vec<String>,
   pub uda_shortcuts_background: Vec<usize>,
+  pub uda_legends: HashMap<String, String>,
+  pub uda_report_contexts: HashMap<String, String>,
+  pub uda_report_show_info: HashMap<String, bool>,
   pub uda_change_focus_rotate: bool,
   pub uda_background_process: String,
   pub uda_background_process_period: usize,
@@ -264,6 +268,7 @@ impl Config {
       uda_tick_rate,
       uda_refresh_debounce_millis,
       uda_change_focus_rotate,
+      uda_gordon_command: Self::get_config("uda.taskwarrior-tui.gordon.command", data).unwrap_or_default(),
       uda_auto_insert_double_quotes_on_add,
       uda_auto_insert_double_quotes_on_annotate,
       uda_auto_insert_double_quotes_on_log,
@@ -306,6 +311,12 @@ impl Config {
       uda_style_command_error,
       uda_shortcuts,
       uda_shortcuts_background,
+      uda_legends: Self::get_uda_legends(data),
+      uda_report_contexts: Self::get_report_options(data, "context"),
+      uda_report_show_info: Self::get_report_options(data, "show-info")
+        .into_iter()
+        .filter_map(|(report, value)| value.get_bool().map(|show| (report, show)))
+        .collect(),
       uda_background_process,
       uda_background_process_period,
       uda_quick_tag_name,
@@ -346,6 +357,49 @@ impl Config {
       v.push(s);
     }
     v
+  }
+
+  pub(crate) fn get_uda_legends(data: &str) -> HashMap<String, String> {
+    data
+      .lines()
+      .filter_map(|line| {
+        let line = line.strip_prefix("uda.taskwarrior-tui.legend.")?;
+        let (report, _) = line.split_once(char::is_whitespace)?;
+        let text = Self::get_config(&format!("uda.taskwarrior-tui.legend.{report}"), data)?;
+        Some((report.to_string(), text))
+      })
+      .collect()
+  }
+
+  pub fn legend(&self, report: &str) -> &str {
+    self
+      .uda_legends
+      .get(report)
+      .or_else(|| self.uda_legends.get("default"))
+      .map(String::as_str)
+      .unwrap_or_default()
+  }
+
+  pub fn show_info(&self, report: &str) -> bool {
+    self.uda_report_show_info.get(report).copied().unwrap_or(self.uda_task_report_info_show)
+  }
+
+  fn get_report_options(data: &str, option: &str) -> HashMap<String, String> {
+    data
+      .lines()
+      .filter_map(|line| {
+        let line = line.strip_prefix("uda.taskwarrior-tui.report.")?;
+        let (key, _) = line.split_once(char::is_whitespace)?;
+        let report = key.strip_suffix(&format!(".{option}"))?;
+        Some((report.to_string(), Self::get_config(&format!("uda.taskwarrior-tui.report.{key}"), data)?))
+      })
+      .collect()
+  }
+
+  pub fn report_context_filter(data: &str, context: &str) -> String {
+    Self::get_config(&format!("context.{context}.read"), data)
+      .or_else(|| Self::get_config(&format!("context.{context}"), data))
+      .unwrap_or_default()
   }
 
   // Shortcuts that run in the write queue instead of taking the terminal, as
@@ -938,6 +992,44 @@ impl Config {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn gordon_command_defaults_to_empty_and_reads_config() {
+    let base = "data.location /tmp/taskwarrior-tui-tests\nrule.precedence.color tag.,project.\nuda.priority.values H,M,L,\n";
+    assert_eq!(Config::new(base, "next").unwrap().uda_gordon_command, "");
+    let data = format!("{base}uda.taskwarrior-tui.gordon.command ~/.local/bin/send-task-to-gordon\n");
+    assert_eq!(Config::new(&data, "next").unwrap().uda_gordon_command, "~/.local/bin/send-task-to-gordon");
+  }
+
+  #[test]
+  fn test_report_legends() {
+    let base = "data.location /tmp/taskwarrior-tui-tests\nrule.precedence.color tag.,project.\nuda.priority.values H,M,L,\n";
+    let data = format!(
+      "{base}\
+      uda.taskwarrior-tui.legend.default 1 open | 2 views\n\
+      uda.taskwarrior-tui.legend.handoffs 5 promote | 6 reply\n   | 7 ack\n\
+      uda.taskwarrior-tui.legend.quiet \n"
+    );
+    let config = Config::new(&data, "next").unwrap();
+    assert_eq!(config.legend("next"), "1 open | 2 views");
+    assert_eq!(config.legend("handoffs"), "5 promote | 6 reply | 7 ack");
+    assert_eq!(config.legend("quiet"), "");
+    assert_eq!(Config::new(base, "next").unwrap().legend("next"), "");
+  }
+
+  #[test]
+  fn test_report_options() {
+    let data = "data.location /tmp/taskwarrior-tui-tests\nrule.precedence.color tag.,project.\nuda.priority.values H,M,L,\n\
+      uda.taskwarrior-tui.report.handoffs.context none\n\
+      uda.taskwarrior-tui.report.handoffs.show-info true\n\
+      uda.taskwarrior-tui.report.next.show-info invalid\n\
+      context.work.read +work -piotr\n";
+    let config = Config::new(data, "next").unwrap();
+    assert_eq!(config.uda_report_contexts.get("handoffs").map(String::as_str), Some("none"));
+    assert_eq!(config.uda_report_show_info.get("handoffs"), Some(&true));
+    assert!(!config.uda_report_show_info.contains_key("next"));
+    assert_eq!(Config::report_context_filter(data, "work"), "+work -piotr");
+  }
 
   #[test]
   fn test_config_collects_keyword_colors() {
