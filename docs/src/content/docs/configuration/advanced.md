@@ -115,7 +115,7 @@ To make a file executable:
 1. Run `chmod +x /path/to/script` to modify the executable flag.
 2. Add `#!/usr/bin/env bash`, `#!/usr/bin/env python`, or whatever is appropriate for your script.
 
-By default, keys `1`-`9` are available to run shortcuts.
+By default, keys `0`-`9` are available to run shortcuts.
 
 When you hit the shortcut, the script will be executed with `selected_tasks_uuid` as an argument:
 
@@ -137,7 +137,35 @@ uda.taskwarrior-tui.shortcuts.background=1,5
 
 A background shortcut gets no terminal input, and its output shows only when it fails.
 
-By default, shortcuts are linked to the `1-9` number row keys. They can be customized as any other keys through `uda.taskwarrior-tui.keyconfig.shortcut1=<key>`. For example:
+Every shortcut receives the active report name in `TASKWARRIOR_TUI_REPORT`, including background shortcuts. A script can use this variable to give the same key a different action in each report. Selected task UUIDs are still passed as arguments.
+
+Configure a one-line key legend for each report:
+
+```ini
+uda.taskwarrior-tui.legend.default=1 open | 2 views
+uda.taskwarrior-tui.legend.handoffs=1 open | 2 views | 3 brief | 4 note | 5 promote | 6 reply | 7 ack
+```
+
+The legend appears beside the command heading above the filter, using the existing row. It changes when you select a report. A report without its own legend uses `legend.default`; an empty report legend hides it. Leave these settings unset to hide all legends. Long legends are clipped to the pane width.
+
+A foreground shortcut can switch reports by writing a configured report name to `$TASKWARRIOR_TUI_REPORT_REQUEST` and exiting successfully:
+
+```sh
+printf '%s\n' handoffs > "$TASKWARRIOR_TUI_REPORT_REQUEST"
+```
+
+The TUI switches in place when the shortcut returns. An unknown report produces an error. The request file is temporary and is removed after each invocation; background shortcuts cannot request a report switch.
+
+Reports can override the read context and detail pane without changing Taskwarrior's global context:
+
+```ini
+uda.taskwarrior-tui.report.handoffs.context=none
+uda.taskwarrior-tui.report.handoffs.show-info=true
+```
+
+Other reports use the normal context and `task-report.show-info` setting. Task writes still use the selected UUIDs, and do not change the global context.
+
+By default, shortcuts are linked to the `0-9` number row keys. They can be customized as any other keys through `uda.taskwarrior-tui.keyconfig.shortcut1=<key>`. For example:
 
 ```plaintext
 uda.taskwarrior-tui.keyconfig.shortcut1=n

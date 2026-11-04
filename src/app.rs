@@ -370,6 +370,7 @@ pub struct TaskwarriorTui {
   writes_in_flight: usize,
   last_write_seq: u64,
   export_in_flight: Option<u64>,
+  report_export_floor: u64,
   refresh_again: bool,
   // Rows removed before their write ran, keyed to the write's queue position.
   hidden_tasks: HashMap<Uuid, u64>,
@@ -442,7 +443,7 @@ impl TaskwarriorTui {
       task_report_height: 0,
       task_details_scroll: 0,
       task_details_defaultwidth: 0,
-      task_report_info_show: c.uda_task_report_info_show,
+      task_report_info_show: c.show_info(report),
       task_info_location_override: None,
       task_info_location_override_width: None,
       config: c,
@@ -478,6 +479,7 @@ impl TaskwarriorTui {
       writes_in_flight: 0,
       last_write_seq: 0,
       export_in_flight: None,
+      report_export_floor: 0,
       refresh_again: false,
       hidden_tasks: HashMap::new(),
     };
@@ -764,6 +766,9 @@ impl TaskwarriorTui {
         false
       }
       JobResult::Export { seq, desc, output } => {
+        if seq < self.report_export_floor {
+          return false;
+        }
         if self.export_in_flight == Some(seq) {
           self.export_in_flight = None;
         }
@@ -876,6 +881,16 @@ impl TaskwarriorTui {
   }
 
   pub fn get_context(&mut self) -> Result<()> {
+    if let Some(context) = self.config.uda_report_contexts.get(&self.report) {
+      self.current_context.clone_from(context);
+      if context == "none" || context.is_empty() {
+        self.current_context_filter.clear();
+        return Ok(());
+      }
+      let data = Self::task_show_output(&self.task_exe)?;
+      self.current_context_filter = Config::report_context_filter(&data, context);
+      return Ok(());
+    }
     let output = std::process::Command::new(&self.task_exe).arg("_get").arg("rc.context").output()?;
     self.current_context = String::from_utf8_lossy(&output.stdout).to_string();
     self.current_context = self.current_context.strip_suffix('\n').unwrap_or("").to_string();
@@ -1158,11 +1173,11 @@ impl TaskwarriorTui {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
         .split(rects[0]);
 
-      self.task_report_height = split_task_layout[0].height;
+      self.task_report_height = split_task_layout[0].height.saturating_sub(1);
       self.draw_task_report(f, split_task_layout[0]);
       self.draw_task_details(f, split_task_layout[1]);
     } else {
-      self.task_report_height = rects[0].height;
+      self.task_report_height = rects[0].height.saturating_sub(1);
       self.draw_task_report(f, rects[0]);
     }
 
@@ -1827,6 +1842,12 @@ impl TaskwarriorTui {
     } else {
       Line::from(vec![title.0])
     };
+    // Use the existing command heading so the legend costs no task rows.
+    let mut title_spans = title_spans;
+    let legend = self.config.legend(&self.report);
+    if !legend.is_empty() {
+      title_spans.spans.push(Span::raw(format!(" | {legend}")));
+    }
     let title = Paragraph::new(Text::from(title_spans)).style(style);
     f.render_widget(title, rects[0]);
 
@@ -2021,12 +2042,18 @@ impl TaskwarriorTui {
       return;
     }
 
-    let maximum_column_width = rect.width;
+    let body = Rect::new(rect.x, rect.y.saturating_add(1), rect.width, rect.height.saturating_sub(1));
+    let needs_scrollbar = tasks.len() > usize::from(body.height);
+    let table_rect = Rect {
+      width: rect.width.saturating_sub(u16::from(needs_scrollbar)),
+      ..rect
+    };
+    let maximum_column_width = table_rect.width;
     let widths = Self::calculate_widths(&self.config, &tasks, &headers, &columns, maximum_column_width);
 
     for (i, header) in headers.iter().enumerate() {
       if is_description_column(header, columns.get(i)) {
-        self.task_report_table.description_width = widths[i] - 1;
+        self.task_report_table.description_width = widths[i].saturating_sub(1);
         break;
       }
     }
@@ -2065,6 +2092,7 @@ impl TaskwarriorTui {
       .collect();
 
     let t = Table::new(header, rows.into_iter())
+      .header_gap(0)
       .header_style(
         self
           .config
@@ -2082,14 +2110,14 @@ impl TaskwarriorTui {
       .unmark_symbol(&self.config.uda_unmark_indicator)
       .widths(&constraints);
 
-    f.render_stateful_widget(t, rect, &mut self.task_table_state);
-    if tasks.iter().len() as u16 > rect.height.saturating_sub(4) {
+    f.render_stateful_widget(t, table_rect, &mut self.task_table_state);
+    if needs_scrollbar {
       let mut widget = Scrollbar::new(pos, tasks.iter().len());
       widget.pos_style = self.config.uda_style_report_scrollbar;
       widget.pos_symbol.clone_from(&self.config.uda_scrollbar_indicator);
       widget.area_style = self.config.uda_style_report_scrollbar_area;
       widget.area_symbol.clone_from(&self.config.uda_scrollbar_area);
-      f.render_widget(widget, rect);
+      f.render_widget(widget, body);
     }
   }
 
@@ -2423,7 +2451,12 @@ impl TaskwarriorTui {
       return Ok(false);
     }
 
-    self.report = report;
+    self.select_report(&report, data)?;
+    Ok(true)
+  }
+
+  fn select_report(&mut self, report: &str, data: &str) -> Result<()> {
+    self.report = report.to_string();
     self.config.filter = Config::get_filter(data, &self.report)?;
     if !self.config.filter.trim().is_empty() {
       self.config.filter = format!("{} ", self.config.filter.trim());
@@ -2435,7 +2468,22 @@ impl TaskwarriorTui {
     }
 
     self.task_report_table.export_headers(Some(data), &self.report, &self.task_exe)?;
-    Ok(true)
+    self.task_report_info_show = self.config.show_info(report);
+    self.current_selection = 0;
+    self.current_selection_id = None;
+    self.current_selection_uuid = None;
+    self.task_table_state.select(None);
+    // Until the new export lands, old rows must not receive the new report's
+    // shortcut meanings. Ignore any exports still queued for the old report.
+    self.tasks.clear();
+    self.marked.clear();
+    self.task_details.clear();
+    self.task_details_modified.clear();
+    self.report_export_floor = self.job_seq + 1;
+    self.export_in_flight = None;
+    self.refresh_again = false;
+    self.get_context()?;
+    Ok(())
   }
 
   fn report_selected_row_index(&self) -> Option<usize> {
@@ -2669,7 +2717,7 @@ impl TaskwarriorTui {
         }
       }
     } else {
-      self.error = Some(format!("Cannot run `{:?}` - ({}) error:\n{}", &task, output.status, error));
+      self.error = Some(format!("Cannot run `{:?}` - ({}) error:\n{}", task, output.status, error));
     }
 
     Ok(())
@@ -2692,6 +2740,9 @@ impl TaskwarriorTui {
       .arg("rc.json.depends.array=on")
       .arg("rc.color=off")
       .arg("rc._forcecolor=off");
+    if let Some(context) = self.config.uda_report_contexts.get(&self.report) {
+      task.arg(format!("rc.context={context}"));
+    }
     // .arg("rc.verbose:override=false");
 
     if let Some(args) = shlex::split(format!(r#"rc.report.{}.filter='{}'"#, self.report, self.filter.trim()).trim()) {
@@ -2889,12 +2940,7 @@ impl TaskwarriorTui {
   // write queue: the TUI keeps the terminal and the next key, and the shortcut
   // still runs after every write queued before it.
   fn task_shortcut_background(&mut self, s: usize) -> Result<(), String> {
-    let shell = self.shortcut_shell(s)?;
-    let Some(cmd) = shlex::split(&shell).filter(|cmd| !cmd.is_empty()) else {
-      return Err(format!("Unable to run shortcut number {}: shlex::split(`{}`) failed.", s, shell));
-    };
-    let mut command = std::process::Command::new(&cmd[0]);
-    command.args(&cmd[1..]);
+    let command = self.shortcut_command(s)?;
     self.queue_write(TaskWrite::new("Shortcut", true, Select::Nothing, (command, None)), &[]);
 
     if !self.config.uda_task_report_jump_to_task_on_modify {
@@ -2904,6 +2950,18 @@ impl TaskwarriorTui {
     Ok(())
   }
 
+  // Construct both kinds of shortcut with the same report context.
+  fn shortcut_command(&self, s: usize) -> Result<std::process::Command, String> {
+    let shell = self.shortcut_shell(s)?;
+    let Some(cmd) = shlex::split(&shell).filter(|cmd| !cmd.is_empty()) else {
+      return Err(format!("Unable to run shortcut number {}: shlex::split(`{}`) failed.", s, shell));
+    };
+    let mut command = std::process::Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    command.env("TASKWARRIOR_TUI_REPORT", &self.report);
+    Ok(command)
+  }
+
   pub async fn task_shortcut(&mut self, s: usize) -> Result<(), String> {
     if self.config.uda_shortcuts_background.contains(&s) {
       return self.task_shortcut_background(s);
@@ -2911,40 +2969,42 @@ impl TaskwarriorTui {
 
     self.wait_for_writes();
 
-    let shell = self.shortcut_shell(s)?;
+    let mut command = self.shortcut_command(s)?;
+
+    // A private request file lets a foreground shortcut select a report without
+    // replacing the terminal process or changing Taskwarrior's global context.
+    let request_dir = std::env::temp_dir().join(format!("taskwarrior-tui-report-{}", Uuid::new_v4()));
+    fs::create_dir(&request_dir).map_err(|e| e.to_string())?;
+    let request_file = request_dir.join("report");
+    if let Err(error) = fs::write(&request_file, "") {
+      let _ = fs::remove_dir(&request_dir);
+      return Err(error.to_string());
+    }
+    command.env("TASKWARRIOR_TUI_REPORT_REQUEST", &request_file);
 
     self.pause_tui().await.unwrap();
 
-    let r = match shlex::split(&shell) {
-      Some(cmd) => {
-        let mut command = std::process::Command::new(&cmd[0]);
-        for i in cmd.iter().skip(1) {
-          command.arg(i);
-        }
-        match command.spawn() {
-          Ok(child) => {
-            let output = child.wait_with_output();
-            match output {
-              Ok(o) => {
-                if o.status.success() {
-                  Ok(())
-                } else {
-                  Err(format!(
-                    "Unable to run shortcut {}. Status Code: {} - stdout: {} stderr: {}",
-                    s,
-                    o.status.code().unwrap_or_default(),
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr),
-                  ))
-                }
-              }
-              Err(s) => Err(format!("`{}` failed to wait with output: {}", shell, s)),
+    let r = match command.spawn() {
+      Ok(child) => {
+        let output = child.wait_with_output();
+        match output {
+          Ok(o) => {
+            if o.status.success() {
+              Ok(())
+            } else {
+              Err(format!(
+                "Unable to run shortcut {}. Status Code: {} - stdout: {} stderr: {}",
+                s,
+                o.status.code().unwrap_or_default(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr),
+              ))
             }
           }
-          Err(err) => Err(format!("`{}` failed: Unable to spawn shortcut number {} - Error: {}", shell, s, err)),
+          Err(err) => Err(format!("Shortcut {s} failed to wait with output: {err}")),
         }
       }
-      None => Err(format!("Unable to run shortcut number {}: shlex::split(`{}`) failed.", s, shell)),
+      Err(err) => Err(format!("Unable to spawn shortcut number {s}: {err}")),
     };
 
     if !self.config.uda_task_report_jump_to_task_on_modify {
@@ -2953,7 +3013,28 @@ impl TaskwarriorTui {
 
     self.resume_tui().await.unwrap();
 
+    let requested_report = fs::read_to_string(&request_file);
+    let _ = fs::remove_file(&request_file);
+    let _ = fs::remove_dir(&request_dir);
+    if r.is_ok()
+      && let Ok(report) = requested_report
+      && !report.trim().is_empty()
+    {
+      self.apply_report_request(report.trim())?;
+    }
+
     r
+  }
+
+  fn apply_report_request(&mut self, report: &str) -> Result<(), String> {
+    let data = Self::task_show_output(&self.task_exe).map_err(|e| e.to_string())?;
+    self.reports.update_data(&self.report, &data);
+    if !self.reports.rows.iter().any(|row| row.name == report) {
+      return Err(format!("Unknown requested report: {report}"));
+    }
+    self.select_report(report, &data).map_err(|e| e.to_string())?;
+    self.dirty = true;
+    Ok(())
   }
 
   pub fn task_modify(&mut self) -> Result<(), String> {
@@ -3759,6 +3840,15 @@ impl TaskwarriorTui {
             }
           } else if input == self.keyconfig.shortcut9 {
             match self.task_shortcut(9).await {
+              Ok(_) => self.update(true).await?,
+              Err(e) => {
+                self.update(true).await?;
+                self.error = Some(e);
+                self.mode = Mode::Tasks(Action::Error);
+              }
+            }
+          } else if input == self.keyconfig.shortcut0 {
+            match self.task_shortcut(0).await {
               Ok(_) => self.update(true).await?,
               Err(e) => {
                 self.update(true).await?;
@@ -4702,7 +4792,7 @@ impl TaskwarriorTui {
         if let Some(tags) = task.tags() {
           for tag in tags {
             if !virtual_tags.contains(tag) {
-              self.completion_list.insert(("+".to_string(), format!("+{}", &tag)));
+              self.completion_list.insert(("+".to_string(), format!("+{}", tag)));
             }
           }
         }
@@ -4710,7 +4800,7 @@ impl TaskwarriorTui {
       for task in tasks {
         if let Some(project) = task.project() {
           let p = if project.contains(' ') {
-            format!(r#""{}""#, &project)
+            format!(r#""{}""#, project)
           } else {
             project.to_string()
           };
@@ -5214,6 +5304,8 @@ mod tests {
 
     setup();
 
+    test_report_legend_and_pane_fit().await;
+
     let app = TaskwarriorTui::new("next", false).await.unwrap();
     assert!(app.task_by_index(0).is_some());
 
@@ -5477,7 +5569,11 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("argv.log");
     let script = dir.join("shortcut.sh");
-    std::fs::write(&script, format!("#!/bin/sh\nsleep 1\necho \"$*\" >> '{}'\n", log.display())).unwrap();
+    std::fs::write(
+      &script,
+      format!("#!/bin/sh\nsleep 1\necho \"$TASKWARRIOR_TUI_REPORT $*\" >> '{}'\n", log.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
@@ -5485,6 +5581,15 @@ mod tests {
     app.config.uda_shortcuts[5] = script.display().to_string();
     app.config.uda_shortcuts_background = vec![5];
     let uuid = app.selected_task_uuids()[0];
+    // The foreground path uses this same command builder. A report change must
+    // override the parent's environment for the next invocation.
+    for report in ["handoffs", "current"] {
+      app.report = report.to_string();
+      assert!(app.shortcut_command(5).unwrap().status().unwrap().success());
+    }
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("handoffs {uuid}\ncurrent {uuid}\n"));
+    std::fs::remove_file(&log).unwrap();
+    app.report = "handoffs".to_string();
 
     let start = Instant::now();
     tokio::time::timeout(Duration::from_secs(5), app.task_shortcut(5))
@@ -5500,10 +5605,99 @@ mod tests {
       .expect("worker running");
     app.apply_job_result(result);
     let calls = std::fs::read_to_string(&log).unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
-    assert_eq!(calls.trim(), uuid.to_string());
+    assert_eq!(calls.trim(), format!("handoffs {uuid}"));
     assert!(app.error.is_none(), "{:?}", app.error);
     assert_eq!(app.writes_in_flight, 0);
+
+    // Slot zero already has config and help entries; exercise its key binding.
+    app.report = "next".into();
+    app.config.uda_shortcuts[0] = script.display().to_string();
+    app.config.uda_shortcuts_background = vec![0];
+    app.handle_input(KeyCode::Char('0')).await.unwrap();
+    app.wait_for_writes();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("handoffs {uuid}\nnext {uuid}\n"));
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  async fn test_report_legend_and_pane_fit() {
+    let taskrc = std::env::var("TASKRC").unwrap();
+    let original = std::fs::read(&taskrc).unwrap();
+    let mut overridden = original.clone();
+    overridden.extend_from_slice(b"\nuda.taskwarrior-tui.report.next.show-info=false\n");
+    std::fs::write(&taskrc, overridden).unwrap();
+    let startup = TaskwarriorTui::new("next", false).await;
+    std::fs::write(&taskrc, original).unwrap();
+    assert!(!startup.unwrap().task_report_info_show, "initial report override ignored");
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.config.uda_legends.insert("next".into(), "1 open | 2 views".into());
+    app
+      .config
+      .uda_legends
+      .insert("handoffs".into(), "3 brief | 4 note | 5 promote | 6 reply | 7 ack".into());
+    app.task_report_info_show = false;
+    for (i, task) in app.tasks.iter_mut().enumerate() {
+      *task.description_mut() = format!("pane-row-{i:02}");
+    }
+    // Match both live task panes. A full page has one header and no spacer.
+    for height in [33, 19, 5] {
+      app.current_selection = 0;
+      app.update_task_table_state();
+      let mut terminal = Terminal::new(TestBackend::new(188, height)).unwrap();
+      terminal.draw(|f| app.draw(f)).unwrap();
+      let buffer = terminal.backend().buffer();
+      let line = |y| (0..188).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+      assert!(line(2).contains("pane-row-00"), "first task hidden at height {height}: {}", line(2));
+      assert!(line(height - 2).contains("Filter Tasks | 1 open | 2 views"));
+      assert_eq!(app.task_report_height, height - 4);
+      let visible = usize::from(height - 4).min(app.tasks.len());
+      for i in 0..visible {
+        assert!(line(i as u16 + 2).contains(&format!("pane-row-{i:02}")));
+      }
+      if app.tasks.len() > visible {
+        assert_eq!(buffer[(187, 2)].symbol(), app.config.uda_scrollbar_indicator);
+      }
+    }
+    app.report = "handoffs".into();
+    app.current_selection = app.tasks.len() - 1;
+    app.update_task_table_state();
+    app.task_report_info_show = true;
+    app.task_info_location_override = Some(TaskInfoLocation::Right);
+    let mut terminal = Terminal::new(TestBackend::new(188, 19)).unwrap();
+    terminal.draw(|f| app.draw(f)).unwrap();
+    let view = buffer_view(terminal.backend().buffer());
+    assert!(view.contains("5 promote | 6 reply | 7 ack"));
+    assert!(view.contains(&format!("pane-row-{:02}", app.tasks.len() - 1)));
+
+    // Growing the pane must reveal the first row again when all tasks fit.
+    let mut terminal = Terminal::new(TestBackend::new(188, 33)).unwrap();
+    terminal.draw(|f| app.draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let first_row = (0..94).map(|x| buffer[(x, 2)].symbol()).collect::<String>();
+    assert!(first_row.contains("pane-row-00"), "stale scroll offset: {first_row}");
+
+    // A shortcut request uses the same report selection path as the menu.
+    app.config.uda_report_contexts.insert("all".into(), "none".into());
+    app.config.uda_report_show_info.insert("all".into(), true);
+    app.current_context_filter = "+hidden-by-context".into();
+    app.apply_report_request("all").unwrap();
+    assert_eq!(app.report, "all");
+    assert!(app.current_context_filter.is_empty());
+    assert!(app.task_report_info_show);
+    assert!(app.tasks.is_empty(), "old report rows retained during switch");
+    let stale = JobResult::Export {
+      seq: app.report_export_floor - 1,
+      desc: "old report".into(),
+      output: std::process::Command::new("true").output(),
+    };
+    assert!(!app.apply_job_result(stale), "old report export applied after switch");
+    assert!(app.export_command().get_args().any(|arg| arg == "rc.context=none"));
+    app.update(true).await.unwrap();
+    assert!(!app.tasks.is_empty());
+    app.apply_report_request("next").unwrap();
+    assert_eq!(app.report, "next");
+    assert_eq!(app.task_report_info_show, app.config.uda_task_report_info_show);
+    assert!(app.apply_report_request("not-a-configured-report").is_err());
+    assert_eq!(app.report, "next");
   }
 
   async fn test_undo_and_add_run_in_background() {

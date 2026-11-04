@@ -437,6 +437,13 @@ where
     if y < table_area.bottom() {
       let remaining = (table_area.bottom() - y) as usize;
 
+      // A taller pane or a shorter filtered report can make the old offset
+      // hide rows even when the whole report now fits.
+      let (minimum, maximum) = self.rows.size_hint();
+      if maximum == Some(minimum) {
+        state.offset = state.offset.min(minimum.saturating_sub(remaining));
+      }
+
       // Make sure the table shows the selected item
       state.offset = selected.map_or(0, |s| {
         if s >= remaining + state.offset - 1 {
