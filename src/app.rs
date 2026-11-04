@@ -5615,6 +5615,16 @@ mod tests {
     app.config.uda_shortcuts_background = vec![0];
     app.handle_input(KeyCode::Char('0')).await.unwrap();
     app.wait_for_writes();
+    // handle_input also queues a refresh. Its Taskwarrior process must exit
+    // before the shared fixture directory is removed by teardown.
+    assert!(app.export_in_flight.is_some());
+    while app.export_in_flight.is_some() {
+      let result = tokio::time::timeout(Duration::from_secs(30), app.worker.as_mut().unwrap().results.recv())
+        .await
+        .expect("shortcut refresh returned")
+        .expect("worker running");
+      app.apply_job_result(result);
+    }
     assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("handoffs {uuid}\nnext {uuid}\n"));
     std::fs::remove_dir_all(&dir).unwrap();
   }
