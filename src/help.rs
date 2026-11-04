@@ -25,6 +25,7 @@ fn keycode_for(name: &str, kc: &KeyConfig) -> KeyCode {
   match name {
     "quit" => kc.quit,
     "refresh" => kc.refresh,
+    "gordon" => kc.gordon,
     "next_tab" => kc.next_tab,
     "previous_tab" => kc.previous_tab,
     "filter" => kc.filter,
@@ -139,8 +140,8 @@ mod tests {
   fn renders_project_filter_control_key() {
     let keys = KeyConfig::default();
     assert_eq!(
-      render_help(&keys, "{{project_filter}} {{filter}} {{refresh}} {{report_menu}}"),
-      "^P / ^R r"
+      render_help(&keys, "{{project_filter}} {{filter}} {{refresh}} {{report_menu}} {{gordon}}"),
+      "^P / ^R r ^G"
     );
   }
 }

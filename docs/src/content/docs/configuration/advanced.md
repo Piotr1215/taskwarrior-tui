@@ -238,3 +238,13 @@ export TASKWARRIOR_TUI_TASKWARRIOR_CLI=/usr/local/bin/task
 ```
 
 In the normal task report, `Ctrl+P` adds the selected task's project to the visible filter. Press it again to restore the previous filter. Changing reports clears this temporary project scope. In input prompts, `Ctrl+P` keeps its completion-navigation behavior.
+
+## Send a task to Gordon
+
+Set a command in your Taskwarrior configuration:
+
+```plaintext
+uda.taskwarrior-tui.gordon.command=~/.local/bin/send-task-to-gordon
+```
+
+Press `Ctrl+G` to send the selected task without pressing Enter. The command runs in the background without input, with the selected task's full UUID appended as one argument. The command defaults to empty.

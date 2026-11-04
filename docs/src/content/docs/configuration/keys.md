@@ -10,6 +10,8 @@ Configure `taskwarrior-tui` using `~/.taskrc`:
 ```plaintext
 uda.taskwarrior-tui.keyconfig.quit=q
 # Refresh defaults to Ctrl+R.
+# Gordon defaults to Ctrl+G; uncomment to remap it to a single character.
+# uda.taskwarrior-tui.keyconfig.gordon=Q
 uda.taskwarrior-tui.keyconfig.go-to-bottom=G
 uda.taskwarrior-tui.keyconfig.go-to-top=g
 uda.taskwarrior-tui.keyconfig.down=j
@@ -47,3 +49,5 @@ searching `waiting` puts that report first, ahead of filters containing `-WAITIN
 The picker refreshes its report list when opened. It lists task-table reports;
 native charts and aggregate commands, such as `burndown` and `summary`, stay outside
 the picker. The waiting report includes hidden tasks that match the active context.
+
+Press `Ctrl+G` to send the selected task to Gordon without pressing Enter. Configure the command first as described in [Advanced Configuration](../advanced/).

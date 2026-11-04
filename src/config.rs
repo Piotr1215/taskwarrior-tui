@@ -89,6 +89,7 @@ pub struct Config {
   pub weekstart: bool,
   pub rule_precedence_color: Vec<String>,
   pub uda_priority_values: Vec<String>,
+  pub uda_gordon_command: String,
   pub uda_tick_rate: u64,
   pub uda_refresh_debounce_millis: u64,
   pub uda_auto_insert_double_quotes_on_add: bool,
@@ -267,6 +268,7 @@ impl Config {
       uda_tick_rate,
       uda_refresh_debounce_millis,
       uda_change_focus_rotate,
+      uda_gordon_command: Self::get_config("uda.taskwarrior-tui.gordon.command", data).unwrap_or_default(),
       uda_auto_insert_double_quotes_on_add,
       uda_auto_insert_double_quotes_on_annotate,
       uda_auto_insert_double_quotes_on_log,
@@ -990,6 +992,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn gordon_command_defaults_to_empty_and_reads_config() {
+    let base = "data.location /tmp/taskwarrior-tui-tests\nrule.precedence.color tag.,project.\nuda.priority.values H,M,L,\n";
+    assert_eq!(Config::new(base, "next").unwrap().uda_gordon_command, "");
+    let data = format!("{base}uda.taskwarrior-tui.gordon.command ~/.local/bin/send-task-to-gordon\n");
+    assert_eq!(Config::new(&data, "next").unwrap().uda_gordon_command, "~/.local/bin/send-task-to-gordon");
+  }
 
   #[test]
   fn test_report_legends() {

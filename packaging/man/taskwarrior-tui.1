@@ -138,6 +138,17 @@ report switcher menu - Open report switcher menu
 \f[V]Ctrl + r\f[R]
 refresh - Refresh task report
 .TP
+\f[V]Ctrl + g\f[R]
+send selected task to Gordon without Enter
+.PP
+Configure
+\f[V]uda.taskwarrior-tui.gordon.command=\[ti]/.local/bin/send-task-to-gordon\f[R]
+in the Taskwarrior configuration.
+The command defaults to empty and runs in the background without input,
+with the selected task\[cq]s full UUID appended as one argument.
+Remap the key with a single character, for example
+\f[V]uda.taskwarrior-tui.keyconfig.gordon=Q\f[R].
+.TP
 \f[V]?\f[R]
 help - Help menu
 .PP

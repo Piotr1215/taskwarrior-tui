@@ -3028,6 +3028,28 @@ impl TaskwarriorTui {
     Ok(())
   }
 
+  fn gordon_command(&self) -> Result<std::process::Command, String> {
+    let args = shlex::split(&self.config.uda_gordon_command)
+      .filter(|args| !args.is_empty())
+      .ok_or_else(|| "Configure uda.taskwarrior-tui.gordon.command with a valid command first.".to_string())?;
+    let task = self.task_current().ok_or_else(|| "Select a task to send to Gordon.".to_string())?;
+    let program = shellexpand::tilde(&args[0]);
+    let mut command = std::process::Command::new(program.as_ref());
+    command
+      .args(&args[1..])
+      .arg(task.uuid().to_string())
+      .env("TASKWARRIOR_TUI_REPORT", &self.report)
+      .env("TASKWARRIOR_TUI_VIEW_VERSION", "4")
+      .stdin(std::process::Stdio::null());
+    Ok(command)
+  }
+
+  fn task_send_gordon(&mut self) -> Result<(), String> {
+    let command = self.gordon_command()?;
+    self.queue_write(TaskWrite::new("Gordon", true, Select::Nothing, (command, None)), &[]);
+    Ok(())
+  }
+
   // Construct both kinds of shortcut with the same report context.
   fn shortcut_command(&self, s: usize) -> Result<std::process::Command, String> {
     let shell = self.shortcut_shell(s)?;
@@ -3801,6 +3823,11 @@ impl TaskwarriorTui {
           } else if input == self.keyconfig.project_filter {
             if self.toggle_project_filter() {
               self.update(true).await?;
+            }
+          } else if input == self.keyconfig.gordon {
+            if let Err(error) = self.task_send_gordon() {
+              self.error = Some(error);
+              self.mode = Mode::Tasks(Action::Error);
             }
           } else if input == self.keyconfig.filter {
             self.mode = Mode::Tasks(Action::Filter);
@@ -5446,6 +5473,7 @@ mod tests {
     test_write_names_one_task_by_guarded_id().await;
     test_undo_and_add_run_in_background().await;
     test_background_shortcut_keeps_the_terminal().await;
+    test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
     test_report_menu_refresh_error_keeps_reports().await;
     test_report_menu_refreshes_and_exports_waiting_tasks().await;
 
@@ -5969,6 +5997,51 @@ mod tests {
 
     let task = app.task_by_id(11).unwrap();
     let style = app.style_for_task(&task);
+  }
+
+  async fn test_gordon_keeps_the_terminal_and_sends_only_current_task() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-gordon-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("gordon helper.sh");
+    let log = dir.join("argv.log");
+    std::fs::write(
+      &script,
+      format!(
+        "#!/bin/sh\nif read -r value; then exit 2; fi\nsleep 1\nprintf '%s\\n' \"$TASKWARRIOR_TUI_REPORT\" \"$#\" \"$1\" \"$2\" > '{}'\n",
+        log.display()
+      ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.worker = Some(Worker::spawn());
+    assert!(app.gordon_command().is_err());
+    app.config.uda_gordon_command = format!("'{}' 'fixed argument'", script.display());
+    let uuid = *app.task_current().unwrap().uuid();
+    let other = app.tasks.iter().find(|task| task.uuid() != &uuid).unwrap().uuid();
+    app.marked.insert(*other);
+    let args = app
+      .gordon_command()
+      .unwrap()
+      .get_args()
+      .map(|arg| arg.to_string_lossy().into_owned())
+      .collect::<Vec<_>>();
+    assert_eq!(args, vec!["fixed argument".to_string(), uuid.to_string()]);
+
+    let start = Instant::now();
+    app.handle_input(KeyCode::Ctrl('g')).await.unwrap();
+    assert!(start.elapsed() < Duration::from_millis(500), "Gordon action blocked the UI");
+    assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    assert_eq!(app.task_current().unwrap().uuid(), &uuid);
+    app.wait_for_writes();
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("next\n2\nfixed argument\n{uuid}\n"));
+
+    app.tasks.clear();
+    assert!(app.gordon_command().is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   async fn test_task_style_keyword_color() {

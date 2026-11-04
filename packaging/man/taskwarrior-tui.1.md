@@ -134,6 +134,11 @@ Ctrl-y
 `Ctrl + r`
 : refresh                           - Refresh task report
 
+`Ctrl + g`
+: send selected task to Gordon without Enter
+
+Configure `uda.taskwarrior-tui.gordon.command=~/.local/bin/send-task-to-gordon` in the Taskwarrior configuration. The command defaults to empty and runs in the background without input, with the selected task's full UUID appended as one argument. Remap the key with a single character, for example `uda.taskwarrior-tui.keyconfig.gordon=Q`.
+
 `?`
 : help                              - Help menu
 

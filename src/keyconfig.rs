@@ -10,6 +10,7 @@ use crate::event::KeyCode;
 pub struct KeyConfig {
   pub quit: KeyCode,
   pub refresh: KeyCode,
+  pub gordon: KeyCode,
   pub go_to_bottom: KeyCode,
   pub go_to_top: KeyCode,
   pub down: KeyCode,
@@ -60,6 +61,7 @@ impl Default for KeyConfig {
     Self {
       quit: KeyCode::Char('q'),
       refresh: KeyCode::Ctrl('r'),
+      gordon: KeyCode::Ctrl('g'),
       go_to_bottom: KeyCode::Char('G'),
       go_to_top: KeyCode::Char('g'),
       down: KeyCode::Char('j'),
@@ -117,6 +119,7 @@ impl KeyConfig {
   pub fn update(&mut self, data: &str) -> Result<()> {
     let quit = Self::get_config("uda.taskwarrior-tui.keyconfig.quit", data);
     let refresh = Self::get_config("uda.taskwarrior-tui.keyconfig.refresh", data);
+    let gordon = Self::get_config("uda.taskwarrior-tui.keyconfig.gordon", data);
     let go_to_bottom = Self::get_config("uda.taskwarrior-tui.keyconfig.go-to-bottom", data);
     let go_to_top = Self::get_config("uda.taskwarrior-tui.keyconfig.go-to-top", data);
     let down = Self::get_config("uda.taskwarrior-tui.keyconfig.down", data);
@@ -158,6 +161,7 @@ impl KeyConfig {
 
     self.quit = quit.unwrap_or(self.quit);
     self.refresh = refresh.unwrap_or(self.refresh);
+    self.gordon = gordon.unwrap_or(self.gordon);
     self.go_to_bottom = go_to_bottom.unwrap_or(self.go_to_bottom);
     self.go_to_top = go_to_top.unwrap_or(self.go_to_top);
     self.down = down.unwrap_or(self.down);
@@ -204,6 +208,7 @@ impl KeyConfig {
     let mut elements = vec![
       &self.quit,
       &self.refresh,
+      &self.gordon,
       &self.go_to_bottom,
       &self.go_to_top,
       &self.down,
@@ -273,4 +278,13 @@ fn has_just_one_char(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn gordon_key_defaults_to_ctrl_g_and_accepts_custom_character() {
+    assert_eq!(KeyConfig::new("").unwrap().gordon, KeyCode::Ctrl('g'));
+    assert_eq!(
+      KeyConfig::new("uda.taskwarrior-tui.keyconfig.gordon Q\n").unwrap().gordon,
+      KeyCode::Char('Q')
+    );
+  }
 }
