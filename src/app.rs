@@ -2539,7 +2539,11 @@ impl TaskwarriorTui {
 
   fn restore_report_selection(&mut self, previous_row_index: Option<usize>) {
     let indices = self.reports.filtered_indices();
+    let query = self.reports.search.to_lowercase();
+    let matches_name = |ri: usize| self.reports.rows[ri].name.to_lowercase().contains(&query);
+    let has_name_match = indices.iter().any(|&ri| matches_name(ri));
     let selection = previous_row_index
+      .filter(|&ri| !has_name_match || matches_name(ri))
       .and_then(|ri| indices.iter().position(|&filtered_ri| filtered_ri == ri))
       .or_else(|| (!indices.is_empty()).then_some(0));
     self.reports.table_state.select(selection);
@@ -2600,6 +2604,12 @@ impl TaskwarriorTui {
       .arg("show")
       .output()
       .context("Unable to run `task show`.")?;
+    if !output.status.success() {
+      return Err(anyhow!(
+        "Unable to read task configuration: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+      ));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
   }
 
@@ -3945,6 +3955,16 @@ impl TaskwarriorTui {
             self.contexts.table_state.select(Some(active_pos));
             self.mode = Mode::Tasks(Action::ContextMenu);
           } else if input == self.keyconfig.report_menu {
+            let data = match Self::task_show_output(&self.task_exe) {
+              Ok(data) => data,
+              Err(error) => {
+                self.error = Some(error.to_string());
+                self.previous_mode = Some(self.mode.clone());
+                self.mode = Mode::Tasks(Action::Error);
+                return Ok(());
+              }
+            };
+            self.reports.update_data(&self.report, &data);
             self.reports.search.clear();
             // Pre-select the active report.
             let active_pos = self
@@ -5426,6 +5446,8 @@ mod tests {
     test_write_names_one_task_by_guarded_id().await;
     test_undo_and_add_run_in_background().await;
     test_background_shortcut_keeps_the_terminal().await;
+    test_report_menu_refresh_error_keeps_reports().await;
+    test_report_menu_refreshes_and_exports_waiting_tasks().await;
 
     teardown();
   }
@@ -6394,11 +6416,11 @@ mod tests {
       let mut app = TaskwarriorTui::new("next", false).await.unwrap();
       app.update(true).await.unwrap();
       app.config.uda_report_menu_close_on_select = close_on_select;
+      app.handle_input(KeyCode::Char('r')).await.unwrap();
       app.reports.update_data(
         "next",
         "report.all.columns id\nreport.all.filter status:any\nreport.day.columns id\nreport.day.filter status:pending\nreport.next.columns id\nreport.next.filter status:pending\nuda.taskwarrior-tui.report.next.order 1\n",
       );
-      app.handle_input(KeyCode::Char('r')).await.unwrap();
       app.reports.search = "pending".into();
       app.restore_report_selection(None);
 
@@ -6428,6 +6450,98 @@ mod tests {
       assert_eq!(app.mode, Mode::Tasks(Action::Report));
       app.wait_for_writes();
     }
+  }
+
+  async fn test_report_menu_refresh_error_keeps_reports() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.update(true).await.unwrap();
+    let before = app.reports.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+    app.task_exe = "missing-task-executable-for-picker-test".into();
+    app.handle_input(KeyCode::Char('r')).await.unwrap();
+    assert_eq!(app.mode, Mode::Tasks(Action::Error));
+    assert!(app.error.is_some());
+    assert_eq!(app.reports.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>(), before);
+  }
+
+  async fn test_report_menu_refreshes_and_exports_waiting_tasks() {
+    reset_test_context();
+    for args in [
+      vec!["add", "picker waiting regression", "wait:tomorrow"],
+      vec!["add", "picker pending regression"],
+    ] {
+      let output = std::process::Command::new(task_exe()).arg("rc.hooks=off").args(args).output().unwrap();
+      assert!(output.status.success());
+    }
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.update(true).await.unwrap();
+    app.reports.rows.retain(|row| row.name != "waiting");
+    app.handle_input(KeyCode::Char('r')).await.unwrap();
+    assert!(app.reports.rows.iter().any(|row| row.name == "waiting"));
+
+    let output = std::process::Command::new(task_exe())
+      .args(["rc.color=off", "rc.verbose=nothing", "reports"])
+      .output()
+      .unwrap();
+    assert!(output.status.success());
+    for name in String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .filter_map(|line| line.split_whitespace().next())
+    {
+      if name == "Report" || name.starts_with('-') || name.parse::<usize>().is_ok() {
+        continue;
+      }
+      // `task reports` also lists native charts and aggregate commands. They
+      // have no task-table columns and are not exportable report names.
+      if [
+        "burndown.daily",
+        "burndown.monthly",
+        "burndown.weekly",
+        "ghistory.annual",
+        "ghistory.monthly",
+        "history.annual",
+        "history.monthly",
+        "information",
+        "projects",
+        "summary",
+        "tags",
+      ]
+      .contains(&name)
+      {
+        continue;
+      }
+      assert!(app.reports.rows.iter().any(|row| row.name == name), "Missing native report {name}");
+    }
+    for c in "waiting".chars() {
+      app.handle_input(KeyCode::Char(c)).await.unwrap();
+    }
+    let first = app.reports.filtered_indices()[0];
+    assert_eq!(app.reports.rows[first].name, "waiting");
+    assert_eq!(app.report_selected_row_index(), Some(first));
+    app.handle_input(KeyCode::Char('1')).await.unwrap();
+    assert_eq!(app.report, "waiting");
+    assert_eq!(app.config.filter.trim(), "+WAITING");
+
+    let native = std::process::Command::new(task_exe())
+      .args([
+        "rc.color=off",
+        "rc.verbose=nothing",
+        "rc.report.waiting.columns=uuid",
+        "rc.report.waiting.labels=UUID",
+        "waiting",
+      ])
+      .output()
+      .unwrap();
+    assert!(native.status.success());
+    let expected = String::from_utf8_lossy(&native.stdout)
+      .lines()
+      .filter_map(|line| Uuid::parse_str(line.trim()).ok())
+      .map(|uuid| uuid.to_string())
+      .collect::<HashSet<_>>();
+    let actual = app.tasks.iter().map(|task| task.uuid().to_string()).collect::<HashSet<_>>();
+    assert!(!expected.is_empty());
+    assert_eq!(actual, expected);
+    assert!(app.tasks.iter().any(|task| task.description() == "picker waiting regression"));
+    assert!(!app.tasks.iter().any(|task| task.description() == "picker pending regression"));
   }
 
   async fn test_report_menu_enter_can_stay_open() {

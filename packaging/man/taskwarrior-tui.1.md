@@ -219,6 +219,11 @@ Keybindings for report switcher:
 Type other characters to filter report names and effective filters. The Active
 column marks the current report.
 
+Name matches come before filter-only matches, so searching `waiting` puts that
+report ahead of filters containing `-WAITING`. The list refreshes when opened.
+Only task-table reports are listed; native charts and aggregate commands stay
+outside the picker. Waiting tasks remain subject to the active context.
+
 Set `uda.taskwarrior-tui.report.<name>.order=<integer>` in taskrc to put reports
 first, lowest number first. Equal numbers sort alphabetically. Reports without
 an order follow alphabetically. Unknown names and invalid values are ignored.

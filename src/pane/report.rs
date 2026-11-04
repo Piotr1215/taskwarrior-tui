@@ -46,17 +46,22 @@ impl ReportsState {
   }
 
   /// Returns the indices into `self.rows` that match the current search query.
-  /// An empty query matches everything (original order is preserved).
-  /// Matching is case-insensitive substring on name or filter.
+  /// An empty query matches everything in the original order. For a nonempty
+  /// query, name matches precede filter-only matches, preserving order within
+  /// each group. Matching is case-insensitive substring on name or filter.
   pub fn filtered_indices(&self) -> Vec<usize> {
     let query = self.search.to_lowercase();
-    self
+    let mut matches: Vec<usize> = self
       .rows
       .iter()
       .enumerate()
       .filter(|(_, r)| query.is_empty() || r.name.to_lowercase().contains(&query) || r.filter.to_lowercase().contains(&query))
       .map(|(i, _)| i)
-      .collect()
+      .collect();
+    if !query.is_empty() {
+      matches.sort_by_key(|&i| !self.rows[i].name.to_lowercase().contains(&query));
+    }
+    matches
   }
 
   /// Parse the `task show` output for all reports that have columns defined
@@ -156,5 +161,21 @@ mod tests {
     );
     reports.update_data("", "report.zulu.columns id\nreport.alpha.columns id\n");
     assert_eq!(reports.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["alpha", "zulu"]);
+  }
+
+  #[test]
+  fn name_matches_precede_filter_only_matches_without_losing_them() {
+    let data = "report.active.columns id,description\nreport.active.filter status:pending -WAITING\nreport.waiting.columns id,priority,project,wait.remaining,due.relative,description.desc,linear_issue_id\nreport.waiting.filter +WAITING\nuda.taskwarrior-tui.report.active.order 1\nuda.taskwarrior-tui.report.waiting.order 2\n";
+    let mut reports = ReportsState::new();
+    reports.update_data("active", data);
+    assert_eq!(
+      reports.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+      vec!["active", "waiting"]
+    );
+    assert_eq!(reports.filtered_indices(), vec![0, 1]);
+    reports.search = "waiting".into();
+    assert_eq!(reports.filtered_indices(), vec![1, 0]);
+    reports.search = "-WAITING".into();
+    assert_eq!(reports.filtered_indices(), vec![0]);
   }
 }

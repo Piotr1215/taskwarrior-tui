@@ -41,3 +41,9 @@ arrow keys to move, and press Enter to load it. Press `1` to `9` to load that
 numbered row and close the picker. Numbers follow the filtered list, and digits
 `1` to `9` select rows rather than entering search text. The Active column marks
 the current report. Press `Ctrl+R` to refresh the task list.
+
+Report names that match your search appear before matches in filters. For example,
+searching `waiting` puts that report first, ahead of filters containing `-WAITING`.
+The picker refreshes its report list when opened. It lists task-table reports;
+native charts and aggregate commands, such as `burndown` and `summary`, stay outside
+the picker. The waiting report includes hidden tasks that match the active context.
