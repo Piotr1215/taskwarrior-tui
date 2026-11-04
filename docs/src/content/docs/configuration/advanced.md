@@ -47,6 +47,10 @@ uda.taskwarrior-tui.context-menu.select-on-move=false
 uda.taskwarrior-tui.context-menu.close-on-select=true
 uda.taskwarrior-tui.report-menu.select-on-move=false
 uda.taskwarrior-tui.report-menu.close-on-select=true
+# Put frequently used reports first in the report picker (lowest integer first).
+uda.taskwarrior-tui.report.inbox.order=1
+uda.taskwarrior-tui.report.handoffs.order=2
+uda.taskwarrior-tui.report.current.order=3
 uda.taskwarrior-tui.tabs.change-focus-rotate=false
 uda.taskwarrior-tui.quick-tag.name=next
 # UI chrome styles (support all Taskwarrior color formats)
@@ -57,6 +61,12 @@ uda.taskwarrior-tui.style.command.error= # default: Red foreground
 ```
 
 See [color configuration](./colors.md) for supported color formats and additional TUI style keys such as `uda.taskwarrior-tui.style.navbar` and `uda.taskwarrior-tui.style.command`.
+
+Set `uda.taskwarrior-tui.report.<name>.order=<integer>` to place a report near the
+top of the picker. Lower numbers come first. Reports with the same number sort
+alphabetically, followed by reports with no order, also alphabetically. Unknown
+report names and invalid values are ignored. Without order settings, all reports
+sort alphabetically. Row numbers follow this order and restart at 1 when filtered.
 
 The `uda.taskwarrior-tui.task-report.next.filter` variable defines the default view at program startup. Set this to any preconfigured report from `task reports`, or create your own report in Taskwarrior and specify its name here.
 

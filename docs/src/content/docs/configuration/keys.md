@@ -37,5 +37,7 @@ uda.taskwarrior-tui.keyconfig.previous-tab=[
 ```
 
 Press `r` to choose a report. Type to filter its name or effective filter, use the
-arrow keys to move, and press Enter to load it. The Active column marks the current
-report. Press `Ctrl+R` to refresh the task list.
+arrow keys to move, and press Enter to load it. Press `1` to `9` to load that
+numbered row and close the picker. Numbers follow the filtered list, and digits
+`1` to `9` select rows rather than entering search text. The Active column marks
+the current report. Press `Ctrl+R` to refresh the task list.

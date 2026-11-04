@@ -128,8 +128,11 @@ Ctrl-y
 `c`
 : context switcher menu             - Open context switcher menu
 
-`R`
+`r`
 : report switcher menu              - Open report switcher menu
+
+`Ctrl + r`
+: refresh                           - Refresh task report
 
 `?`
 : help                              - Help menu
@@ -200,11 +203,26 @@ Keybindings for context switcher:
 
 Keybindings for report switcher:
 
-`j`
+`Down`
 : {selected+=1}                     - Move forward a report
 
-`k`
+`Up`
 : {selected-=1}                     - Move back a report
+
+`Enter`
+: Select the highlighted report.
+
+`1-9`
+: Load the numbered row and close the picker. Numbers follow the filtered list.
+  These digits select reports instead of entering search text.
+
+Type other characters to filter report names and effective filters. The Active
+column marks the current report.
+
+Set `uda.taskwarrior-tui.report.<name>.order=<integer>` in taskrc to put reports
+first, lowest number first. Equal numbers sort alphabetically. Reports without
+an order follow alphabetically. Unknown names and invalid values are ignored.
+Without order settings, all reports sort alphabetically.
 
 
 Keybindings for calendar:

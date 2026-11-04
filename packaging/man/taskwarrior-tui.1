@@ -132,8 +132,11 @@ scroll up task details - Scroll task details view up one line
 \f[V]c\f[R]
 context switcher menu - Open context switcher menu
 .TP
-\f[V]R\f[R]
+\f[V]r\f[R]
 report switcher menu - Open report switcher menu
+.TP
+\f[V]Ctrl + r\f[R]
+refresh - Refresh task report
 .TP
 \f[V]?\f[R]
 help - Help menu
@@ -204,11 +207,29 @@ Keybindings for context switcher:
 .PP
 Keybindings for report switcher:
 .TP
-\f[V]j\f[R]
+\f[V]Down\f[R]
 {selected+=1} - Move forward a report
 .TP
-\f[V]k\f[R]
+\f[V]Up\f[R]
 {selected-=1} - Move back a report
+.TP
+\f[V]Enter\f[R]
+Select the highlighted report.
+.TP
+\f[V]1-9\f[R]
+Load the numbered row and close the picker.
+Numbers follow the filtered list.
+These digits select reports instead of entering search text.
+.PP
+Type other characters to filter report names and effective filters.
+The Active column marks the current report.
+.PP
+Set \f[V]uda.taskwarrior-tui.report.<name>.order=<integer>\f[R] in
+taskrc to put reports first, lowest number first.
+Equal numbers sort alphabetically.
+Reports without an order follow alphabetically.
+Unknown names and invalid values are ignored.
+Without order settings, all reports sort alphabetically.
 .PP
 Keybindings for calendar:
 .TP

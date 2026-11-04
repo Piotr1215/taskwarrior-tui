@@ -138,11 +138,17 @@ Keybindings for context switcher:
 
 Keybindings for report switcher:
 
-    {{down}}: {selected+=1}                     - Move forward a report
+    Down: {selected+=1}                 - Move forward a report
 
-    {{up}}: {selected-=1}                     - Move back a report
+    Up: {selected-=1}                   - Move back a report
 
     Enter: task report {selected}       - Select highlighted report
+
+    1-9: task report {number}           - Select numbered row and close
+
+    Type:                              - Filter report names and filters
+
+    Order: uda.taskwarrior-tui.report.<name>.order=<n>, lowest first
 
 Keybindings for calendar:
 

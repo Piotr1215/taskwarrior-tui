@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{config::Config, table::TaskwarriorTuiTableState};
 
@@ -86,7 +86,21 @@ impl ReportsState {
       }
     }
 
-    report_names.sort();
+    let orders: HashMap<&str, i64> = data
+      .lines()
+      .filter_map(|line| {
+        let rest = line.strip_prefix("uda.taskwarrior-tui.report.")?;
+        let (key, value) = rest.split_once(char::is_whitespace)?;
+        let name = key.strip_suffix(".order")?;
+        Some((name, value.trim().parse().ok()?))
+      })
+      .collect();
+    report_names.sort_by(|a, b| match (orders.get(a.as_str()), orders.get(b.as_str())) {
+      (Some(a_order), Some(b_order)) => a_order.cmp(b_order).then_with(|| a.cmp(b)),
+      (Some(_), None) => std::cmp::Ordering::Less,
+      (None, Some(_)) => std::cmp::Ordering::Greater,
+      (None, None) => a.cmp(b),
+    });
 
     for name in report_names {
       let filter = Config::get_filter(data, &name).unwrap_or_default();
@@ -114,5 +128,33 @@ mod tests {
     assert_eq!(reports.filtered_indices(), vec![1]);
     reports.search = "ALP".into();
     assert_eq!(reports.filtered_indices(), vec![0]);
+  }
+
+  #[test]
+  fn ordered_reports_precede_unordered_and_search_preserves_order() {
+    let data = "report.zulu.columns id\nreport.alpha.columns id\nreport.beta.columns id\nreport.gamma.columns id\nreport.gamma.filter +work\nuda.taskwarrior-tui.report.zulu.order -1\nuda.taskwarrior-tui.report.beta.order 2\nuda.taskwarrior-tui.report.missing.order -99\n";
+    let mut reports = ReportsState::new();
+    reports.update_data("alpha", data);
+    assert_eq!(
+      reports.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+      vec!["zulu", "beta", "alpha", "gamma"]
+    );
+    reports.search = "a".into();
+    assert_eq!(reports.filtered_indices(), vec![1, 2, 3]);
+    reports.search = "+WORK".into();
+    assert_eq!(reports.filtered_indices(), vec![3]);
+  }
+
+  #[test]
+  fn ties_and_invalid_or_absent_orders_are_alphabetical() {
+    let data = "report.zulu.columns id\nreport.beta.columns id\nreport.alpha.columns id\nreport.gamma.columns id\nuda.taskwarrior-tui.report.zulu.order 4\nuda.taskwarrior-tui.report.beta.order 4\nuda.taskwarrior-tui.report.alpha.order 1.5\nuda.taskwarrior-tui.report.gamma.order nope\n";
+    let mut reports = ReportsState::new();
+    reports.update_data("", data);
+    assert_eq!(
+      reports.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+      vec!["beta", "zulu", "alpha", "gamma"]
+    );
+    reports.update_data("", "report.zulu.columns id\nreport.alpha.columns id\n");
+    assert_eq!(reports.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["alpha", "zulu"]);
   }
 }

@@ -1711,7 +1711,10 @@ impl TaskwarriorTui {
         Block::default()
           .borders(Borders::ALL)
           .border_type(BorderType::Rounded)
-          .title(Span::styled("Report  (type to filter)", Style::default().add_modifier(Modifier::BOLD))),
+          .title(Span::styled(
+            "Report  (type to filter, 1-9 to select)",
+            Style::default().add_modifier(Modifier::BOLD),
+          )),
       ),
       chunks[0],
     );
@@ -1727,9 +1730,10 @@ impl TaskwarriorTui {
     let headers = ["Name", "Filter", "Active"];
     let filtered_rows: Vec<Vec<String>> = indices
       .iter()
-      .map(|&ri| {
+      .enumerate()
+      .map(|(index, &ri)| {
         let r = &self.reports.rows[ri];
-        vec![r.name.clone(), r.filter.clone(), r.active.clone()]
+        vec![format!("{}. {}", index + 1, r.name), r.filter.clone(), r.active.clone()]
       })
       .collect();
 
@@ -2561,6 +2565,30 @@ impl TaskwarriorTui {
       }
     }
 
+    Ok(())
+  }
+
+  async fn activate_report_menu_selection(&mut self, force_close: bool) -> Result<()> {
+    if self.error.is_some() {
+      self.previous_mode = Some(self.mode.clone());
+      self.mode = Mode::Tasks(Action::Error);
+      return Ok(());
+    }
+
+    let data = Self::task_show_output(&self.task_exe)?;
+    match self.report_select(&data) {
+      Ok(true) => {
+        self.update(true).await?;
+        if force_close || self.config.uda_report_menu_close_on_select {
+          self.mode = Mode::Tasks(Action::Report);
+        }
+      }
+      Ok(false) => {}
+      Err(e) => {
+        self.error = Some(e.to_string());
+        self.mode = Mode::Tasks(Action::Error);
+      }
+    }
     Ok(())
   }
 
@@ -4018,24 +4046,13 @@ impl TaskwarriorTui {
               self.maybe_autoselect_report_menu().await?;
             }
             KeyCode::Char('\n') => {
-              if self.error.is_some() {
-                self.previous_mode = Some(self.mode.clone());
-                self.mode = Mode::Tasks(Action::Error);
-              } else {
-                let data = Self::task_show_output(&self.task_exe)?;
-                match self.report_select(&data) {
-                  Ok(true) => {
-                    self.update(true).await?;
-                    if self.config.uda_report_menu_close_on_select {
-                      self.mode = Mode::Tasks(Action::Report);
-                    }
-                  }
-                  Ok(false) => {}
-                  Err(e) => {
-                    self.error = Some(e.to_string());
-                    self.mode = Mode::Tasks(Action::Error);
-                  }
-                }
+              self.activate_report_menu_selection(false).await?;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+              let index = (c as usize) - ('1' as usize);
+              if index < self.reports.filtered_indices().len() {
+                self.reports.table_state.select(Some(index));
+                self.activate_report_menu_selection(true).await?;
               }
             }
             // Printable characters feed the search bar (except quit when search is empty).
@@ -5384,6 +5401,7 @@ mod tests {
     test_context_menu_escape_clears_search_selects_top_match_and_stays_open_when_select_on_move_is_enabled().await;
     test_context_menu_enter_with_no_matches_stays_open_when_select_on_move_is_enabled().await;
     test_report_menu_enter_closes_menu().await;
+    test_report_menu_digits_select_numbered_filtered_rows().await;
     test_report_menu_enter_can_stay_open().await;
     test_report_menu_enter_with_no_matches_does_not_select().await;
     test_report_menu_selection_config_combinations_select_filtered_match_on_enter().await;
@@ -6369,6 +6387,47 @@ mod tests {
     assert_eq!(app.mode, Mode::Tasks(Action::Report));
     assert_eq!(app.report, "day");
     assert_eq!(app.config.filter.trim(), "status:pending");
+  }
+
+  async fn test_report_menu_digits_select_numbered_filtered_rows() {
+    for close_on_select in [false, true] {
+      let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+      app.update(true).await.unwrap();
+      app.config.uda_report_menu_close_on_select = close_on_select;
+      app.reports.update_data(
+        "next",
+        "report.all.columns id\nreport.all.filter status:any\nreport.day.columns id\nreport.day.filter status:pending\nreport.next.columns id\nreport.next.filter status:pending\nuda.taskwarrior-tui.report.next.order 1\n",
+      );
+      app.handle_input(KeyCode::Char('r')).await.unwrap();
+      app.reports.search = "pending".into();
+      app.restore_report_selection(None);
+
+      let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+      terminal.draw(|frame| app.draw_report_menu(frame, 100, 100)).unwrap();
+      let rendered = buffer_view(terminal.backend().buffer());
+      assert!(rendered.contains("1. next"));
+      assert!(rendered.contains("2. day"));
+      assert!(!rendered.contains("all"));
+
+      app.handle_input(KeyCode::Char('9')).await.unwrap();
+      assert_eq!(app.mode, Mode::Tasks(Action::ReportMenu));
+      assert_eq!(app.report, "next");
+      assert_eq!(app.reports.search, "pending");
+
+      app.handle_input(KeyCode::Char('2')).await.unwrap();
+      assert_eq!(app.mode, Mode::Tasks(Action::Report));
+      assert_eq!(app.report, "day");
+      assert_eq!(app.config.filter.trim(), "status:pending");
+      assert_eq!(app.reports.search, "pending");
+      app.wait_for_writes();
+
+      app.handle_input(KeyCode::Char('r')).await.unwrap();
+      let first_report = app.reports.rows[0].name.clone();
+      app.handle_input(KeyCode::Char('1')).await.unwrap();
+      assert_eq!(app.report, first_report);
+      assert_eq!(app.mode, Mode::Tasks(Action::Report));
+      app.wait_for_writes();
+    }
   }
 
   async fn test_report_menu_enter_can_stay_open() {
