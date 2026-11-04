@@ -526,7 +526,20 @@ impl TaskwarriorTui {
     enable_raw_mode()?;
     self.requires_redraw = true;
     terminal.hide_cursor()?;
+    self.update_pane_title();
     Ok(())
+  }
+
+  // Scope title changes to this pane; agent identity uses separate pane options.
+  fn update_pane_title(&self) {
+    let Ok(pane) = std::env::var("TMUX_PANE") else { return };
+    let Some(id) = pane.strip_prefix('%') else { return };
+    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) {
+      return;
+    }
+    let _ = std::process::Command::new("tmux")
+      .args(["select-pane", "-t", &pane, "-T", &self.report])
+      .output();
   }
 
   pub async fn abort_event_loop(&mut self) -> Result<()> {
@@ -575,7 +588,12 @@ impl TaskwarriorTui {
 
   async fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut hangup = Hangup::new()?;
+    let mut titled_report = String::new();
     loop {
+      if titled_report != self.report {
+        self.update_pane_title();
+        titled_report.clone_from(&self.report);
+      }
       if self.requires_redraw {
         repaint_all(terminal)?;
         self.requires_redraw = false;
@@ -1240,7 +1258,7 @@ impl TaskwarriorTui {
           f,
           rects[1],
           self.filter.as_str(),
-          (Span::raw("Filter Tasks"), self.history_status.as_ref().map(Span::raw)),
+          (Span::raw(self.report.clone()), self.history_status.as_ref().map(Span::raw)),
           Self::get_position(&self.filter),
           false,
           self.error.clone(),
@@ -1275,7 +1293,7 @@ impl TaskwarriorTui {
           rects[1],
           self.filter.as_str(),
           (
-            Span::styled("Filter Tasks", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(self.report.clone(), Style::default().add_modifier(Modifier::BOLD)),
             self
               .history_status
               .as_ref()
@@ -1432,7 +1450,7 @@ impl TaskwarriorTui {
           f,
           rects[1],
           self.filter.as_str(),
-          ("Filter Tasks".into(), None),
+          (self.report.clone().into(), None),
           Self::get_position(&self.filter),
           false,
           self.error.clone(),
@@ -1445,7 +1463,7 @@ impl TaskwarriorTui {
           f,
           rects[1],
           self.filter.as_str(),
-          ("Filter Tasks".into(), None),
+          (self.report.clone().into(), None),
           Self::get_position(&self.filter),
           false,
           self.error.clone(),
@@ -1458,7 +1476,7 @@ impl TaskwarriorTui {
           f,
           rects[1],
           self.filter.as_str(),
-          ("Filter Tasks".into(), None),
+          (self.report.clone().into(), None),
           Self::get_position(&self.filter),
           false,
           self.error.clone(),
@@ -2959,6 +2977,7 @@ impl TaskwarriorTui {
     let mut command = std::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
     command.env("TASKWARRIOR_TUI_REPORT", &self.report);
+    command.env("TASKWARRIOR_TUI_VIEW_VERSION", "2");
     Ok(command)
   }
 
@@ -5657,7 +5676,8 @@ mod tests {
       let buffer = terminal.backend().buffer();
       let line = |y| (0..188).map(|x| buffer[(x, y)].symbol()).collect::<String>();
       assert!(line(2).contains("pane-row-00"), "first task hidden at height {height}: {}", line(2));
-      assert!(line(height - 2).contains("Filter Tasks | 1 open | 2 views"));
+      assert!(line(height - 2).starts_with("next | 1 open | 2 views"));
+      assert!(!line(height - 2).contains("Filter Tasks"));
       assert_eq!(app.task_report_height, height - 4);
       let visible = usize::from(height - 4).min(app.tasks.len());
       for i in 0..visible {
@@ -6782,7 +6802,7 @@ mod tests {
       "                                                  ",
       "                                                  ",
       "                                                  ",
-      "Filter Tasks                                      ",
+      "next                                              ",
       "(status:pending or status:waiting)                ",
     ]);
 

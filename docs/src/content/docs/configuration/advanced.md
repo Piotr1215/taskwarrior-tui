@@ -146,7 +146,7 @@ uda.taskwarrior-tui.legend.default=1 open | 2 views
 uda.taskwarrior-tui.legend.handoffs=1 open | 2 views | 3 brief | 4 note | 5 promote | 6 reply | 7 ack
 ```
 
-The legend appears beside the command heading above the filter, using the existing row. It changes when you select a report. A report without its own legend uses `legend.default`; an empty report legend hides it. Leave these settings unset to hide all legends. Long legends are clipped to the pane width.
+The active report name and legend share the heading above the filter, using the existing row. In tmux, the pane title also follows the active report. It changes when you select a report. A report without its own legend uses `legend.default`; an empty report legend hides it. Leave these settings unset to hide all legends. Long legends are clipped to the pane width.
 
 A foreground shortcut can switch reports by writing a configured report name to `$TASKWARRIOR_TUI_REPORT_REQUEST` and exiting successfully:
 
