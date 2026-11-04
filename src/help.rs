@@ -27,6 +27,7 @@ fn keycode_for(name: &str, kc: &KeyConfig) -> KeyCode {
     "next_tab" => kc.next_tab,
     "previous_tab" => kc.previous_tab,
     "filter" => kc.filter,
+    "project_filter" => kc.project_filter,
     "add" => kc.add,
     "done" => kc.done,
     "edit" => kc.edit,
@@ -66,10 +67,8 @@ fn keycode_for(name: &str, kc: &KeyConfig) -> KeyCode {
 
 /// Generates the Help text from the template based on the current
 /// key configuration. Every substring `{{token}}` in the template
-/// is replaced with the character held by `kc.token`.
+/// is replaced with the configured key label.
 fn render_help(kc: &KeyConfig, tmpl: &str) -> String {
-  // NOTE: assumes KeyCode is always a single char (which is currently the case)
-  // this function MUST be updated if that ever changes
   let mut out = String::with_capacity(tmpl.len());
   let mut i = 0;
   while let Some(start) = tmpl[i..].find("{{") {
@@ -78,8 +77,13 @@ fn render_help(kc: &KeyConfig, tmpl: &str) -> String {
     if let Some(end) = tmpl[s + 2..].find("}}") {
       let e = s + 2 + end;
       let name = &tmpl[s + 2..e];
-      if let KeyCode::Char(c) = keycode_for(name, kc) {
-        out.push(c);
+      match keycode_for(name, kc) {
+        KeyCode::Char(c) => out.push(c),
+        KeyCode::Ctrl(c) => {
+          out.push('^');
+          out.extend(c.to_uppercase());
+        }
+        _ => {}
       }
       i = e + 2;
       continue;
@@ -123,5 +127,16 @@ impl Widget for &Help {
       .alignment(Alignment::Left)
       .scroll((self.scroll, 0))
       .render(area, buf);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn renders_project_filter_control_key() {
+    let keys = KeyConfig::default();
+    assert_eq!(render_help(&keys, "{{project_filter}} {{filter}}"), "^P /");
   }
 }

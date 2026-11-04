@@ -142,7 +142,7 @@ Every shortcut receives the active report name in `TASKWARRIOR_TUI_REPORT`, incl
 Configure a one-line key legend for each report:
 
 ```ini
-uda.taskwarrior-tui.legend.default=1 open | 2 views
+uda.taskwarrior-tui.legend.default=1 open | 2 views | ^P project
 uda.taskwarrior-tui.legend.handoffs=1 open | 2 views | 3 brief | 4 note | 5 promote | 6 reply | 7 ack
 ```
 
@@ -160,7 +160,7 @@ Reports can override the read context and detail pane without changing Taskwarri
 
 ```ini
 uda.taskwarrior-tui.report.handoffs.context=none
-uda.taskwarrior-tui.report.handoffs.show-info=true
+uda.taskwarrior-tui.report.handoffs.show-info=false
 ```
 
 Other reports use the normal context and `task-report.show-info` setting. Task writes still use the selected UUIDs, and do not change the global context.
@@ -226,3 +226,5 @@ You can also set it permanently in your shell profile:
 ```bash
 export TASKWARRIOR_TUI_TASKWARRIOR_CLI=/usr/local/bin/task
 ```
+
+In the normal task report, `Ctrl+P` adds the selected task's project to the visible filter. Press it again to restore the previous filter. Changing reports clears this temporary project scope. In input prompts, `Ctrl+P` keeps its completion-navigation behavior.

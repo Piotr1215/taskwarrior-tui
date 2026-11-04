@@ -371,6 +371,7 @@ pub struct TaskwarriorTui {
   last_write_seq: u64,
   export_in_flight: Option<u64>,
   report_export_floor: u64,
+  project_filter_before: Option<String>,
   refresh_again: bool,
   // Rows removed before their write ran, keyed to the write's queue position.
   hidden_tasks: HashMap<Uuid, u64>,
@@ -480,6 +481,7 @@ impl TaskwarriorTui {
       last_write_seq: 0,
       export_in_flight: None,
       report_export_floor: 0,
+      project_filter_before: None,
       refresh_again: false,
       hidden_tasks: HashMap::new(),
     };
@@ -2475,6 +2477,7 @@ impl TaskwarriorTui {
 
   fn select_report(&mut self, report: &str, data: &str) -> Result<()> {
     self.report = report.to_string();
+    self.project_filter_before = None;
     self.config.filter = Config::get_filter(data, &self.report)?;
     if !self.config.filter.trim().is_empty() {
       self.config.filter = format!("{} ", self.config.filter.trim());
@@ -2507,6 +2510,26 @@ impl TaskwarriorTui {
   fn report_selected_row_index(&self) -> Option<usize> {
     let fi = self.reports.table_state.current_selection()?;
     self.reports.filtered_indices().get(fi).copied()
+  }
+
+  fn toggle_project_filter(&mut self) -> bool {
+    let filter = if let Some(before) = self.project_filter_before.take() {
+      before
+    } else {
+      let Some(task) = self.task_current() else { return false };
+      let project = task.project().map(ToString::to_string).unwrap_or_default();
+      let project = Self::escape(&project.replace('\\', "\\\\"));
+      let before = self.filter.as_str().to_string();
+      let scoped = if before.trim().is_empty() {
+        format!("project:{project}")
+      } else {
+        format!("({}) project:{project}", before.trim())
+      };
+      self.project_filter_before = Some(before);
+      scoped
+    };
+    self.filter.update(&filter, filter.len(), &mut self.changes);
+    true
   }
 
   fn restore_report_selection(&mut self, previous_row_index: Option<usize>) {
@@ -2763,11 +2786,9 @@ impl TaskwarriorTui {
     }
     // .arg("rc.verbose:override=false");
 
-    if let Some(args) = shlex::split(format!(r#"rc.report.{}.filter='{}'"#, self.report, self.filter.trim()).trim()) {
-      for arg in args {
-        task.arg(arg);
-      }
-    }
+    // This is already one argv value. A shell parse would corrupt project names
+    // or filters containing apostrophes.
+    task.arg(format!("rc.report.{}.filter={}", self.report, self.filter.trim()));
 
     if !self.current_context_filter.trim().is_empty() && self.task_version >= *TASKWARRIOR_VERSION_SUPPORTED {
       if let Some(args) = shlex::split(&self.current_context_filter) {
@@ -2977,7 +2998,7 @@ impl TaskwarriorTui {
     let mut command = std::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
     command.env("TASKWARRIOR_TUI_REPORT", &self.report);
-    command.env("TASKWARRIOR_TUI_VIEW_VERSION", "2");
+    command.env("TASKWARRIOR_TUI_VIEW_VERSION", "3");
     Ok(command)
   }
 
@@ -3738,6 +3759,10 @@ impl TaskwarriorTui {
             self.update_completion_list();
           } else if input == self.keyconfig.help {
             self.mode = Mode::Tasks(Action::HelpPopup);
+          } else if input == self.keyconfig.project_filter {
+            if self.toggle_project_filter() {
+              self.update(true).await?;
+            }
           } else if input == self.keyconfig.filter {
             self.mode = Mode::Tasks(Action::Filter);
             self.filter_history.reset();
@@ -5324,6 +5349,7 @@ mod tests {
     setup();
 
     test_report_legend_and_pane_fit().await;
+    test_selected_project_filter_toggle().await;
 
     let app = TaskwarriorTui::new("next", false).await.unwrap();
     assert!(app.task_by_index(0).is_some());
@@ -5646,6 +5672,56 @@ mod tests {
     }
     assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("handoffs {uuid}\nnext {uuid}\n"));
     std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  async fn test_selected_project_filter_toggle() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let before = app.filter.as_str().to_string();
+    let total = app.tasks.len();
+    app.current_selection = app.tasks.iter().position(|task| task.project().is_some()).expect("fixture project");
+    let project = app.task_current().unwrap().project().unwrap().to_string();
+    app.handle_input(KeyCode::Ctrl('p')).await.unwrap();
+    assert!(app.filter.as_str().contains(&format!("project:{}", TaskwarriorTui::escape(&project))));
+    assert!(!app.tasks.is_empty());
+    assert!(app.tasks.iter().all(|task| {
+      task.project().is_some_and(|value| {
+        let value = value.to_string();
+        value == project || value.starts_with(&format!("{project}."))
+      })
+    }));
+    app.handle_input(KeyCode::Ctrl('p')).await.unwrap();
+    assert_eq!(app.filter.as_str(), before);
+    assert_eq!(app.tasks.len(), total);
+
+    // Preserve the complete original expression, including disjunctions, and
+    // pass quotes and apostrophes through as one Taskwarrior argv value.
+    let base = "status:pending or status:waiting ";
+    app.filter.update(base, base.len(), &mut app.changes);
+    app.current_selection = 0;
+    app.tasks[0].set_project(Some("ops.\"quoted\"\\path's"));
+    assert!(app.toggle_project_filter());
+    assert_eq!(
+      app.filter.as_str(),
+      "(status:pending or status:waiting) project:\"ops.\\\"quoted\\\"\\\\path's\""
+    );
+    let filter_arg = format!("rc.report.next.filter={}", app.filter.trim());
+    assert!(app.export_command().get_args().any(|arg| arg == filter_arg.as_str()));
+    assert!(app.toggle_project_filter());
+    assert_eq!(app.filter.as_str(), base);
+
+    app.tasks[0].set_project(None::<String>);
+    assert!(app.toggle_project_filter());
+    assert!(app.filter.as_str().ends_with("project:\"\""));
+    app.tasks.clear();
+    assert!(app.toggle_project_filter(), "can remove the filter even with no matches");
+    assert_eq!(app.filter.as_str(), base);
+    assert!(!app.toggle_project_filter(), "empty selection leaves the filter unchanged");
+
+    // A report change drops the temporary scope instead of restoring another
+    // report's filter on the next Ctrl+P.
+    app.project_filter_before = Some(base.to_string());
+    app.apply_report_request("all").unwrap();
+    assert!(app.project_filter_before.is_none());
   }
 
   async fn test_report_legend_and_pane_fit() {

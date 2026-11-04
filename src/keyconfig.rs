@@ -32,6 +32,7 @@ pub struct KeyConfig {
   pub annotate: KeyCode,
   pub help: KeyCode,
   pub filter: KeyCode,
+  pub project_filter: KeyCode,
   pub zoom: KeyCode,
   pub transpose: KeyCode,
   pub context_menu: KeyCode,
@@ -81,6 +82,7 @@ impl Default for KeyConfig {
       annotate: KeyCode::Char('A'),
       help: KeyCode::Char('?'),
       filter: KeyCode::Char('/'),
+      project_filter: KeyCode::Ctrl('p'),
       zoom: KeyCode::Char('z'),
       transpose: KeyCode::Char('\\'),
       context_menu: KeyCode::Char('c'),
@@ -136,6 +138,7 @@ impl KeyConfig {
     let add = Self::get_config("uda.taskwarrior-tui.keyconfig.add", data);
     let annotate = Self::get_config("uda.taskwarrior-tui.keyconfig.annotate", data);
     let filter = Self::get_config("uda.taskwarrior-tui.keyconfig.filter", data);
+    let project_filter = Self::get_config("uda.taskwarrior-tui.keyconfig.project-filter", data);
     let zoom = Self::get_config("uda.taskwarrior-tui.keyconfig.zoom", data);
     let transpose = Self::get_config("uda.taskwarrior-tui.keyconfig.transpose", data);
     let context_menu = Self::get_config("uda.taskwarrior-tui.keyconfig.context-menu", data);
@@ -176,6 +179,7 @@ impl KeyConfig {
     self.add = add.unwrap_or(self.add);
     self.annotate = annotate.unwrap_or(self.annotate);
     self.filter = filter.unwrap_or(self.filter);
+    self.project_filter = project_filter.unwrap_or(self.project_filter);
     self.zoom = zoom.unwrap_or(self.zoom);
     self.transpose = transpose.unwrap_or(self.transpose);
     self.context_menu = context_menu.unwrap_or(self.context_menu);
@@ -222,6 +226,7 @@ impl KeyConfig {
       &self.annotate,
       &self.help,
       &self.filter,
+      &self.project_filter,
       &self.zoom,
       &self.transpose,
       &self.context_menu,
