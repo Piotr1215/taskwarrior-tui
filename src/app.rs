@@ -328,6 +328,7 @@ pub struct TaskwarriorTui {
   pub current_selection: usize,
   pub current_selection_uuid: Option<Uuid>,
   pub current_selection_id: Option<u64>,
+  selection_publisher: crate::selection_publisher::SelectionPublisher,
   pub selection_follow: bool,
   pub task_report_table: TaskReportTable,
   pub calendar_year: i32,
@@ -433,6 +434,7 @@ impl TaskwarriorTui {
       current_selection: 0,
       current_selection_uuid: None,
       current_selection_id: None,
+      selection_publisher: crate::selection_publisher::SelectionPublisher::from_environment(),
       selection_follow: true,
       current_context_filter: "".to_string(),
       current_context: "".to_string(),
@@ -811,8 +813,8 @@ impl TaskwarriorTui {
             self.task_details_modified.clear();
             self.last_export = Some(std::time::SystemTime::now());
             self.cursor_fix();
-            self.update_task_table_state();
             self.selection_fix();
+            self.update_task_table_state();
           }
           Err(e) => self.error = Some(format!("Cannot run `{}`: {}", desc, e)),
         }
@@ -2203,11 +2205,11 @@ impl TaskwarriorTui {
       self.timesheet_dirty = false;
     }
     self.cursor_fix();
+    self.selection_fix();
     self.update_task_table_state();
     if self.task_report_info_show {
       self.update_task_details().await?;
     }
-    self.selection_fix();
 
     Ok(())
   }
@@ -2322,6 +2324,9 @@ impl TaskwarriorTui {
 
   pub fn update_task_table_state(&mut self) {
     trace!("self.update_task_table_state()");
+    self
+      .selection_publisher
+      .publish(self.tasks.get(self.current_selection).map(|task| *task.uuid()));
     self.task_table_state.select(Some(self.current_selection));
 
     for uuid in self.marked.clone() {
@@ -3028,6 +3033,16 @@ impl TaskwarriorTui {
     Ok(())
   }
 
+  fn handoff_navigation_command(&self) -> Option<std::process::Command> {
+    let task = self.tasks.get(self.current_selection)?;
+    if !task.tags().as_ref().is_some_and(|tags| tags.iter().any(|tag| tag == "piotr")) {
+      return None;
+    }
+    let mut command = std::process::Command::new(dirs::home_dir()?.join("dev/dotfiles/scripts/__handoff_navigate.sh"));
+    command.arg(task.uuid().to_string()).stdin(std::process::Stdio::null());
+    Some(command)
+  }
+
   fn gordon_command(&self) -> Result<std::process::Command, String> {
     let args = shlex::split(&self.config.uda_gordon_command)
       .filter(|args| !args.is_empty())
@@ -3629,6 +3644,11 @@ impl TaskwarriorTui {
     if let Mode::Tasks(task_mode) = &self.mode {
       match task_mode {
         Action::Report => {
+          if input == KeyCode::Char('S') {
+            if let Some(command) = self.handoff_navigation_command() {
+              self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
+            }
+          }
           if input == KeyCode::Esc {
             self.marked.clear();
           } else if input == self.keyconfig.quit || input == KeyCode::Ctrl('c') {
@@ -5474,6 +5494,8 @@ mod tests {
     test_undo_and_add_run_in_background().await;
     test_background_shortcut_keeps_the_terminal().await;
     test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
+    test_selection_signal_and_handoff_navigation().await;
+    test_handoff_key_preserves_configured_action().await;
     test_report_menu_refresh_error_keeps_reports().await;
     test_report_menu_refreshes_and_exports_waiting_tasks().await;
 
@@ -5997,6 +6019,96 @@ mod tests {
 
     let task = app.task_by_id(11).unwrap();
     let style = app.style_for_task(&task);
+  }
+
+  async fn test_handoff_key_preserves_configured_action() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    assert!(app.tasks.len() >= 2);
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_results_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.current_selection = 0;
+    app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
+    let uuid = *app.tasks[0].uuid();
+    app.handle_input(KeyCode::Char('S')).await.unwrap();
+    assert_eq!(app.current_selection, 0);
+    assert!(queue.try_recv().is_err());
+
+    add_tag(&mut app.tasks[0], "piotr".to_string());
+    app.handle_input(KeyCode::Char('S')).await.unwrap();
+    assert_eq!(app.current_selection, 0);
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected handoff write")
+    };
+    assert_eq!(write.label, "Handoff");
+    assert_eq!(
+      write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+      vec![uuid.to_string()]
+    );
+    assert!(queue.try_recv().is_err());
+
+    app.keyconfig.down = KeyCode::Char('S');
+    app.handle_input(KeyCode::Char('S')).await.unwrap();
+    assert_eq!(app.current_selection, 1);
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected handoff write")
+    };
+    assert_eq!(
+      write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+      vec![uuid.to_string()]
+    );
+    assert!(queue.try_recv().is_err());
+
+    app.current_selection = 0;
+    app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
+    app.handle_input(KeyCode::Char('S')).await.unwrap();
+    assert_eq!(app.current_selection, 1);
+    assert!(queue.try_recv().is_err());
+  }
+
+  async fn test_selection_signal_and_handoff_navigation() {
+    let dir = std::env::temp_dir().join(format!("taskwarrior-tui-selection-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.selection_publisher = crate::selection_publisher::SelectionPublisher::new(Some(&dir), Some("%987"));
+    assert!(app.tasks.len() >= 2);
+    let signal = dir.join("taskwarrior-tui/selected-987");
+    app.current_selection = 0;
+    let first = *app.tasks[0].uuid();
+    app.update_task_table_state();
+    assert_eq!(std::fs::read_to_string(&signal).unwrap(), format!("{first}\n"));
+    app.handle_input(app.keyconfig.down).await.unwrap();
+    let second = *app.tasks[app.current_selection].uuid();
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read_to_string(&signal).unwrap(), format!("{second}\n"));
+    app.current_selection_uuid = Some(second);
+    app.tasks.swap(0, app.current_selection);
+    app.selection_fix();
+    app.update_task_table_state();
+    assert_eq!(std::fs::read_to_string(&signal).unwrap(), format!("{second}\n"));
+    app.tasks[app.current_selection]
+      .tags_mut()
+      .as_mut()
+      .map(|tags| tags.retain(|tag| tag != "piotr"));
+    assert!(app.handoff_navigation_command().is_none());
+    app.handle_input(KeyCode::Char('S')).await.unwrap();
+    assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    add_tag(&mut app.tasks[app.current_selection], "piotr".to_string());
+    let command = app.handoff_navigation_command().unwrap();
+    assert!(
+      command
+        .get_program()
+        .to_string_lossy()
+        .ends_with("/dev/dotfiles/scripts/__handoff_navigate.sh")
+    );
+    assert_eq!(
+      command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+      vec![second.to_string()]
+    );
+    app.tasks.clear();
+    app.update_task_table_state();
+    assert!(!signal.exists());
+    std::fs::remove_dir_all(dir).unwrap();
   }
 
   async fn test_gordon_keeps_the_terminal_and_sends_only_current_task() {
