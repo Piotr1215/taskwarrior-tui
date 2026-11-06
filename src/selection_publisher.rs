@@ -1,12 +1,17 @@
 use std::{
-  fs::{self, OpenOptions},
-  io::{self, Write},
-  os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+  fs, io,
   path::{Path, PathBuf},
+};
+#[cfg(unix)]
+use std::{
+  fs::OpenOptions,
+  io::Write,
+  os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
   sync::atomic::{AtomicU64, Ordering},
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 pub struct SelectionPublisher {
@@ -45,6 +50,7 @@ impl SelectionPublisher {
     }
   }
 
+  #[cfg(unix)]
   fn write_selection(&self, selection: Option<Uuid>) -> io::Result<()> {
     let Some(path) = &self.path else { return Ok(()) };
     let dir = path.parent().expect("signal path has a parent");
@@ -82,10 +88,17 @@ impl SelectionPublisher {
   }
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+impl SelectionPublisher {
+  fn write_selection(&self, _selection: Option<Uuid>) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
   use super::*;
-  use std::os::unix::fs::MetadataExt;
+  use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
   #[test]
   fn selection_file_tracks_changes_and_removes_empty_selection() {
@@ -114,13 +127,13 @@ mod tests {
 
   #[test]
   fn paths_require_runtime_and_a_valid_pane() {
-    let root = Path::new("/tmp");
+    let root = std::env::temp_dir();
     assert_eq!(
-      SelectionPublisher::new(Some(root), None).path.unwrap(),
+      SelectionPublisher::new(Some(&root), None).path.unwrap(),
       root.join("taskwarrior-tui/selected")
     );
     for pane in ["", "%", "%../bad", "42", "%2/3"] {
-      assert!(SelectionPublisher::new(Some(root), Some(pane)).path.is_none());
+      assert!(SelectionPublisher::new(Some(&root), Some(pane)).path.is_none());
     }
     assert!(SelectionPublisher::new(None, None).path.is_none());
     assert!(SelectionPublisher::new(Some(Path::new("relative")), None).path.is_none());
