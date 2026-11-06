@@ -55,7 +55,7 @@ use crate::{
     report::ReportsState,
   },
   scrollbar::Scrollbar,
-  table::{Row, Table, TableMode, TaskwarriorTuiTableState},
+  table::{Row, Table, TableMode, TaskwarriorTuiTableState, selected_row_screen_y},
   task_report::TaskReportTable,
   ui, utils,
 };
@@ -328,6 +328,7 @@ pub struct TaskwarriorTui {
   pub current_selection: usize,
   pub current_selection_uuid: Option<Uuid>,
   pub current_selection_id: Option<u64>,
+  handoff_selected_row_y: Option<(usize, u16)>,
   selection_publisher: crate::selection_publisher::SelectionPublisher,
   pub selection_follow: bool,
   pub task_report_table: TaskReportTable,
@@ -434,6 +435,7 @@ impl TaskwarriorTui {
       current_selection: 0,
       current_selection_uuid: None,
       current_selection_id: None,
+      handoff_selected_row_y: None,
       selection_publisher: crate::selection_publisher::SelectionPublisher::from_environment(),
       selection_follow: true,
       current_context_filter: "".to_string(),
@@ -2064,6 +2066,7 @@ impl TaskwarriorTui {
     let (tasks, headers, columns) = self.get_task_report();
 
     if tasks.is_empty() {
+      self.handoff_selected_row_y = None;
       f.render_widget(Block::default(), rect);
       return;
     }
@@ -2137,6 +2140,10 @@ impl TaskwarriorTui {
       .widths(&constraints);
 
     f.render_stateful_widget(t, table_rect, &mut self.task_table_state);
+    self.handoff_selected_row_y = self
+      .task_table_state
+      .current_selection()
+      .and_then(|selected| selected_row_screen_y(rect.y, 1, self.task_table_state.offset(), selected).map(|y| (selected, y)));
     if needs_scrollbar {
       let mut widget = Scrollbar::new(pos, tasks.iter().len());
       widget.pos_style = self.config.uda_style_report_scrollbar;
@@ -3049,8 +3056,13 @@ impl TaskwarriorTui {
     command
       .arg("toggle")
       .arg(task.uuid().to_string())
-      .arg(std::env::var("TMUX_PANE").unwrap_or_default())
-      .stdin(std::process::Stdio::null());
+      .arg(std::env::var("TMUX_PANE").unwrap_or_default());
+    if let Some((selected, y)) = self.handoff_selected_row_y
+      && selected == self.current_selection
+    {
+      command.arg(y.to_string());
+    }
+    command.stdin(std::process::Stdio::null());
     Some(command)
   }
 
@@ -6089,6 +6101,7 @@ mod tests {
     let (_results_sender, results) = tokio::sync::mpsc::unbounded_channel();
     app.worker = Some(Worker { jobs, results });
     app.current_selection = 0;
+    app.handoff_selected_row_y = Some((0, 12));
     let uuid = *app.tasks[0].uuid();
 
     app.handle_input(KeyCode::Char('b')).await.unwrap();
@@ -6107,7 +6120,12 @@ mod tests {
     );
     assert_eq!(
       write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-      vec!["toggle".to_string(), uuid.to_string(), std::env::var("TMUX_PANE").unwrap_or_default()]
+      vec![
+        "toggle".to_string(),
+        uuid.to_string(),
+        std::env::var("TMUX_PANE").unwrap_or_default(),
+        "12".to_string(),
+      ]
     );
     assert!(queue.try_recv().is_err());
 

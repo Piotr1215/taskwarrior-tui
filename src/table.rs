@@ -47,6 +47,11 @@ impl Default for TaskwarriorTuiTableState {
 }
 
 impl TaskwarriorTuiTableState {
+  /// Row offset currently shown at the top of the table body.
+  pub fn offset(&self) -> usize {
+    self.offset
+  }
+
   pub fn mode(&self) -> TableMode {
     self.mode.clone()
   }
@@ -96,6 +101,32 @@ impl TaskwarriorTuiTableState {
 
   pub fn clear(&mut self) {
     self.marked.drain().for_each(drop);
+  }
+}
+
+/// Return the terminal row occupied by a selected table row.
+///
+/// table_top is the first terminal row of the table widget, and
+/// header_rows is the number of rows before its body (normally one).
+pub fn selected_row_screen_y(table_top: u16, header_rows: u16, offset: usize, selected: usize) -> Option<u16> {
+  let visible_row = selected.checked_sub(offset)?;
+  table_top.checked_add(header_rows)?.checked_add(u16::try_from(visible_row).ok()?)
+}
+
+#[cfg(test)]
+mod selected_row_screen_y_tests {
+  use super::selected_row_screen_y;
+
+  #[test]
+  fn computes_screen_y_for_top_middle_and_scrolled_bottom_rows() {
+    assert_eq!(selected_row_screen_y(0, 1, 0, 0), Some(1));
+    assert_eq!(selected_row_screen_y(0, 1, 0, 9), Some(10));
+    assert_eq!(selected_row_screen_y(0, 1, 18, 23), Some(6));
+  }
+
+  #[test]
+  fn returns_none_when_selection_is_outside_visible_rows() {
+    assert_eq!(selected_row_screen_y(0, 1, 4, 3), None);
   }
 }
 
