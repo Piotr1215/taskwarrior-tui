@@ -3043,6 +3043,17 @@ impl TaskwarriorTui {
     Some(command)
   }
 
+  fn handoff_floater_toggle_command(&self) -> Option<std::process::Command> {
+    let task = self.tasks.get(self.current_selection)?;
+    let mut command = std::process::Command::new(dirs::home_dir()?.join("dev/dotfiles/scripts/__handoff_floater.sh"));
+    command
+      .arg("toggle")
+      .arg(task.uuid().to_string())
+      .arg(std::env::var("TMUX_PANE").unwrap_or_default())
+      .stdin(std::process::Stdio::null());
+    Some(command)
+  }
+
   fn gordon_command(&self) -> Result<std::process::Command, String> {
     let args = shlex::split(&self.config.uda_gordon_command)
       .filter(|args| !args.is_empty())
@@ -3644,6 +3655,11 @@ impl TaskwarriorTui {
     if let Mode::Tasks(task_mode) = &self.mode {
       match task_mode {
         Action::Report => {
+          if input == KeyCode::Char('b') {
+            if let Some(command) = self.handoff_floater_toggle_command() {
+              self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
+            }
+          }
           if input == KeyCode::Char('S') {
             if let Some(command) = self.handoff_navigation_command() {
               self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
@@ -5496,6 +5512,7 @@ mod tests {
     test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
     test_selection_signal_and_handoff_navigation().await;
     test_handoff_key_preserves_configured_action().await;
+    test_brief_key_toggles_floater_for_selected_task().await;
     test_report_menu_refresh_error_keeps_reports().await;
     test_report_menu_refreshes_and_exports_waiting_tasks().await;
 
@@ -6063,6 +6080,39 @@ mod tests {
     app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
     app.handle_input(KeyCode::Char('S')).await.unwrap();
     assert_eq!(app.current_selection, 1);
+    assert!(queue.try_recv().is_err());
+  }
+
+  async fn test_brief_key_toggles_floater_for_selected_task() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_results_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.current_selection = 0;
+    let uuid = *app.tasks[0].uuid();
+
+    app.handle_input(KeyCode::Char('b')).await.unwrap();
+
+    assert_eq!(app.current_selection, 0);
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected brief toggle write")
+    };
+    assert_eq!(write.label, "Brief");
+    assert_eq!(
+      write.cmd.get_program().to_string_lossy(),
+      dirs::home_dir()
+        .unwrap()
+        .join("dev/dotfiles/scripts/__handoff_floater.sh")
+        .to_string_lossy()
+    );
+    assert_eq!(
+      write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+      vec!["toggle".to_string(), uuid.to_string(), std::env::var("TMUX_PANE").unwrap_or_default()]
+    );
+    assert!(queue.try_recv().is_err());
+
+    app.tasks.clear();
+    app.handle_input(KeyCode::Char('b')).await.unwrap();
     assert!(queue.try_recv().is_err());
   }
 
