@@ -48,10 +48,10 @@ impl SelectionPublisher {
   fn write_selection(&self, selection: Option<Uuid>) -> io::Result<()> {
     let Some(path) = &self.path else { return Ok(()) };
     let dir = path.parent().expect("signal path has a parent");
-    if let Ok(metadata) = fs::symlink_metadata(dir) {
-      if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "signal directory is not a directory"));
-      }
+    if let Ok(metadata) = fs::symlink_metadata(dir)
+      && !metadata.file_type().is_dir()
+    {
+      return Err(io::Error::new(io::ErrorKind::InvalidInput, "signal directory is not a directory"));
     }
     if let Some(uuid) = selection {
       fs::DirBuilder::new()

@@ -3667,15 +3667,15 @@ impl TaskwarriorTui {
     if let Mode::Tasks(task_mode) = &self.mode {
       match task_mode {
         Action::Report => {
-          if input == KeyCode::Char('b') {
-            if let Some(command) = self.handoff_floater_toggle_command() {
-              self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
-            }
+          if input == KeyCode::Char('b')
+            && let Some(command) = self.handoff_floater_toggle_command()
+          {
+            self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
           }
-          if input == KeyCode::Char('S') {
-            if let Some(command) = self.handoff_navigation_command() {
-              self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
-            }
+          if input == KeyCode::Char('S')
+            && let Some(command) = self.handoff_navigation_command()
+          {
+            self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
           }
           if input == KeyCode::Esc {
             self.marked.clear();
