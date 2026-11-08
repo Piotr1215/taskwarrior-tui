@@ -24,7 +24,9 @@ jobs:
             rust_flags: ""
             features: ""
             binary_postfix: ""
-          - os: macos-15
+          # Cross-compiled on the Intel host: hosted arm64 macOS runners never
+          # picked up this repo's jobs ("not acquired by Runner of type hosted").
+          - os: macos-15-intel
             target: aarch64-apple-darwin
             rust_flags: ""
             features: ""

@@ -14,9 +14,12 @@ use uuid::Uuid;
 #[cfg(unix)]
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+/// The selected task and the terminal row it was drawn on, when known.
+pub type Selection = Option<(Uuid, Option<u16>)>;
+
 pub struct SelectionPublisher {
   path: Option<PathBuf>,
-  published: Option<Option<Uuid>>,
+  published: Option<Selection>,
 }
 
 impl SelectionPublisher {
@@ -41,7 +44,9 @@ impl SelectionPublisher {
     }
   }
 
-  pub fn publish(&mut self, selection: Option<Uuid>) {
+  // An open brief pane reads "<uuid> <row>" to follow the selection and sit
+  // under that row; without a drawn row it switches without moving.
+  pub fn publish(&mut self, selection: Selection) {
     if self.published == Some(selection) {
       return;
     }
@@ -51,7 +56,7 @@ impl SelectionPublisher {
   }
 
   #[cfg(unix)]
-  fn write_selection(&self, selection: Option<Uuid>) -> io::Result<()> {
+  fn write_selection(&self, selection: Selection) -> io::Result<()> {
     let Some(path) = &self.path else { return Ok(()) };
     let dir = path.parent().expect("signal path has a parent");
     if let Ok(metadata) = fs::symlink_metadata(dir)
@@ -59,7 +64,7 @@ impl SelectionPublisher {
     {
       return Err(io::Error::new(io::ErrorKind::InvalidInput, "signal directory is not a directory"));
     }
-    if let Some(uuid) = selection {
+    if let Some((uuid, row)) = selection {
       fs::DirBuilder::new()
         .mode(0o700)
         .create(dir)
@@ -71,7 +76,10 @@ impl SelectionPublisher {
       let temporary = dir.join(format!(".selected-{}-{}", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
       let result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
-        writeln!(file, "{uuid}")?;
+        match row {
+          Some(row) => writeln!(file, "{uuid} {row}")?,
+          None => writeln!(file, "{uuid}")?,
+        }
         fs::rename(&temporary, path)
       })();
       if result.is_err() {
@@ -90,7 +98,7 @@ impl SelectionPublisher {
 
 #[cfg(not(unix))]
 impl SelectionPublisher {
-  fn write_selection(&self, _selection: Option<Uuid>) -> io::Result<()> {
+  fn write_selection(&self, _selection: Selection) -> io::Result<()> {
     Ok(())
   }
 }
@@ -112,14 +120,17 @@ mod tests {
     let path = root.join("taskwarrior-tui/selected-42");
     let first = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
     let second = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-    publisher.publish(Some(first));
+    publisher.publish(Some((first, None)));
     assert_eq!(fs::read_to_string(&path).unwrap(), format!("{first}\n"));
     assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
     let inode = fs::metadata(&path).unwrap().ino();
-    publisher.publish(Some(first));
+    publisher.publish(Some((first, None)));
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    publisher.publish(Some(second));
-    assert_eq!(fs::read_to_string(&path).unwrap(), format!("{second}\n"));
+    // The same task on another row is a new signal: the brief pane must move.
+    publisher.publish(Some((first, Some(7))));
+    assert_eq!(fs::read_to_string(&path).unwrap(), format!("{first} 7\n"));
+    publisher.publish(Some((second, Some(8))));
+    assert_eq!(fs::read_to_string(&path).unwrap(), format!("{second} 8\n"));
     publisher.publish(None);
     assert!(!path.exists());
     fs::remove_dir_all(root).unwrap();
