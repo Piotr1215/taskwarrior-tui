@@ -6104,30 +6104,38 @@ mod tests {
     app.handoff_selected_row_y = Some((0, 12));
     let uuid = *app.tasks[0].uuid();
 
-    app.handle_input(KeyCode::Char('b')).await.unwrap();
+    // Regular tasks open the same brief pane as +piotr handoff rows.
+    for handoff in [false, true] {
+      remove_tag(&mut app.tasks[0], "piotr");
+      if handoff {
+        add_tag(&mut app.tasks[0], "piotr".to_string());
+      }
 
-    assert_eq!(app.current_selection, 0);
-    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected brief toggle write")
-    };
-    assert_eq!(write.label, "Brief");
-    assert_eq!(
-      write.cmd.get_program().to_string_lossy(),
-      dirs::home_dir()
-        .unwrap()
-        .join("dev/dotfiles/scripts/__handoff_floater.sh")
-        .to_string_lossy()
-    );
-    assert_eq!(
-      write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-      vec![
-        "toggle".to_string(),
-        uuid.to_string(),
-        std::env::var("TMUX_PANE").unwrap_or_default(),
-        "12".to_string(),
-      ]
-    );
-    assert!(queue.try_recv().is_err());
+      app.handle_input(KeyCode::Char('b')).await.unwrap();
+
+      assert_eq!(app.current_selection, 0);
+      let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+        panic!("expected brief toggle write for handoff={handoff}")
+      };
+      assert_eq!(write.label, "Brief");
+      assert_eq!(
+        write.cmd.get_program().to_string_lossy(),
+        dirs::home_dir()
+          .unwrap()
+          .join("dev/dotfiles/scripts/__handoff_floater.sh")
+          .to_string_lossy()
+      );
+      assert_eq!(
+        write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        vec![
+          "toggle".to_string(),
+          uuid.to_string(),
+          std::env::var("TMUX_PANE").unwrap_or_default(),
+          "12".to_string(),
+        ]
+      );
+      assert!(queue.try_recv().is_err());
+    }
 
     app.tasks.clear();
     app.handle_input(KeyCode::Char('b')).await.unwrap();
