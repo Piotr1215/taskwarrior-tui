@@ -16,6 +16,7 @@ mod history;
 mod keyconfig;
 mod pane;
 mod scrollbar;
+mod selection_publisher;
 mod table;
 mod task_report;
 mod ui;
