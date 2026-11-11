@@ -195,7 +195,7 @@ pub struct Table<'a, H, R> {
   unmark_highlight_symbol: Option<&'a str>,
   /// Data to display in each row
   rows: R,
-  muted_suffix_column: Option<usize>,
+  muted_status_column: Option<usize>,
 }
 
 impl<'a, H, R> Default for Table<'a, H, R>
@@ -219,7 +219,7 @@ where
       mark_highlight_symbol: None,
       unmark_highlight_symbol: None,
       rows: R::default(),
-      muted_suffix_column: None,
+      muted_status_column: None,
     }
   }
 }
@@ -246,11 +246,11 @@ where
       mark_highlight_symbol: None,
       unmark_highlight_symbol: None,
       rows,
-      muted_suffix_column: None,
+      muted_status_column: None,
     }
   }
-  pub fn muted_suffix_column(mut self, column: Option<usize>) -> Self {
-    self.muted_suffix_column = column;
+  pub fn muted_status_column(mut self, column: Option<usize>) -> Self {
+    self.muted_status_column = column;
     self
   }
 
@@ -562,23 +562,12 @@ where
               format!("{elt:<width$}", elt = elt, width = *w as usize)
             }
           };
-          if self.muted_suffix_column == Some(c) {
-            if let Some((prefix, suffix)) = s.split_once(" · ") {
-              let prefix_width = prefix.width().min(*w as usize);
-              buf.set_stringn(x, y + i as u16, prefix, *w as usize, style);
-              buf.set_stringn(
-                x + prefix_width as u16,
-                y + i as u16,
-                format!(" · {suffix}"),
-                (*w as usize).saturating_sub(prefix_width),
-                style.add_modifier(Modifier::DIM),
-              );
-            } else {
-              buf.set_stringn(x, y + i as u16, s, *w as usize, style);
-            }
+          let cell_style = if self.muted_status_column == Some(c) && matches!(s.trim().to_ascii_lowercase().as_str(), "parked" | "backlog") {
+            style.add_modifier(Modifier::DIM)
           } else {
-            buf.set_stringn(x, y + i as u16, s, *w as usize, style);
-          }
+            style
+          };
+          buf.set_stringn(x, y + i as u16, s, *w as usize, cell_style);
           x += *w + self.column_spacing;
         }
       }

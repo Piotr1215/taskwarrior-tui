@@ -2169,11 +2169,10 @@ impl TaskwarriorTui {
     // capped columns stop growing, so trimming leaves the room to the description
     for (i, column) in columns.iter().enumerate() {
       let attribute = column.split('.').next().unwrap_or(column);
-      if let Some(max) = config
-        .uda_task_report_column_max_width
-        .get(attribute)
-        .filter(|_| attribute != "linear_issue_id" || !headers.iter().any(|h| h == "Lin"))
-      {
+      if let Some(max) = config.uda_task_report_column_max_width.get(attribute).filter(|_| {
+        !((attribute == "linear_issue_id" && headers.iter().any(|h| h == "Lin"))
+          || (attribute == "linear_status" && headers.iter().any(|h| h == "Status")))
+      }) {
         widths[i] = std::cmp::min(widths[i], *max);
       }
     }
@@ -2190,11 +2189,10 @@ impl TaskwarriorTui {
     // now start trimming
     let trim_target = maximum_column_width.saturating_sub(headers.len() as u16) as usize;
     while widths.iter().sum::<usize>() >= trim_target {
-      let protected = headers.iter().position(|h| h == "Lin");
       let index = widths
         .iter()
         .enumerate()
-        .filter(|(i, width)| Some(*i) != protected && **width > 1)
+        .filter(|(i, width)| !matches!(headers[*i].as_str(), "Lin" | "Status") && **width > 1)
         .max_by_key(|(_, width)| *width)
         .map(|(i, _)| i)
         .unwrap_or_else(|| widths.iter().position(|i| i == widths.iter().max().unwrap_or(&0)).unwrap_or_default());
@@ -2284,8 +2282,8 @@ impl TaskwarriorTui {
       .mark_symbol(&self.config.uda_mark_indicator)
       .unmark_symbol(&self.config.uda_unmark_indicator)
       .widths(&constraints)
-      .muted_suffix_column(if self.report == "myprojects" {
-        headers.iter().position(|h| h == "Lin")
+      .muted_status_column(if self.report == "myprojects" {
+        headers.iter().position(|h| h == "Status")
       } else {
         None
       });
@@ -2320,7 +2318,7 @@ impl TaskwarriorTui {
       };
       let presentation = crate::project_tree::presentation(&self.tasks, context);
       let show_mapping = presentation.iter().any(|row| !row.mapping.is_empty());
-      let mut labels = vec!["ID", "Project", "Type", "State", "Action / current update", "Lin", "Due"];
+      let mut labels = vec!["ID", "Project", "Type", "State", "Action / current update", "Lin", "Status", "Due"];
       let mut columns = vec![
         "id",
         "project",
@@ -2328,6 +2326,7 @@ impl TaskwarriorTui {
         "view_state",
         "description",
         "linear_issue_id",
+        "linear_status",
         "due.relative",
       ];
       if show_mapping {
@@ -2346,6 +2345,7 @@ impl TaskwarriorTui {
             row.state,
             utils::display_control_chars(&row.description),
             row.linear,
+            row.linear_status,
             self.task_report_table.get_string_attribute("due.relative", task, &self.tasks),
           ];
           if show_mapping {
@@ -5822,13 +5822,22 @@ mod tests {
   }
 
   #[test]
-  fn projects_linear_width_keeps_the_full_status() {
-    let config = width_test_config(&["uda.taskwarrior-tui.task-report.column-max-width.linear_issue_id 8"]);
-    let headers = ["ID", "Action / current update", "Lin"].map(String::from);
-    let columns = ["id", "description", "linear_issue_id"].map(String::from);
-    let tasks = vec![vec!["1".into(), "A long action".into(), "DEVOPS-1688 · Waiting for Review".into()]];
+  fn projects_linear_width_keeps_issue_and_status() {
+    let config = width_test_config(&[
+      "uda.taskwarrior-tui.task-report.column-max-width.linear_issue_id 8",
+      "uda.taskwarrior-tui.task-report.column-max-width.linear_status 5",
+    ]);
+    let headers = ["ID", "Action / current update", "Lin", "Status"].map(String::from);
+    let columns = ["id", "description", "linear_issue_id", "linear_status"].map(String::from);
+    let tasks = vec![vec![
+      "1".into(),
+      "A long action".into(),
+      "DEVOPS-1688".into(),
+      "Waiting for Review".into(),
+    ]];
     let widths = TaskwarriorTui::calculate_widths(&config, &tasks, &headers, &columns, 60);
     assert!(widths[2] >= tasks[0][2].width());
+    assert!(widths[3] >= tasks[0][3].width());
   }
 
   #[test]
@@ -7019,6 +7028,7 @@ mod tests {
     work.set_project(Some("ai-maintenance"));
     work.set_tags(Some(vec!["work".to_string()]));
     work.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    work.uda_mut().insert("linear_status".into(), UDAValue::Str("Backlog".into()));
     app.project_input = vec![child, work, header];
     let original = format!("{:?}", app.project_input);
     app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
@@ -7027,6 +7037,10 @@ mod tests {
     assert!(!columns.iter().any(|column| column == "tags"));
     assert!(labels.contains(&"Type".to_string()));
     assert!(labels.contains(&"State".to_string()));
+    let lin = labels.iter().position(|label| label == "Lin").unwrap();
+    let status = labels.iter().position(|label| label == "Status").unwrap();
+    assert_eq!(columns[status], "linear_status");
+    assert!(rows.iter().any(|row| row[lin] == "DEVOPS-123" && row[status] == "Backlog"));
     let project = columns.iter().position(|column| column == "project").unwrap();
     assert_eq!(rows[0][project], "ai-maintenance");
     assert!(rows.iter().skip(1).all(|row| row[project].is_empty()));
