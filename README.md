@@ -69,7 +69,8 @@ If you are compiling from source, you'll need the most recent stable rust compil
 
 In text fields, Backspace deletes the previous character and Alt+k deletes from
 the cursor to the end of the line. Ctrl+h, Ctrl+j, Ctrl+k and Ctrl+l are reserved
-for terminal pane navigation.
+for terminal pane navigation. In Projects, Ctrl+o zooms into a project and
+O toggles the header-only view.
 
 See the documentation for more information:
 
