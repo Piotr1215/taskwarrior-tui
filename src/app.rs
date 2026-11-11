@@ -130,6 +130,7 @@ impl TaskWrite {
 // `seq` is the queue position of the job that produced the result.
 enum JobResult {
   Write {
+    seq: u64,
     label: &'static str,
     report_errors: bool,
     select: Select,
@@ -155,6 +156,7 @@ impl Worker {
       for (seq, job) in queue {
         let result = match job {
           Job::Write(mut write) => JobResult::Write {
+            seq,
             output: write.run(),
             label: write.label,
             report_errors: write.report_errors,
@@ -312,6 +314,18 @@ pub enum Mode {
   Calendar,
 }
 
+// Each tab keeps its own report cursor and filter. The shared action engine
+// operates only on the active tab; select_report invalidates older exports.
+#[derive(Clone)]
+struct ReportView {
+  report: String,
+  filter: String,
+  selection: Option<Uuid>,
+  marked: HashSet<Uuid>,
+  show_info: bool,
+  project_filter_before: Option<String>,
+}
+
 pub struct TaskwarriorTui {
   pub should_quit: bool,
   pub dirty: bool,
@@ -379,6 +393,11 @@ pub struct TaskwarriorTui {
   refresh_again: bool,
   // Rows removed before their write ran, keyed to the write's queue position.
   hidden_tasks: HashMap<Uuid, u64>,
+  tasks_tab: Option<ReportView>,
+  projects_tab: Option<ReportView>,
+  project_options: crate::project_tree::ViewOptions,
+  project_input: Vec<Task>,
+  tab_marks_pending: Option<HashSet<Uuid>>,
 }
 
 // Extract only unquoted, whitespace-delimited sort tokens, preserving the filter text.
@@ -444,6 +463,21 @@ fn add_report_filter(task: &mut std::process::Command, report: &str, filter: &st
 }
 
 impl TaskwarriorTui {
+  fn with_project_defaults(data: &str) -> String {
+    let mut data = data.to_string();
+    if !data.lines().any(|line| {
+      matches!(
+        line.split_whitespace().next(),
+        Some("report.myprojects.filter" | "uda.taskwarrior-tui.task-report.myprojects.filter")
+      )
+    }) {
+      data.push_str(
+        "\nreport.myprojects.filter status:pending -WAITING ( +view or ( +work -gordon -piotr -private -backlog linear_issue_id.any: ) )\n",
+      );
+    }
+    data
+  }
+
   pub async fn new(report: &str, init_event_loop: bool) -> Result<Self> {
     let task_exe = std::env::var("TASKWARRIOR_TUI_TASKWARRIOR_CLI").unwrap_or_else(|_| "task".to_string());
 
@@ -467,7 +501,7 @@ impl TaskwarriorTui {
       ));
     }
 
-    let data = String::from_utf8_lossy(&output.stdout);
+    let data = Self::with_project_defaults(&String::from_utf8_lossy(&output.stdout));
     let c = Config::new(&data, report)?;
     let kc = KeyConfig::new(&data)?;
 
@@ -552,6 +586,11 @@ impl TaskwarriorTui {
       project_filter_before: None,
       refresh_again: false,
       hidden_tasks: HashMap::new(),
+      tasks_tab: None,
+      projects_tab: None,
+      project_options: crate::project_tree::ViewOptions::default(),
+      project_input: Vec::new(),
+      tab_marks_pending: None,
     };
 
     for c in app.config.filter.chars() {
@@ -762,6 +801,7 @@ impl TaskwarriorTui {
             self.hidden_tasks.insert(*uuid, seq);
           }
           self.tasks.retain(|t| !hide.contains(t.uuid()));
+          self.project_input.retain(|t| !hide.contains(t.uuid()));
           self.cursor_fix();
           self.update_task_table_state();
         }
@@ -844,13 +884,19 @@ impl TaskwarriorTui {
   fn apply_job_result(&mut self, result: JobResult) -> bool {
     match result {
       JobResult::Write {
+        seq,
         label,
         report_errors,
         select,
         output,
       } => {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
-        self.apply_write_result(label, report_errors, select, output);
+        self.apply_write_result(
+          label,
+          report_errors,
+          if seq >= self.report_export_floor { select } else { Select::Nothing },
+          output,
+        );
         false
       }
       JobResult::Export { seq, desc, output } => {
@@ -1026,6 +1072,7 @@ impl TaskwarriorTui {
     let titles: Vec<&str> = vec!["Tasks", "Projects", "Timesheet", "Calendar"];
     let tab_names: Vec<_> = titles.into_iter().map(Line::from).collect();
     let selected_tab = match self.mode {
+      Mode::Tasks(_) if self.report == "myprojects" => 1,
       Mode::Tasks(_) => 0,
       Mode::Projects => 1,
       Mode::Timesheet => 2,
@@ -1033,7 +1080,11 @@ impl TaskwarriorTui {
     };
     let navbar_block = Block::default().style(self.config.uda_style_navbar);
     let context = Line::from(vec![
-      Span::from(&self.report),
+      Span::from(if self.report == "myprojects" {
+        "project workspace"
+      } else {
+        &self.report
+      }),
       Span::from(" "),
       Span::from("["),
       Span::from(if self.current_context.is_empty() {
@@ -1243,7 +1294,13 @@ impl TaskwarriorTui {
   pub fn draw_task(&mut self, f: &mut Frame, layout: Rect, action: Action) {
     let rects = Layout::default()
       .direction(Direction::Vertical)
-      .constraints([Constraint::Min(0), Constraint::Length(2)].as_ref())
+      .constraints(
+        [
+          Constraint::Min(0),
+          Constraint::Length(if self.report == "myprojects" && action == Action::Report { 3 } else { 2 }),
+        ]
+        .as_ref(),
+      )
       .split(layout);
 
     // render task report and task details if required
@@ -1320,6 +1377,10 @@ impl TaskwarriorTui {
         // reset error when entering Action::Report
         self.previous_mode = None;
         self.error = None;
+        if self.report == "myprojects" {
+          f.render_widget(Paragraph::new(self.project_legend()).style(self.config.uda_style_command), rects[1]);
+          return;
+        }
         let position = Self::get_position(&self.command);
         self.draw_command(
           f,
@@ -2073,6 +2134,12 @@ impl TaskwarriorTui {
       Style::default()
     };
 
+    if self.report == "myprojects" && is_overview(task) {
+      return base_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    if self.report == "myprojects" && has_tag(task, "view") {
+      return base_style;
+    }
     base_style.patch(self.style_for_task(task))
   }
 
@@ -2223,16 +2290,56 @@ impl TaskwarriorTui {
   }
 
   fn get_task_report(&mut self) -> (Vec<Vec<String>>, Vec<String>, Vec<String>) {
-    self.task_report_table.generate_table(&self.tasks);
-    let (mut rows, headers, columns) = self.task_report_table.simplify_table();
-    if self.report == "myprojects"
-      && let Some(column) = columns.iter().position(|c| c.starts_with("description"))
-    {
-      for (row, prefix) in rows.iter_mut().zip(crate::project_tree::descriptions(&self.tasks)) {
-        row[column] = format!("{prefix}{}", row[column]);
+    if self.report == "myprojects" {
+      let context = if self.project_input.is_empty() {
+        &self.tasks
+      } else {
+        &self.project_input
+      };
+      let presentation = crate::project_tree::presentation(&self.tasks, context);
+      let show_mapping = presentation.iter().any(|row| !row.mapping.is_empty());
+      let mut labels = vec!["ID", "Project", "Type", "State", "Action / current update", "Lin", "Due"];
+      let mut columns = vec![
+        "id",
+        "project",
+        "view_kind",
+        "view_state",
+        "description",
+        "linear_issue_id",
+        "due.relative",
+      ];
+      if show_mapping {
+        labels.insert(4, "Mapping");
+        columns.insert(4, "view_mapping");
       }
+      let rows = self
+        .tasks
+        .iter()
+        .zip(presentation)
+        .map(|(task, row)| {
+          let mut cells = vec![
+            task.id().map(|id| id.to_string()).unwrap_or_default(),
+            row.project,
+            row.kind,
+            row.state,
+            utils::display_control_chars(&row.description),
+            row.linear,
+            self.task_report_table.get_string_attribute("due.relative", task, &self.tasks),
+          ];
+          if show_mapping {
+            cells.insert(4, row.mapping);
+          }
+          cells
+        })
+        .collect();
+      return (
+        rows,
+        labels.into_iter().map(str::to_string).collect(),
+        columns.into_iter().map(str::to_string).collect(),
+      );
     }
-    (rows, headers, columns)
+    self.task_report_table.generate_table(&self.tasks);
+    self.task_report_table.simplify_table()
   }
 
   pub async fn update(&mut self, force: bool) -> Result<()> {
@@ -2557,7 +2664,117 @@ impl TaskwarriorTui {
     Ok(true)
   }
 
+  fn report_view(&self) -> ReportView {
+    ReportView {
+      report: self.report.clone(),
+      filter: self.filter.as_str().to_string(),
+      selection: self.task_current().map(|task| *task.uuid()).or(self.current_selection_uuid),
+      marked: self.tab_marks_pending.as_ref().unwrap_or(&self.marked).clone(),
+      show_info: self.task_report_info_show,
+      project_filter_before: self.project_filter_before.clone(),
+    }
+  }
+
+  async fn open_report_tab(&mut self, projects: bool) -> Result<()> {
+    if projects == (self.report == "myprojects") {
+      self.mode = Mode::Tasks(Action::Report);
+      return self.update(false).await;
+    }
+    let saved = if projects { self.projects_tab.clone() } else { self.tasks_tab.clone() };
+    let report = saved
+      .as_ref()
+      .map(|view| view.report.as_str())
+      .unwrap_or(if projects { "myprojects" } else { "next" });
+    let data = Self::with_project_defaults(&Self::task_show_output(&self.task_exe)?);
+    self.select_report(report, &data)?;
+    self.mode = Mode::Tasks(Action::Report);
+    if let Some(view) = saved {
+      self.filter.update(&view.filter, view.filter.len(), &mut self.changes);
+      self.current_selection_uuid = view.selection;
+      self.tab_marks_pending = Some(view.marked);
+      self.task_report_info_show = view.show_info;
+      self.project_filter_before = view.project_filter_before;
+    } else if projects {
+      self.task_report_info_show = false;
+    }
+    self.update(true).await
+  }
+
+  fn project_legend(&self) -> String {
+    use crate::project_tree::Sort;
+    let sort = match self.project_options.sort {
+      Sort::Execution => "next",
+      Sort::Due => "due",
+      Sort::Priority => "priority",
+      Sort::Newest => "newest",
+      Sort::Oldest => "oldest",
+      Sort::Title => "title",
+    };
+    let toggle = |enabled| if enabled { "on" } else { "off" };
+    let key = |code: KeyCode| match code {
+      KeyCode::Char(c) => c.to_string(),
+      KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
+      other => format!("{other:?}"),
+    };
+    format!(
+      "1 next  2 due  3 priority  4 newest  5 oldest  6 title\n7 ready [{}]  8 handoffs [{}]  9 reset | Order within projects: {sort}\n{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
+      toggle(self.project_options.ready_only),
+      toggle(self.project_options.handoffs_only),
+      key(self.keyconfig.previous_tab),
+      key(self.keyconfig.next_tab),
+      key(self.keyconfig.start_stop),
+      key(self.keyconfig.done),
+      key(self.keyconfig.report_menu),
+      key(self.keyconfig.filter),
+    )
+  }
+
+  fn project_control(&mut self, key: KeyCode) -> bool {
+    use crate::project_tree::{Sort, ViewOptions};
+    if self.report != "myprojects" {
+      return false;
+    }
+    match key {
+      KeyCode::Char('1') => self.project_options.sort = Sort::Execution,
+      KeyCode::Char('2') => self.project_options.sort = Sort::Due,
+      KeyCode::Char('3') => self.project_options.sort = Sort::Priority,
+      KeyCode::Char('4') => self.project_options.sort = Sort::Newest,
+      KeyCode::Char('5') => self.project_options.sort = Sort::Oldest,
+      KeyCode::Char('6') => self.project_options.sort = Sort::Title,
+      KeyCode::Char('7') => self.project_options.ready_only = !self.project_options.ready_only,
+      KeyCode::Char('8') => self.project_options.handoffs_only = !self.project_options.handoffs_only,
+      KeyCode::Char('9') => self.project_options = ViewOptions::default(),
+      _ => return false,
+    }
+    let selected = self.task_current().map(|task| *task.uuid()).or(self.current_selection_uuid);
+    self.tasks = crate::project_tree::arrange(
+      self
+        .project_input
+        .iter()
+        .filter(|task| !self.hidden_tasks.contains_key(task.uuid()))
+        .cloned()
+        .collect(),
+      &self.project_options,
+    );
+    self.marked.retain(|uuid| self.tasks.iter().any(|task| task.uuid() == uuid));
+    self.current_selection_uuid = selected;
+    self.current_selection_id = None;
+    self.selection_fix();
+    self.cursor_fix();
+    self.update_task_table_state();
+    true
+  }
+
   fn select_report(&mut self, report: &str, data: &str) -> Result<()> {
+    let normalized = Self::with_project_defaults(data);
+    let data = normalized.as_str();
+    if self.report != report {
+      if self.report == "myprojects" {
+        self.projects_tab = Some(self.report_view());
+      } else if report == "myprojects" {
+        self.tasks_tab = Some(self.report_view());
+      }
+    }
     self.report = report.to_string();
     self.config.uda_legends = Config::get_uda_legends(data);
     self.project_filter_before = None;
@@ -2580,6 +2797,8 @@ impl TaskwarriorTui {
     // Until the new export lands, old rows must not receive the new report's
     // shortcut meanings. Ignore any exports still queued for the old report.
     self.tasks.clear();
+    self.project_input.clear();
+    self.tab_marks_pending = None;
     self.marked.clear();
     self.task_details.clear();
     self.task_details_modified.clear();
@@ -2945,10 +3164,18 @@ impl TaskwarriorTui {
             imported.retain(|t| !self.hidden_tasks.contains_key(t.uuid()));
           }
           self.tasks = if self.report == "myprojects" {
-            crate::project_tree::group(imported)
+            self.project_input = imported.clone();
+            crate::project_tree::arrange(imported, &self.project_options)
           } else {
             imported
           };
+          if let Some(mut marked) = self.tab_marks_pending.take() {
+            marked.retain(|uuid| self.tasks.iter().any(|task| task.uuid() == uuid));
+            self.marked = marked;
+            if !self.marked.is_empty() {
+              self.task_table_state.multiple_selection();
+            }
+          }
           info!("Imported {} tasks", self.tasks.len());
           self.error = None;
           if self.mode == Mode::Tasks(Action::Error) {
@@ -3704,11 +3931,13 @@ impl TaskwarriorTui {
   pub async fn handle_input(&mut self, input: KeyCode) -> Result<()> {
     match self.mode {
       Mode::Tasks(_) => {
+        if self.mode == Mode::Tasks(Action::Report) && self.project_control(input) {
+          return Ok(());
+        }
         self.handle_input_by_task_mode(input).await?;
       }
       Mode::Projects => {
-        ProjectsState::handle_input(self, input)?;
-        self.update(false).await?;
+        self.open_report_tab(true).await?;
       }
       Mode::Timesheet => {
         if input == self.keyconfig.quit || input == KeyCode::Ctrl('c') {
@@ -3716,7 +3945,7 @@ impl TaskwarriorTui {
         } else if input == self.keyconfig.next_tab {
           self.mode = Mode::Calendar;
         } else if input == self.keyconfig.previous_tab {
-          self.mode = Mode::Projects;
+          self.open_report_tab(true).await?;
         } else if input == KeyCode::Up || input == self.keyconfig.up {
           self.timesheet_scroll = self.timesheet_scroll.saturating_sub(1);
         } else if input == KeyCode::Down || input == self.keyconfig.down {
@@ -3736,7 +3965,7 @@ impl TaskwarriorTui {
           self.should_quit = true;
         } else if input == self.keyconfig.next_tab {
           if self.config.uda_change_focus_rotate {
-            self.mode = Mode::Tasks(Action::Report);
+            self.open_report_tab(false).await?;
           }
         } else if input == self.keyconfig.previous_tab {
           self.mode = Mode::Timesheet;
@@ -3800,6 +4029,7 @@ impl TaskwarriorTui {
           }
           if input == KeyCode::Esc {
             self.marked.clear();
+            self.tab_marks_pending = None;
           } else if input == self.keyconfig.quit || input == KeyCode::Ctrl('c') {
             self.should_quit = true;
           } else if input == self.keyconfig.select {
@@ -4178,11 +4408,19 @@ impl TaskwarriorTui {
             self.reports.table_state.select(Some(active_pos));
             self.mode = Mode::Tasks(Action::ReportMenu);
           } else if input == self.keyconfig.previous_tab {
-            if self.config.uda_change_focus_rotate {
+            if self.report == "myprojects" {
+              self.open_report_tab(false).await?;
+            } else if self.config.uda_change_focus_rotate {
               self.mode = Mode::Calendar;
             }
           } else if input == self.keyconfig.next_tab {
-            self.mode = Mode::Projects;
+            if self.report == "myprojects" {
+              self.mode = Mode::Timesheet;
+              self.timesheet_dirty = true;
+              self.update(false).await?;
+            } else {
+              self.open_report_tab(true).await?;
+            }
           }
         }
         Action::ContextMenu => {
@@ -5695,6 +5933,9 @@ mod tests {
     test_handoff_key_preserves_configured_action().await;
     test_handoff_start_stop_dispatch().await;
     test_grouped_handoffs_and_dispatch().await;
+    test_project_tab_restores_task_report().await;
+    test_project_controls_and_columns().await;
+    test_project_tab_async_state().await;
     test_project_overview_actions_are_guarded().await;
     test_project_start_uses_existing_shortcuts().await;
     test_project_selection_survives_refresh_and_id_changes().await;
@@ -6370,6 +6611,189 @@ mod tests {
     assert!(write.cmd.get_args().any(|a| a == expected[0].to_string().as_str()));
   }
 
+  async fn test_project_tab_restores_task_report() {
+    let startup = TaskwarriorTui::new("myprojects", false).await.unwrap();
+    assert!(startup.filter.as_str().contains("+view"));
+    assert!(!startup.export_command().get_args().any(|arg| arg.to_string_lossy().contains("(  )")));
+    let custom = "report.myprojects.filter project:chosen +view\n";
+    assert_eq!(TaskwarriorTui::with_project_defaults(custom), custom);
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.filter.update("status:pending", 14, &mut app.changes);
+    app.update(true).await.unwrap();
+    app.current_selection = 1;
+    let selected = *app.task_current().unwrap().uuid();
+    app.marked.insert(selected);
+    app.task_report_info_show = false;
+    let before = app.filter.as_str().to_string();
+    app.handle_input(app.keyconfig.next_tab).await.unwrap();
+    assert_eq!(app.report, "myprojects");
+    assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    assert!(app.tasks_tab.as_ref().unwrap().marked.contains(&selected));
+    assert!(app.filter.as_str().contains("+view"), "missing report uses scoped project default");
+    app.handle_input(KeyCode::Char('2')).await.unwrap();
+    app.handle_input(app.keyconfig.previous_tab).await.unwrap();
+    assert_eq!(app.report, "next");
+    assert_eq!(app.filter.as_str(), before);
+    assert_eq!(*app.task_current().unwrap().uuid(), selected);
+    assert!(app.marked.contains(&selected));
+    assert!(!app.task_report_info_show);
+    app.handle_input(app.keyconfig.next_tab).await.unwrap();
+    assert!(matches!(app.project_options.sort, crate::project_tree::Sort::Due));
+    app.handle_input(app.keyconfig.next_tab).await.unwrap();
+    assert_eq!(app.mode, Mode::Timesheet);
+    app.handle_input(app.keyconfig.previous_tab).await.unwrap();
+    assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    assert_eq!(app.report, "myprojects");
+
+    // The old Tasks response cannot populate the project view after a switch.
+    let output = app.export_command().output().unwrap();
+    let before = app.tasks.iter().map(|task| *task.uuid()).collect::<Vec<_>>();
+    app.report_export_floor = 10;
+    assert!(!app.apply_job_result(JobResult::Export {
+      seq: 9,
+      desc: "stale Tasks export".into(),
+      output: Ok(output)
+    }));
+    assert_eq!(app.tasks.iter().map(|task| *task.uuid()).collect::<Vec<_>>(), before);
+  }
+
+  async fn test_project_controls_and_columns() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.report = "myprojects".into();
+    app.task_report_info_show = false;
+    let mut header = app.tasks[0].clone();
+    header.set_project(Some("ai-maintenance"));
+    header.set_tags(Some(vec!["view".to_string()]));
+    header.uda_mut().insert("view_key".into(), UDAValue::Str("standing:ai".into()));
+    let mut child = app.tasks[1].clone();
+    child.set_project(Some("admin"));
+    child.set_tags(Some(vec!["piotr".to_string()]));
+    child.uda_mut().insert("view_project".into(), UDAValue::Str("ai-maintenance".into()));
+    let child_uuid = *child.uuid();
+    let mut work = app.tasks[2].clone();
+    work.set_project(Some("ai-maintenance"));
+    work.set_tags(Some(vec!["work".to_string()]));
+    work.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    app.project_input = vec![child, work, header];
+    let original = format!("{:?}", app.project_input);
+    app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
+    app.current_selection = app.task_index_by_uuid(child_uuid).unwrap();
+    let (rows, labels, columns) = app.get_task_report();
+    assert!(!columns.iter().any(|column| column == "tags"));
+    assert!(labels.contains(&"Type".to_string()));
+    assert!(labels.contains(&"State".to_string()));
+    let project = columns.iter().position(|column| column == "project").unwrap();
+    assert_eq!(rows[0][project], "ai-maintenance");
+    assert!(rows.iter().skip(1).all(|row| row[project].is_empty()));
+    for number in ['1', '2', '3', '4', '5', '6', '7', '8', '9'] {
+      app.handle_input(KeyCode::Char(number)).await.unwrap();
+      assert_eq!(*app.task_current().unwrap().uuid(), child_uuid, "selection drift on {number}");
+      assert_eq!(format!("{:?}", app.project_input), original, "view key mutated source tasks");
+      assert_ne!(app.mode, Mode::Tasks(Action::Error));
+    }
+    assert!(!app.project_options.ready_only);
+    assert!(!app.project_options.handoffs_only);
+    app.handle_input(KeyCode::Char('8')).await.unwrap();
+    assert_eq!(app.tasks.len(), 2, "handoff filter retains its project header");
+    assert!(app.project_legend().contains("handoffs [on]"));
+    app.handle_input(KeyCode::Char('9')).await.unwrap();
+    assert_eq!(app.tasks.len(), 3);
+
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
+      terminal.draw(|frame| app.draw(frame)).unwrap();
+      let buffer = terminal.backend().buffer();
+      let screen = (0..15)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+      assert!(
+        screen.contains("1 next") && screen.contains("9 reset"),
+        "controls clipped at {width}: {screen}"
+      );
+      assert!(screen.contains("Type") && screen.contains("State"));
+      assert!(!screen.contains("admin"), "native child category leaked into project column");
+      let projects_x = (0..width).find(|x| buffer[(*x, 0)].symbol() == "P").unwrap();
+      assert!(buffer[(projects_x, 0)].modifier.contains(Modifier::BOLD));
+    }
+    app.report = "next".into();
+    let (_, _, columns) = app.get_task_report();
+    assert!(!columns.iter().any(|column| column == "view_kind"));
+    assert!(!app.project_control(KeyCode::Char('1')), "Tasks retains configured shortcuts");
+  }
+
+  async fn test_project_tab_async_state() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let output = app.export_command().output().unwrap();
+    app.current_selection = 1;
+    let selected = *app.task_current().unwrap().uuid();
+    app.marked = app.tasks.iter().take(2).map(|task| *task.uuid()).collect();
+    app.task_table_state.multiple_selection();
+    let marked = app.marked.clone();
+    let (jobs, _queue) = std::sync::mpsc::channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.handle_input(app.keyconfig.next_tab).await.unwrap();
+    app.handle_input(app.keyconfig.previous_tab).await.unwrap();
+    assert!(app.tasks.is_empty());
+    assert_eq!(app.tab_marks_pending.as_ref(), Some(&marked));
+    assert_eq!(app.current_selection_uuid, Some(selected));
+    let seq = app.export_in_flight.unwrap();
+    assert!(app.apply_job_result(JobResult::Export {
+      seq,
+      desc: "restored Tasks".into(),
+      output: Ok(output.clone())
+    }));
+    assert_eq!(app.marked, marked);
+    assert!(matches!(app.task_table_state.mode(), TableMode::MultipleSelection));
+    assert_eq!(*app.task_current().unwrap().uuid(), selected);
+
+    // A late Undo in the previous tab cannot replace this tab's cursor.
+    app.current_selection_uuid = Some(selected);
+    let mut undo = output.clone();
+    undo.stdout = Uuid::nil().to_string().into_bytes();
+    app.apply_job_result(JobResult::Write {
+      seq: 0,
+      label: "Undo",
+      report_errors: true,
+      select: Select::UndoneTask,
+      output: Ok(undo),
+    });
+    assert_eq!(app.current_selection_uuid, Some(selected));
+
+    app.tab_marks_pending = Some(marked);
+    app.handle_input(KeyCode::Esc).await.unwrap();
+    assert!(app.tab_marks_pending.is_none());
+    assert!(app.marked.is_empty());
+
+    app.report = "myprojects".into();
+    app.tasks.clear();
+    app.project_input.clear();
+    app.current_selection_uuid = Some(selected);
+    assert!(app.project_control(KeyCode::Char('2')));
+    assert_eq!(app.current_selection_uuid, Some(selected), "sort while loading lost the saved UUID");
+
+    app.apply_export("fixture", &output);
+    let hidden = *app.tasks[0].uuid();
+    app.queue_write(
+      TaskWrite::new("Done", true, Select::Nothing, (std::process::Command::new("task"), None)),
+      &[hidden],
+    );
+    assert!(!app.project_input.iter().any(|task| *task.uuid() == hidden));
+    let mut invalid = output;
+    invalid.stdout = b"invalid export".to_vec();
+    app.apply_job_result(JobResult::Export {
+      seq: app.job_seq + 1,
+      desc: "failed refresh".into(),
+      output: Ok(invalid),
+    });
+    app.project_control(KeyCode::Char('9'));
+    assert!(
+      !app.tasks.iter().any(|task| *task.uuid() == hidden),
+      "sort resurrected a removed row after export failure"
+    );
+  }
+
   async fn test_project_overview_actions_are_guarded() {
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
     let (jobs, queue) = std::sync::mpsc::channel();
@@ -6580,8 +7004,11 @@ mod tests {
     }
     app.marked.clear();
     app.task_table_state.single_selection();
-    let (rows, _, _) = app.get_task_report();
-    assert!(rows.iter().flatten().any(|cell| cell.contains("↳ [ready] selected")));
+    let (rows, _, columns) = app.get_task_report();
+    let description = columns.iter().position(|column| column == "description").unwrap();
+    let state = columns.iter().position(|column| column == "view_state").unwrap();
+    let selected_row = rows.iter().find(|row| row[description].contains("↳ selected")).unwrap();
+    assert_eq!(selected_row[state], "ready");
     app.task_done().unwrap();
     let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
       panic!("expected selected completion")
@@ -8315,7 +8742,7 @@ mod tests {
       "│                                      │",
       "│    [: Previous view                  │",
       "╰──────────────────────────────────────╯",
-      "  7% ───────────────────────────────────",
+      "  6% ───────────────────────────────────",
     ]);
 
     for i in 1..=4 {
