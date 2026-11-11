@@ -3877,17 +3877,11 @@ impl TaskwarriorTui {
               }
             }
           } else if input == self.keyconfig.start_stop {
-            if matches!(self.report.as_str(), "handoffs" | "myprojects")
-              && let Some(command) = self.handoff_navigation_command()
-            {
-              self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
-            } else {
-              match self.task_start_stop() {
-                Ok(_) => self.update(true).await?,
-                Err(e) => {
-                  self.error = Some(e);
-                  self.mode = Mode::Tasks(Action::Error);
-                }
+            match self.task_start_stop() {
+              Ok(_) => self.update(true).await?,
+              Err(e) => {
+                self.error = Some(e);
+                self.mode = Mode::Tasks(Action::Error);
               }
             }
           } else if input == self.keyconfig.quick_tag {
@@ -5710,6 +5704,7 @@ mod tests {
     test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
     test_selection_signal_and_handoff_navigation().await;
     test_handoff_key_preserves_configured_action().await;
+    test_handoff_start_stop_dispatch().await;
     test_grouped_handoffs_and_dispatch().await;
     test_brief_key_toggles_floater_for_selected_task().await;
     test_tab_focuses_the_brief_pane().await;
@@ -6283,6 +6278,32 @@ mod tests {
     assert!(queue.try_recv().is_err());
   }
 
+  async fn test_handoff_start_stop_dispatch() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.report = "handoffs".into();
+    app.current_selection = 0;
+    add_tag(&mut app.tasks[0], "piotr".into());
+    let uuid = app.tasks[0].uuid().to_string();
+    for (active, action) in [(false, "start"), (true, "stop")] {
+      app.tasks[0].set_start(if active { Some(chrono::Utc::now().naive_utc()) } else { None });
+      app.handle_input(KeyCode::Char('s')).await.unwrap();
+      let write = queue
+        .try_iter()
+        .find_map(|(_, job)| match job {
+          Job::Write(w) => Some(w),
+          _ => None,
+        })
+        .expect("expected start/stop write");
+      assert_eq!(write.label, "Start/stop");
+      let args: Vec<_> = write.cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+      assert!(args.iter().any(|a| a == action));
+      assert!(args.iter().any(|a| a == &uuid || a == &format!("uuid:{uuid}")));
+    }
+  }
+
   async fn test_grouped_handoffs_and_dispatch() {
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
     let mut standing = app.tasks[0].clone();
@@ -6318,15 +6339,20 @@ mod tests {
     app.current_selection = 1;
     app.handle_input(KeyCode::Char('s')).await.unwrap();
     let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected navigation")
+      panic!("expected start/stop")
     };
-    assert_eq!(write.label, "Handoff");
-    assert_eq!(write.cmd.get_args().next().unwrap(), expected[1].to_string().as_str());
+    assert_eq!(write.label, "Start/stop");
+    assert!(write.cmd.get_args().any(|a| a == "start"));
+    assert!(write.cmd.get_args().any(|a| a == format!("uuid:{}", expected[1]).as_str()));
     app.config.uda_task_report_prompt_on_done = false;
     app.handle_input(app.keyconfig.done).await.unwrap();
-    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected done")
-    };
+    let write = queue
+      .try_iter()
+      .find_map(|(_, job)| match job {
+        Job::Write(w) => Some(w),
+        _ => None,
+      })
+      .expect("expected done");
     assert_eq!(write.label, "Done");
     assert!(write.cmd.get_args().any(|a| a == "done"));
     app.current_selection = 0;
