@@ -6849,15 +6849,19 @@ mod tests {
     let mut header = app.tasks[0].clone();
     header.set_project(Some("alpha"));
     header.set_tags(Some(vec!["view".to_string()]));
-    header.uda_mut().insert("view_key".into(), UDAValue::Str("standing:alpha".into()));
+    header.uda_mut().insert("view_key".into(), UDAValue::Str("local:alpha".into()));
+    header.uda_mut().insert("view_kind".into(), UDAValue::Str("project".into()));
     let mut child = app.tasks[1].clone();
     child.set_project(Some("alpha"));
     child.set_tags(Some(vec!["work".to_string()]));
-    let mut unmatched = app.tasks[2].clone();
+    let mut second = app.tasks[2].clone();
+    second.set_project(Some("alpha"));
+    second.set_tags(Some(vec!["work".to_string()]));
+    let mut unmatched = app.tasks[3].clone();
     unmatched.set_project(None::<String>);
     unmatched.set_tags(Some(vec!["work".to_string()]));
     let header_id = *header.uuid();
-    app.project_input = vec![header, child, unmatched];
+    app.project_input = vec![header, child, second, unmatched];
     app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
     app.current_selection = 1;
     app.handle_input(KeyCode::Ctrl('l')).await.unwrap();
@@ -6866,7 +6870,7 @@ mod tests {
     assert_eq!(*app.task_current().unwrap().uuid(), header_id);
     assert_eq!(app.get_task_report().0.last().unwrap()[1], "Unsorted (1)");
     app.handle_input(KeyCode::Ctrl('o')).await.unwrap();
-    assert_eq!(app.tasks.len(), 2);
+    assert_eq!(app.tasks.len(), 3);
     app.handle_input(KeyCode::Esc).await.unwrap();
     assert_eq!(*app.task_current().unwrap().uuid(), header_id);
     app.task_report_bottom();
@@ -6881,8 +6885,8 @@ mod tests {
     app.handle_input(KeyCode::Esc).await.unwrap();
     assert_eq!(app.current_selection, 1);
     app.handle_input(KeyCode::Ctrl('l')).await.unwrap();
-    assert_eq!(app.tasks.len(), 3);
-    assert_eq!(app.current_selection, 2);
+    assert_eq!(app.tasks.len(), 4);
+    assert_eq!(app.current_selection, 3);
   }
 
   async fn test_project_zoom() {

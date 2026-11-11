@@ -40,15 +40,15 @@ pub fn has_tag(task: &Task, tag: &str) -> bool {
   task.tags().as_ref().is_some_and(|tags| tags.iter().any(|t| t == tag))
 }
 
-// Source issue/ask rows also carry +view. Only standing project rows are
-// overviews; missing keys preserve the earlier project's +view convention.
+// Explicit project rows are headers; legacy +view rows keep their old rules.
 pub fn is_overview(task: &Task) -> bool {
-  has_tag(task, "view")
-    && match task.uda().get("view_key") {
-      Some(UDAValue::Str(key)) if !key.is_empty() => key.starts_with("standing:"),
-      None | Some(UDAValue::Str(_)) => true,
-      _ => false,
-    }
+  matches!(task.uda().get("view_kind"), Some(UDAValue::Str(kind)) if kind == "project")
+    || has_tag(task, "view")
+      && match task.uda().get("view_key") {
+        Some(UDAValue::Str(key)) if !key.is_empty() => key.starts_with("standing:"),
+        None | Some(UDAValue::Str(_)) => true,
+        _ => false,
+      }
 }
 
 // Use the configured shortcuts rather than starting an issue merely to open
@@ -993,6 +993,22 @@ mod tests {
     for (i, project) in [(3, "admin"), (4, "no project"), (5, "other"), (6, "ci.child"), (7, "ci-other")] {
       assert!(prefixes[i].starts_with(&format!("[ungrouped: {project}]")), "{}", prefixes[i]);
     }
+  }
+
+  #[test]
+  fn local_project_header_groups_native_members() {
+    let mut header = task(1, Some("operations"), &["view"]);
+    view(&mut header, "view_key", "local:operations");
+    view(&mut header, "view_kind", "project");
+    let first = task(2, Some("operations"), &["work"]);
+    let second = task(3, Some("operations"), &["work"]);
+    let rows = group(vec![second, header, first]);
+    assert_eq!(ids(&rows), vec![1, 2, 3]);
+    assert!(
+      rows
+        .iter()
+        .all(|row| project_group(row, &rows) == ProjectGroup::Named("operations".into()))
+    );
   }
 
   #[test]
