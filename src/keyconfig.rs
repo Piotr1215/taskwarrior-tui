@@ -280,6 +280,21 @@ mod tests {
   use super::*;
 
   #[test]
+  fn default_bindings_leave_tmux_pane_keys_free() {
+    let defaults = format!("{:?}", KeyConfig::default());
+    for key in ['h', 'j', 'k', 'l'] {
+      assert!(!defaults.contains(&format!("Ctrl('{key}')")), "default binding uses Ctrl+{key}");
+      for source in [include_str!("app.rs"), include_str!("pane/project.rs")] {
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+          !production.contains(&format!("KeyCode::Ctrl('{key}')")),
+          "hardcoded binding uses Ctrl+{key}"
+        );
+      }
+    }
+  }
+
+  #[test]
   fn gordon_key_defaults_to_ctrl_g_and_accepts_custom_character() {
     assert_eq!(KeyConfig::new("").unwrap().gordon, KeyCode::Ctrl('g'));
     assert_eq!(
