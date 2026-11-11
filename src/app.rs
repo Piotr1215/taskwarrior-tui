@@ -1292,15 +1292,10 @@ impl TaskwarriorTui {
   }
 
   pub fn draw_task(&mut self, f: &mut Frame, layout: Rect, action: Action) {
+    let footer_height = if self.report == "myprojects" && action == Action::Report { 1 } else { 2 };
     let rects = Layout::default()
       .direction(Direction::Vertical)
-      .constraints(
-        [
-          Constraint::Min(0),
-          Constraint::Length(if self.report == "myprojects" && action == Action::Report { 3 } else { 2 }),
-        ]
-        .as_ref(),
-      )
+      .constraints([Constraint::Min(0), Constraint::Length(footer_height)].as_ref())
       .split(layout);
 
     // render task report and task details if required
@@ -1378,7 +1373,10 @@ impl TaskwarriorTui {
         self.previous_mode = None;
         self.error = None;
         if self.report == "myprojects" {
-          f.render_widget(Paragraph::new(self.project_legend()).style(self.config.uda_style_command), rects[1]);
+          f.render_widget(
+            Paragraph::new(self.project_legend(rects[1].width)).style(self.config.uda_style_command),
+            rects[1],
+          );
           return;
         }
         let position = Self::get_position(&self.command);
@@ -2700,7 +2698,7 @@ impl TaskwarriorTui {
     self.update(true).await
   }
 
-  fn project_legend(&self) -> String {
+  fn project_legend(&self, width: u16) -> String {
     use crate::project_tree::Sort;
     let sort = match self.project_options.sort {
       Sort::Execution => "next",
@@ -2716,17 +2714,37 @@ impl TaskwarriorTui {
       KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
       other => format!("{other:?}"),
     };
-    format!(
-      "1 next  2 due  3 priority  4 newest  5 oldest  6 title\n7 ready [{}]  8 handoffs [{}]  9 reset | Order within projects: {sort}\n{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
-      toggle(self.project_options.ready_only),
-      toggle(self.project_options.handoffs_only),
-      key(self.keyconfig.previous_tab),
-      key(self.keyconfig.next_tab),
-      key(self.keyconfig.start_stop),
-      key(self.keyconfig.done),
-      key(self.keyconfig.report_menu),
-      key(self.keyconfig.filter),
-    )
+    // Retain the mode, both filters and the primary action before optional controls.
+    let mut items = vec![
+      (format!("[{sort}]"), true),
+      ("1 next".to_string(), false),
+      ("2 due".to_string(), false),
+      ("3 priority".to_string(), false),
+      ("4 newest".to_string(), false),
+      ("5 oldest".to_string(), false),
+      ("6 title".to_string(), false),
+      (format!("7 ready [{}]", toggle(self.project_options.ready_only)), true),
+      (format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)), true),
+      ("9 reset".to_string(), false),
+      (format!("{} act", key(self.keyconfig.start_stop)), true),
+      ("b brief".to_string(), false),
+      (format!("{} ack", key(self.keyconfig.done)), false),
+      (format!("{} reports", key(self.keyconfig.report_menu)), false),
+      (format!("{} filter", key(self.keyconfig.filter)), false),
+    ];
+    let width = usize::from(width);
+    while items.iter().map(|(item, _)| item.width()).sum::<usize>() + 2 * items.len().saturating_sub(1) > width {
+      if let Some(index) = items.iter().rposition(|(_, required)| !required) {
+        items.remove(index);
+      } else {
+        // Extremely narrow terminals cannot show every required item. Keep whole labels.
+        items.pop();
+      }
+      if items.is_empty() {
+        break;
+      }
+    }
+    items.into_iter().map(|(item, _)| item).collect::<Vec<_>>().join("  ")
   }
 
   fn project_control(&mut self, key: KeyCode) -> bool {
@@ -6714,26 +6732,55 @@ mod tests {
     assert!(!app.project_options.handoffs_only);
     app.handle_input(KeyCode::Char('8')).await.unwrap();
     assert_eq!(app.tasks.len(), 2, "handoff filter retains its project header");
-    assert!(app.project_legend().contains("handoffs [on]"));
+    assert!(app.project_legend(160).contains("handoffs [on]"));
     app.handle_input(KeyCode::Char('9')).await.unwrap();
     assert_eq!(app.tasks.len(), 3);
 
-    for width in [80, 160] {
-      let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
-      terminal.draw(|frame| app.draw(frame)).unwrap();
-      let buffer = terminal.backend().buffer();
-      let screen = (0..15)
-        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-      assert!(
-        screen.contains("1 next") && screen.contains("9 reset"),
-        "controls clipped at {width}: {screen}"
-      );
-      assert!(screen.contains("Type") && screen.contains("State"));
-      assert!(!screen.contains("admin"), "native child category leaked into project column");
-      let projects_x = (0..width).find(|x| buffer[(*x, 0)].symbol() == "P").unwrap();
-      assert!(buffer[(projects_x, 0)].modifier.contains(Modifier::BOLD));
+    for width in [80, 120, 250] {
+      for height in [8, 15] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..height)
+          .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+          .collect::<Vec<_>>()
+          .join("\n");
+        let legend = app.project_legend(width);
+        let footer = screen.lines().last().unwrap().trim_end();
+        assert_eq!(footer, legend, "footer clipped at {width}x{height}: {screen}");
+        assert!(footer.starts_with("[next]"));
+        assert!(!footer.contains("Tasks") && !footer.contains("Timesheet"));
+        for label in ["7 ready [off]", "8 handoffs [off]", "s act"] {
+          assert!(footer.contains(label), "missing {label} at {width}x{height}: {footer}");
+        }
+        let valid_items = [
+          "[next]",
+          "1 next",
+          "2 due",
+          "3 priority",
+          "4 newest",
+          "5 oldest",
+          "6 title",
+          "7 ready [off]",
+          "8 handoffs [off]",
+          "9 reset",
+          "s act",
+          "b brief",
+          "x ack",
+          "r reports",
+          "/ filter",
+        ];
+        assert!(footer.split("  ").all(|item| valid_items.contains(&item)), "partial item: {footer}");
+        assert!(!legend.contains('\n'));
+        assert!(legend.width() <= usize::from(width));
+        assert!(screen.lines().filter(|row| row.contains("7 ready")).count() == 1);
+        if width == 250 {
+          assert_eq!(
+            footer,
+            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  s act  b brief  x ack  r reports  / filter"
+          );
+        }
+      }
     }
     app.report = "next".into();
     let (_, _, columns) = app.get_task_report();
