@@ -1292,11 +1292,7 @@ impl TaskwarriorTui {
   }
 
   pub fn draw_task(&mut self, f: &mut Frame, layout: Rect, action: Action) {
-    let footer_height = if self.report == "myprojects" && action == Action::Report {
-      self.project_legend(layout.width).lines().count().min(usize::from(u16::MAX)) as u16
-    } else {
-      2
-    };
+    let footer_height = if self.report == "myprojects" && action == Action::Report { 1 } else { 2 };
     let rects = Layout::default()
       .direction(Direction::Vertical)
       .constraints([Constraint::Min(0), Constraint::Length(footer_height)].as_ref())
@@ -2718,43 +2714,37 @@ impl TaskwarriorTui {
       KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
       other => format!("{other:?}"),
     };
-    let controls = [
-      "1 next".to_string(),
-      "2 due".to_string(),
-      "3 priority".to_string(),
-      "4 newest".to_string(),
-      "5 oldest".to_string(),
-      "6 title".to_string(),
-      format!("7 ready [{}]", toggle(self.project_options.ready_only)),
-      format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)),
-      "9 reset".to_string(),
+    // Retain the mode, both filters and the primary action before optional controls.
+    let mut items = vec![
+      (format!("[{sort}]"), true),
+      ("1 next".to_string(), false),
+      ("2 due".to_string(), false),
+      ("3 priority".to_string(), false),
+      ("4 newest".to_string(), false),
+      ("5 oldest".to_string(), false),
+      ("6 title".to_string(), false),
+      (format!("7 ready [{}]", toggle(self.project_options.ready_only)), true),
+      (format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)), true),
+      ("9 reset".to_string(), false),
+      (format!("{} act", key(self.keyconfig.start_stop)), true),
+      ("b brief".to_string(), false),
+      (format!("{} ack", key(self.keyconfig.done)), false),
+      (format!("{} reports", key(self.keyconfig.report_menu)), false),
+      (format!("{} filter", key(self.keyconfig.filter)), false),
     ];
-    let navigation = format!(
-      "{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
-      key(self.keyconfig.previous_tab),
-      key(self.keyconfig.next_tab),
-      key(self.keyconfig.start_stop),
-      key(self.keyconfig.done),
-      key(self.keyconfig.report_menu),
-      key(self.keyconfig.filter),
-    );
-    let lines = [controls.join("  "), format!("Order within projects: {sort}"), navigation];
-    let mut wrapped = Vec::new();
-    for line in lines {
-      let mut current = String::new();
-      for word in line.split("  ") {
-        let separator = if current.is_empty() { "" } else { "  " };
-        if !current.is_empty() && current.width() + separator.len() + word.width() > usize::from(width) {
-          wrapped.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() {
-          current.push_str("  ");
-        }
-        current.push_str(word);
+    let width = usize::from(width);
+    while items.iter().map(|(item, _)| item.width()).sum::<usize>() + 2 * items.len().saturating_sub(1) > width {
+      if let Some(index) = items.iter().rposition(|(_, required)| !required) {
+        items.remove(index);
+      } else {
+        // Extremely narrow terminals cannot show every required item. Keep whole labels.
+        items.pop();
       }
-      wrapped.push(current);
+      if items.is_empty() {
+        break;
+      }
     }
-    wrapped.join("\n")
+    items.into_iter().map(|(item, _)| item).collect::<Vec<_>>().join("  ")
   }
 
   fn project_control(&mut self, key: KeyCode) -> bool {
@@ -6741,34 +6731,39 @@ mod tests {
           .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
           .collect::<Vec<_>>()
           .join("\n");
-        for label in [
+        let legend = app.project_legend(width);
+        let footer = screen.lines().last().unwrap().trim_end();
+        assert_eq!(footer, legend, "footer clipped at {width}x{height}: {screen}");
+        assert!(footer.starts_with("[next]"));
+        assert!(!footer.contains("Tasks") && !footer.contains("Timesheet"));
+        for label in ["7 ready [off]", "8 handoffs [off]", "s act"] {
+          assert!(footer.contains(label), "missing {label} at {width}x{height}: {footer}");
+        }
+        let valid_items = [
+          "[next]",
           "1 next",
           "2 due",
           "3 priority",
           "4 newest",
           "5 oldest",
           "6 title",
-          "7 ready",
-          "8 handoffs",
+          "7 ready [off]",
+          "8 handoffs [off]",
           "9 reset",
-          "Order within projects:",
-          "Tasks",
-          "Timesheet",
-          "act",
-          "brief",
-          "acknowledge",
-          "reports",
-          "filter",
-        ] {
-          assert!(screen.contains(label), "missing {label} at {width}x{height}: {screen}");
-        }
-        let legend = app.project_legend(width);
-        for line in legend.lines() {
-          assert!(line.width() <= usize::from(width), "line too wide: {line}");
-          assert!(!line.contains("   "), "wide gap: {line}");
-          assert!(
-            screen.lines().any(|row| row.trim_end() == line),
-            "clipped line at {width}x{height}: {line}"
+          "s act",
+          "b brief",
+          "x ack",
+          "r reports",
+          "/ filter",
+        ];
+        assert!(footer.split("  ").all(|item| valid_items.contains(&item)), "partial item: {footer}");
+        assert!(!legend.contains('\n'));
+        assert!(legend.width() <= usize::from(width));
+        assert!(screen.lines().filter(|row| row.contains("7 ready")).count() == 1);
+        if width == 250 {
+          assert_eq!(
+            footer,
+            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  s act  b brief  x ack  r reports  / filter"
           );
         }
       }
