@@ -55,6 +55,7 @@ fn project(task: &Task) -> Option<&str> {
 
 fn membership(task: &Task) -> Option<&str> {
   match task.uda().get("view_project") {
+    Some(UDAValue::Str(project)) if project == "!unassigned" => None,
     Some(UDAValue::Str(project)) if !project.is_empty() => Some(project),
     _ => project(task),
   }
@@ -192,7 +193,9 @@ pub fn descriptions(tasks: &[Task]) -> Vec<String> {
       if is_overview(task) {
         return String::new();
       }
-      let location = if membership(task).is_some_and(|p| projects.contains(p)) {
+      let location = if matches!(task.uda().get("view_project"), Some(UDAValue::Str(project)) if project == "!unassigned") {
+        "[unresolved project] ".to_string()
+      } else if membership(task).is_some_and(|p| projects.contains(p)) {
         "  ↳ ".to_string()
       } else {
         format!(
@@ -327,6 +330,25 @@ mod tests {
     assert_eq!(rows[2].project().map(String::as_str), Some("admin"));
     assert_eq!(rows[2].uda().get("view_project"), Some(&UDAValue::Str("ci".into())));
     assert!(descriptions(&rows)[0].starts_with("[ungrouped: ci-other]"));
+  }
+
+  #[test]
+  fn explicitly_unassigned_project_prevents_native_project_fallback() {
+    let mut unresolved = task(2, Some("ci"), &["piotr"]);
+    unresolved.uda_mut().insert("view_project".into(), UDAValue::Str("!unassigned".into()));
+    let mut linked = task(3, Some("admin"), &["piotr"]);
+    linked.uda_mut().insert("view_project".into(), UDAValue::Str("ci".into()));
+    let absent = task(4, Some("ci"), &["work"]);
+    let mut empty = task(5, Some("ci"), &["work"]);
+    empty.uda_mut().insert("view_project".into(), UDAValue::Str(String::new()));
+
+    assert_eq!(membership(&unresolved), None);
+    let rows = group(vec![unresolved, linked, absent, empty, task(1, Some("ci"), &["view"])]);
+    assert_eq!(ids(&rows), vec![2, 1, 3, 4, 5]);
+    assert_eq!(rows[0].project().map(String::as_str), Some("ci"));
+    assert_eq!(rows[0].uda().get("view_project"), Some(&UDAValue::Str("!unassigned".into())));
+    assert_eq!(descriptions(&rows)[0], "[unresolved project] [ready] ");
+    assert!(descriptions(&rows)[2..].iter().all(|prefix| prefix.starts_with("  ↳ ")));
   }
 
   #[test]
