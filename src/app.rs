@@ -4459,7 +4459,7 @@ impl TaskwarriorTui {
               }
             }
             // Backspace removes the last search character.
-            KeyCode::Backspace | KeyCode::Ctrl('h') => {
+            KeyCode::Backspace => {
               let previous_row_index = self.context_selected_row_index();
               self.contexts.search.pop();
               self.restore_context_selection(previous_row_index);
@@ -4521,7 +4521,7 @@ impl TaskwarriorTui {
               }
             }
             // Backspace removes the last search character.
-            KeyCode::Backspace | KeyCode::Ctrl('h') => {
+            KeyCode::Backspace => {
               let previous_row_index = self.report_selected_row_index();
               self.reports.search.pop();
               self.restore_report_selection(previous_row_index);
@@ -5438,7 +5438,7 @@ pub fn handle_movement(linebuffer: &mut LineBuffer, input: KeyCode, changes: &mu
     KeyCode::Ctrl('b') | KeyCode::Left => {
       linebuffer.move_backward(1);
     }
-    KeyCode::Ctrl('h') | KeyCode::Backspace => {
+    KeyCode::Backspace => {
       linebuffer.backspace(1, changes);
     }
     KeyCode::Ctrl('d') | KeyCode::Delete => {
@@ -5450,7 +5450,7 @@ pub fn handle_movement(linebuffer: &mut LineBuffer, input: KeyCode, changes: &mu
     KeyCode::Ctrl('e') | KeyCode::End => {
       linebuffer.move_end();
     }
-    KeyCode::Ctrl('k') => {
+    KeyCode::Alt('k') => {
       linebuffer.kill_line(changes);
     }
     KeyCode::Ctrl('u') => {
@@ -5497,6 +5497,20 @@ pub fn remove_tag(task: &mut Task, tag: &str) {
 // Disabled, as "'" should be a String for more readable shlex shell escaping.
 #[allow(clippy::single_char_pattern)]
 mod tests {
+  #[test]
+  fn alt_k_kills_to_end_of_line() {
+    let mut line = super::LineBuffer::with_capacity(32);
+    let mut changes = super::utils::Changeset::default();
+    for c in "hello world".chars() {
+      super::handle_movement(&mut line, super::KeyCode::Char(c), &mut changes);
+    }
+    super::handle_movement(&mut line, super::KeyCode::Home, &mut changes);
+    for _ in 0..6 {
+      super::handle_movement(&mut line, super::KeyCode::Right, &mut changes);
+    }
+    super::handle_movement(&mut line, super::KeyCode::Alt('k'), &mut changes);
+    assert_eq!(line.as_str(), "hello ");
+  }
   use std::{
     ffi::OsStr,
     fmt::Write,
@@ -8068,7 +8082,7 @@ mod tests {
       app.handle_input(KeyCode::Char(c)).await.unwrap();
     }
     for _ in 0..7 {
-      app.handle_input(KeyCode::Ctrl('h')).await.unwrap();
+      app.handle_input(KeyCode::Backspace).await.unwrap();
     }
 
     assert_eq!(app.mode, Mode::Tasks(Action::ReportMenu));
