@@ -15,6 +15,7 @@ mod help;
 mod history;
 mod keyconfig;
 mod pane;
+mod project_tree;
 mod scrollbar;
 mod selection_publisher;
 mod table;
