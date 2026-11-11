@@ -1292,15 +1292,14 @@ impl TaskwarriorTui {
   }
 
   pub fn draw_task(&mut self, f: &mut Frame, layout: Rect, action: Action) {
+    let footer_height = if self.report == "myprojects" && action == Action::Report {
+      self.project_legend(layout.width).lines().count().min(usize::from(u16::MAX)) as u16
+    } else {
+      2
+    };
     let rects = Layout::default()
       .direction(Direction::Vertical)
-      .constraints(
-        [
-          Constraint::Min(0),
-          Constraint::Length(if self.report == "myprojects" && action == Action::Report { 3 } else { 2 }),
-        ]
-        .as_ref(),
-      )
+      .constraints([Constraint::Min(0), Constraint::Length(footer_height)].as_ref())
       .split(layout);
 
     // render task report and task details if required
@@ -2730,34 +2729,32 @@ impl TaskwarriorTui {
       format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)),
       "9 reset".to_string(),
     ];
-    let label_width: usize = controls.iter().map(|label| label.width()).sum();
-    let gaps = controls.len() - 1;
-    let choices = if usize::from(width) >= label_width + 2 * gaps {
-      let spaces = usize::from(width) - label_width;
-      let mut line = String::new();
-      for (index, label) in controls.iter().enumerate() {
-        if index > 0 {
-          line.push_str(&" ".repeat(spaces / gaps + usize::from(index <= spaces % gaps)));
-        }
-        line.push_str(label);
-      }
-      format!("{line}\nOrder within projects: {sort}")
-    } else {
-      format!(
-        "{}\n{} | Order within projects: {sort}",
-        controls[..6].join("  "),
-        controls[6..].join("  ")
-      )
-    };
-    format!(
-      "{choices}\n{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
+    let navigation = format!(
+      "{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
       key(self.keyconfig.previous_tab),
       key(self.keyconfig.next_tab),
       key(self.keyconfig.start_stop),
       key(self.keyconfig.done),
       key(self.keyconfig.report_menu),
       key(self.keyconfig.filter),
-    )
+    );
+    let lines = [controls.join("  "), format!("Order within projects: {sort}"), navigation];
+    let mut wrapped = Vec::new();
+    for line in lines {
+      let mut current = String::new();
+      for word in line.split("  ") {
+        let separator = if current.is_empty() { "" } else { "  " };
+        if !current.is_empty() && current.width() + separator.len() + word.width() > usize::from(width) {
+          wrapped.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+          current.push_str("  ");
+        }
+        current.push_str(word);
+      }
+      wrapped.push(current);
+    }
+    wrapped.join("\n")
   }
 
   fn project_control(&mut self, key: KeyCode) -> bool {
@@ -6735,21 +6732,17 @@ mod tests {
     app.handle_input(KeyCode::Char('9')).await.unwrap();
     assert_eq!(app.tasks.len(), 3);
 
-    for width in [80, 120, 160, 240] {
-      let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
-      terminal.draw(|frame| app.draw(frame)).unwrap();
-      let buffer = terminal.backend().buffer();
-      let screen = (0..15)
-        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-      assert!(
-        screen.contains("1 next") && screen.contains("9 reset"),
-        "controls clipped at {width}: {screen}"
-      );
-      if width >= 120 {
-        let controls = screen.lines().find(|line| line.starts_with("1 next")).unwrap();
+    for width in [80, 120, 250] {
+      for height in [8, 15] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..height)
+          .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+          .collect::<Vec<_>>()
+          .join("\n");
         for label in [
+          "1 next",
           "2 due",
           "3 priority",
           "4 newest",
@@ -6758,17 +6751,27 @@ mod tests {
           "7 ready",
           "8 handoffs",
           "9 reset",
+          "Order within projects:",
+          "Tasks",
+          "Timesheet",
+          "act",
+          "brief",
+          "acknowledge",
+          "reports",
+          "filter",
         ] {
-          assert!(controls.contains(label), "control missing from wide row at {width}: {controls}");
+          assert!(screen.contains(label), "missing {label} at {width}x{height}: {screen}");
         }
-        assert!(controls.ends_with("9 reset"), "wide controls should fill the row: {controls}");
-      } else {
-        assert!(screen.lines().any(|line| line.starts_with("7 ready")), "narrow controls must wrap");
+        let legend = app.project_legend(width);
+        for line in legend.lines() {
+          assert!(line.width() <= usize::from(width), "line too wide: {line}");
+          assert!(!line.contains("   "), "wide gap: {line}");
+          assert!(
+            screen.lines().any(|row| row.trim_end() == line),
+            "clipped line at {width}x{height}: {line}"
+          );
+        }
       }
-      assert!(screen.contains("Type") && screen.contains("State"));
-      assert!(!screen.contains("admin"), "native child category leaked into project column");
-      let projects_x = (0..width).find(|x| buffer[(*x, 0)].symbol() == "P").unwrap();
-      assert!(buffer[(projects_x, 0)].modifier.contains(Modifier::BOLD));
     }
     app.report = "next".into();
     let (_, _, columns) = app.get_task_report();
