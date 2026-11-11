@@ -397,7 +397,9 @@ pub struct TaskwarriorTui {
   projects_tab: Option<ReportView>,
   project_options: crate::project_tree::ViewOptions,
   project_input: Vec<Task>,
-  project_zoom: Option<(crate::project_tree::ProjectGroup, Uuid)>,
+  project_zoom: Option<(crate::project_tree::ProjectGroup, Option<Uuid>)>,
+  project_collapsed: bool,
+  project_unsorted_count: usize,
   tab_marks_pending: Option<HashSet<Uuid>>,
 }
 
@@ -592,6 +594,8 @@ impl TaskwarriorTui {
       project_options: crate::project_tree::ViewOptions::default(),
       project_input: Vec::new(),
       project_zoom: None,
+      project_collapsed: false,
+      project_unsorted_count: 0,
       tab_marks_pending: None,
     };
 
@@ -1328,7 +1332,7 @@ impl TaskwarriorTui {
       vec!["0".to_string()]
     } else {
       match self.task_table_state.mode() {
-        TableMode::SingleSelection => vec![self.tasks[selected].id().unwrap_or_default().to_string()],
+        TableMode::SingleSelection => vec![self.tasks.get(selected).and_then(|task| task.id()).unwrap_or_default().to_string()],
         TableMode::MultipleSelection => {
           let mut tids = vec![];
           for uuid in &self.marked {
@@ -2015,7 +2019,7 @@ impl TaskwarriorTui {
   }
 
   fn draw_task_details(&mut self, f: &mut Frame, rect: Rect) {
-    if self.tasks.is_empty() {
+    if self.tasks.get(self.current_selection).is_none() {
       let p = Paragraph::new(Text::from("Task not found")).block(Block::default().borders(Borders::TOP));
       f.render_widget(p, rect);
       return;
@@ -2223,7 +2227,7 @@ impl TaskwarriorTui {
     let mut highlight_style = Style::default();
     let mut pos = 0;
     for (i, task) in tasks.iter().enumerate() {
-      let style = self.task_report_row_style(i, &self.tasks[i]);
+      let style = self.tasks.get(i).map(|task| self.task_report_row_style(i, task)).unwrap_or_default();
       if i == selected {
         pos = i;
         highlight_style = style.patch(self.config.uda_style_report_selection);
@@ -2314,7 +2318,7 @@ impl TaskwarriorTui {
         labels.insert(4, "Mapping");
         columns.insert(4, "view_mapping");
       }
-      let rows = self
+      let mut rows: Vec<Vec<String>> = self
         .tasks
         .iter()
         .zip(presentation)
@@ -2334,6 +2338,11 @@ impl TaskwarriorTui {
           cells
         })
         .collect();
+      if self.project_unsorted_count > 0 {
+        let mut row = vec![String::new(); labels.len()];
+        row[1] = format!("Unsorted ({})", self.project_unsorted_count);
+        rows.push(row);
+      }
       return (
         rows,
         labels.into_iter().map(str::to_string).collect(),
@@ -2426,7 +2435,7 @@ impl TaskwarriorTui {
   pub fn cursor_fix(&mut self) {
     // Clamping through the navigation handler would clear the saved UUID
     // before selection_fix can find it after rows disappear or regroup.
-    self.current_selection = self.current_selection.min(self.tasks.len().saturating_sub(1));
+    self.current_selection = self.current_selection.min(self.project_row_count().saturating_sub(1));
   }
 
   pub async fn update_task_details(&mut self) -> Result<()> {
@@ -2731,6 +2740,7 @@ impl TaskwarriorTui {
       (format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)), true),
       ("9 reset".to_string(), false),
       ("^O zoom".to_string(), false),
+      ("O collapse".to_string(), false),
       (format!("{} act", key(self.keyconfig.start_stop)), true),
       ("b brief".to_string(), false),
       (format!("{} ack", key(self.keyconfig.done)), false),
@@ -2758,12 +2768,37 @@ impl TaskwarriorTui {
       return false;
     }
     let selected = self.task_current().map(|task| *task.uuid()).or(self.current_selection_uuid);
+    let selected_group = self
+      .task_current()
+      .map(|task| crate::project_tree::project_group(&task, &self.project_input));
+    let on_unsorted = self.project_unsorted_count > 0 && self.current_selection == self.tasks.len();
+    let mut select_unsorted = false;
     let selected = match key {
-      KeyCode::Ctrl('o') if self.project_zoom.is_some() => self.project_zoom.take().map(|(_, uuid)| uuid),
-      KeyCode::Esc if self.project_zoom.is_some() => self.project_zoom.take().map(|(_, uuid)| uuid),
+      KeyCode::Ctrl('o') | KeyCode::Esc if self.project_zoom.is_some() => {
+        let (_, uuid) = self.project_zoom.take().unwrap();
+        select_unsorted = uuid.is_none();
+        uuid
+      }
       KeyCode::Ctrl('o') => {
-        if let Some(task) = self.task_current() {
-          self.project_zoom = Some((crate::project_tree::project_group(&task, &self.project_input), *task.uuid()));
+        if on_unsorted {
+          self.project_zoom = Some((crate::project_tree::ProjectGroup::Unsorted, None));
+        } else if let Some(task) = self.task_current() {
+          self.project_zoom = Some((crate::project_tree::project_group(&task, &self.project_input), Some(*task.uuid())));
+        }
+        selected
+      }
+      KeyCode::Char('O') => {
+        self.project_collapsed = !self.project_collapsed;
+        if self.project_collapsed && self.project_zoom.is_none() {
+          match selected_group {
+            Some(crate::project_tree::ProjectGroup::Unsorted) => select_unsorted = true,
+            Some(group) => {
+              return self.collapse_to_group(group);
+            }
+            None => {}
+          }
+        } else if on_unsorted {
+          select_unsorted = true;
         }
         selected
       }
@@ -2815,8 +2850,19 @@ impl TaskwarriorTui {
       &self.project_options,
     );
     self.apply_project_zoom();
+    if select_unsorted {
+      self.current_selection = if self.project_unsorted_count > 0 {
+        self.tasks.len()
+      } else {
+        self
+          .tasks
+          .iter()
+          .position(|task| crate::project_tree::project_group(task, &self.project_input) == crate::project_tree::ProjectGroup::Unsorted)
+          .unwrap_or(0)
+      };
+    }
     self.marked.retain(|uuid| self.tasks.iter().any(|task| task.uuid() == uuid));
-    self.current_selection_uuid = selected;
+    self.current_selection_uuid = if select_unsorted { None } else { selected };
     self.current_selection_id = None;
     self.selection_fix();
     self.cursor_fix();
@@ -2824,11 +2870,39 @@ impl TaskwarriorTui {
     true
   }
 
+  fn project_row_count(&self) -> usize {
+    self.tasks.len() + usize::from(self.report == "myprojects" && self.project_unsorted_count > 0)
+  }
+
+  fn collapse_to_group(&mut self, group: crate::project_tree::ProjectGroup) -> bool {
+    self.apply_project_zoom();
+    self.marked.retain(|uuid| self.tasks.iter().any(|task| task.uuid() == uuid));
+    self.current_selection = self
+      .tasks
+      .iter()
+      .position(|task| crate::project_tree::project_group(task, &self.project_input) == group)
+      .unwrap_or(0);
+    self.current_selection_uuid = None;
+    self.current_selection_id = None;
+    self.update_task_table_state();
+    true
+  }
+
   fn apply_project_zoom(&mut self) {
+    self.project_unsorted_count = 0;
     if let Some((group, _)) = &self.project_zoom {
       self
         .tasks
         .retain(|task| crate::project_tree::project_group(task, &self.project_input) == *group);
+    } else if self.project_collapsed {
+      self.project_unsorted_count = self
+        .tasks
+        .iter()
+        .filter(|task| {
+          !is_overview(task) && crate::project_tree::project_group(task, &self.project_input) == crate::project_tree::ProjectGroup::Unsorted
+        })
+        .count();
+      self.tasks.retain(is_overview);
     }
   }
 
@@ -2978,7 +3052,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_report_top(&mut self) {
-    if self.tasks.is_empty() {
+    if self.project_row_count() == 0 {
       return;
     }
     self.current_selection = 0;
@@ -2987,20 +3061,20 @@ impl TaskwarriorTui {
   }
 
   pub fn task_report_bottom(&mut self) {
-    if self.tasks.is_empty() {
+    if self.project_row_count() == 0 {
       return;
     }
-    self.current_selection = self.tasks.len() - 1;
+    self.current_selection = self.project_row_count() - 1;
     self.current_selection_id = None;
     self.current_selection_uuid = None;
   }
 
   pub fn task_report_next(&mut self) {
-    if self.tasks.is_empty() {
+    if self.project_row_count() == 0 {
       return;
     }
     let i = {
-      if self.current_selection >= self.tasks.len() - 1 {
+      if self.current_selection >= self.project_row_count() - 1 {
         if self.config.uda_task_report_looping {
           0
         } else {
@@ -3016,12 +3090,16 @@ impl TaskwarriorTui {
   }
 
   pub fn task_report_previous(&mut self) {
-    if self.tasks.is_empty() {
+    if self.project_row_count() == 0 {
       return;
     }
     let i = {
       if self.current_selection == 0 {
-        if self.config.uda_task_report_looping { self.tasks.len() - 1 } else { 0 }
+        if self.config.uda_task_report_looping {
+          self.project_row_count() - 1
+        } else {
+          0
+        }
       } else {
         self.current_selection - 1
       }
@@ -3032,19 +3110,23 @@ impl TaskwarriorTui {
   }
 
   pub fn task_report_next_page(&mut self) {
-    if self.tasks.is_empty() {
+    if self.project_row_count() == 0 {
       return;
     }
     let i = {
-      if self.current_selection == self.tasks.len() - 1 {
-        if self.config.uda_task_report_looping { 0 } else { self.tasks.len() - 1 }
+      if self.current_selection == self.project_row_count() - 1 {
+        if self.config.uda_task_report_looping {
+          0
+        } else {
+          self.project_row_count() - 1
+        }
       } else {
         std::cmp::min(
           self
             .current_selection
             .checked_add(self.task_report_height as usize)
-            .unwrap_or(self.tasks.len() - 1),
-          self.tasks.len() - 1,
+            .unwrap_or(self.project_row_count() - 1),
+          self.project_row_count() - 1,
         )
       }
     };
@@ -3054,12 +3136,16 @@ impl TaskwarriorTui {
   }
 
   pub fn task_report_previous_page(&mut self) {
-    if self.tasks.is_empty() {
+    if self.project_row_count() == 0 {
       return;
     }
     let i = {
       if self.current_selection == 0 {
-        if self.config.uda_task_report_looping { self.tasks.len() - 1 } else { 0 }
+        if self.config.uda_task_report_looping {
+          self.project_row_count() - 1
+        } else {
+          0
+        }
       } else {
         self.current_selection.saturating_sub(self.task_report_height as usize)
       }
@@ -3840,11 +3926,7 @@ impl TaskwarriorTui {
   }
 
   pub fn task_current(&self) -> Option<Task> {
-    if self.tasks.is_empty() {
-      return None;
-    }
-    let selected = self.current_selection;
-    Some(self.tasks[selected].clone())
+    self.tasks.get(self.current_selection).cloned()
   }
 
   pub fn update_tags(&mut self) {
@@ -3967,7 +4049,7 @@ impl TaskwarriorTui {
   }
 
   pub fn toggle_mark(&mut self) {
-    if !self.tasks.is_empty() {
+    if self.tasks.get(self.current_selection).is_some() {
       let selected = self.current_selection;
       let task_id = self.tasks[selected].id().unwrap_or_default();
       let task_uuid = *self.tasks[selected].uuid();
@@ -4007,6 +4089,32 @@ impl TaskwarriorTui {
       Mode::Tasks(_) => {
         if self.mode == Mode::Tasks(Action::Report) && self.project_control(input) {
           return Ok(());
+        }
+        if self.report == "myprojects" && self.project_unsorted_count > 0 && self.current_selection == self.tasks.len() {
+          let allowed = [
+            KeyCode::Esc,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Ctrl('c'),
+            self.keyconfig.quit,
+            self.keyconfig.down,
+            self.keyconfig.up,
+            self.keyconfig.page_down,
+            self.keyconfig.page_up,
+            self.keyconfig.go_to_top,
+            self.keyconfig.go_to_bottom,
+            self.keyconfig.next_tab,
+            self.keyconfig.previous_tab,
+            self.keyconfig.help,
+            self.keyconfig.refresh,
+          ];
+          if !allowed.contains(&input) {
+            return Ok(());
+          }
         }
         self.handle_input_by_task_mode(input).await?;
       }
@@ -6024,6 +6132,7 @@ mod tests {
     test_project_tab_restores_task_report().await;
     test_project_controls_and_columns().await;
     test_project_zoom().await;
+    test_project_collapse().await;
     test_next_queue_inside_zoom().await;
     test_project_tab_async_state().await;
     test_project_overview_actions_are_guarded().await;
@@ -6748,6 +6857,48 @@ mod tests {
     assert_eq!(app.tasks.iter().map(|task| *task.uuid()).collect::<Vec<_>>(), before);
   }
 
+  async fn test_project_collapse() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.report = "myprojects".into();
+    let mut header = app.tasks[0].clone();
+    header.set_project(Some("alpha"));
+    header.set_tags(Some(vec!["view".to_string()]));
+    header.uda_mut().insert("view_key".into(), UDAValue::Str("standing:alpha".into()));
+    let mut child = app.tasks[1].clone();
+    child.set_project(Some("alpha"));
+    child.set_tags(Some(vec!["work".to_string()]));
+    let mut unmatched = app.tasks[2].clone();
+    unmatched.set_project(None::<String>);
+    unmatched.set_tags(Some(vec!["work".to_string()]));
+    let header_id = *header.uuid();
+    app.project_input = vec![header, child, unmatched];
+    app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
+    app.current_selection = 1;
+    app.handle_input(KeyCode::Char('O')).await.unwrap();
+    assert_eq!(app.tasks.len(), 1);
+    assert_eq!(app.project_unsorted_count, 1);
+    assert_eq!(*app.task_current().unwrap().uuid(), header_id);
+    assert_eq!(app.get_task_report().0.last().unwrap()[1], "Unsorted (1)");
+    app.handle_input(KeyCode::Ctrl('o')).await.unwrap();
+    assert_eq!(app.tasks.len(), 2);
+    app.handle_input(KeyCode::Esc).await.unwrap();
+    assert_eq!(*app.task_current().unwrap().uuid(), header_id);
+    app.task_report_bottom();
+    assert_eq!(app.current_selection, 1);
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    app.handle_input(app.keyconfig.delete).await.unwrap();
+    assert_eq!(app.current_selection, 1);
+    app.handle_input(KeyCode::Ctrl('o')).await.unwrap();
+    assert_eq!(app.tasks.len(), 1);
+    assert!(matches!(app.project_zoom, Some((crate::project_tree::ProjectGroup::Unsorted, None))));
+    app.handle_input(KeyCode::Esc).await.unwrap();
+    assert_eq!(app.current_selection, 1);
+    app.handle_input(KeyCode::Char('O')).await.unwrap();
+    assert_eq!(app.tasks.len(), 3);
+    assert_eq!(app.current_selection, 2);
+  }
+
   async fn test_project_zoom() {
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
     app.report = "myprojects".into();
@@ -6892,6 +7043,7 @@ mod tests {
           "8 handoffs [off]",
           "9 reset",
           "^O zoom",
+          "O collapse",
           "s act",
           "b brief",
           "x ack",
@@ -6905,7 +7057,7 @@ mod tests {
         if width == 250 {
           assert_eq!(
             footer,
-            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  ^O zoom  s act  b brief  x ack  r reports  / filter"
+            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  ^O zoom  O collapse  s act  b brief  x ack  r reports  / filter"
           );
         }
       }
