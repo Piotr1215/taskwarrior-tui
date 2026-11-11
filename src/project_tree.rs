@@ -29,6 +29,9 @@ pub fn start_shortcut(task: &Task) -> Option<usize> {
   if is_overview(task) || has_tag(task, "piotr") {
     return None;
   }
+  if has_tag(task, "view") && matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.starts_with("issue:") || key.starts_with("ask:")) {
+    return Some(1);
+  }
   if matches!(task.uda().get("linear_issue_id"), Some(UDAValue::Str(id)) if !id.trim().is_empty()) {
     static SESSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tmux session [A-Za-z0-9._-]+").unwrap());
     let recorded = task
@@ -41,9 +44,6 @@ pub fn start_shortcut(task: &Task) -> Option<usize> {
     } else {
       4
     });
-  }
-  if has_tag(task, "view") && matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.starts_with("issue:") || key.starts_with("ask:")) {
-    return Some(1);
   }
   None
 }
@@ -296,6 +296,22 @@ mod tests {
     let rows = group(vec![ask, issue, header]);
     assert_eq!(ids(&rows), vec![1, 2, 3]);
     assert_eq!(descriptions(&rows), vec!["", "  ↳ [ready] ", "  ↳ [ready] "]);
+  }
+
+  #[test]
+  fn source_views_open_sources_even_with_retained_runner_metadata() {
+    use task_hookrs::annotation::Annotation;
+
+    for key in ["issue:source-id", "ask:source-id"] {
+      let mut source = task(1, Some("ci"), &["view", "ACTIVE"]);
+      source.uda_mut().insert("view_key".into(), UDAValue::Str(key.into()));
+      source.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+      source.set_start(Some(chrono::Utc::now().naive_utc()));
+      source.set_annotations::<_, Annotation>(Some(vec![Annotation::new(source.entry().clone(), "tmux session test-worker".into())]));
+      assert_eq!(start_shortcut(&source), Some(1));
+      source.tags_mut().as_mut().unwrap().push("piotr".into());
+      assert_eq!(start_shortcut(&source), None, "handoff hook keeps precedence");
+    }
   }
 
   #[test]

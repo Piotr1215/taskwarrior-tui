@@ -6451,6 +6451,8 @@ mod tests {
       ("myprojects", "piotr", "", true, true, true, None),
       ("myprojects", "view", "issue:source-id", false, false, false, Some(1)),
       ("myprojects", "view", "ask:source-id", false, false, false, Some(1)),
+      ("myprojects", "view", "issue:source-id", true, true, true, Some(1)),
+      ("myprojects", "view", "ask:source-id", true, true, true, Some(1)),
       ("myprojects", "work", "", false, false, false, None),
       ("next", "work", "", true, true, true, None),
     ] {
