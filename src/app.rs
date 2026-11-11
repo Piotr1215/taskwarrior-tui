@@ -379,6 +379,68 @@ pub struct TaskwarriorTui {
   hidden_tasks: HashMap<Uuid, u64>,
 }
 
+// Extract only unquoted, whitespace-delimited sort tokens, preserving the filter text.
+fn filter_sort(filter: &str) -> (String, Option<String>) {
+  let mut spans = Vec::new();
+  let mut start = None;
+  let mut quote = None;
+  let mut escaped = false;
+  for (i, c) in filter.char_indices() {
+    if start.is_none() && !c.is_whitespace() {
+      start = Some(i);
+    }
+    if escaped {
+      escaped = false;
+    } else if c == '\\' {
+      escaped = true;
+    } else if let Some(q) = quote {
+      if c == q {
+        quote = None;
+      }
+    } else if c == '\'' || c == '"' {
+      quote = Some(c);
+    } else if c.is_whitespace() {
+      if let Some(begin) = start.take() {
+        spans.push((begin, i));
+      }
+    }
+  }
+  if let Some(begin) = start {
+    spans.push((begin, filter.len()));
+  }
+  let mut result = String::new();
+  let mut last = 0;
+  let mut sort = None;
+  for (begin, end) in spans {
+    let token = &filter[begin..end];
+    if let Some(spec) = token
+      .strip_prefix("sort:")
+      .filter(|spec| !spec.is_empty() && !spec.contains(['\'', '"', '\\']))
+    {
+      result.push_str(&filter[last..begin]);
+      last = end;
+      sort = Some(
+        match spec {
+          "created" | "date" | "entry" => "entry-",
+          "oldest" => "entry+",
+          other => other,
+        }
+        .to_string(),
+      );
+    }
+  }
+  result.push_str(&filter[last..]);
+  (result.trim().to_string(), sort)
+}
+
+fn add_report_filter(task: &mut std::process::Command, report: &str, filter: &str) {
+  let (filter, sort) = filter_sort(filter);
+  task.arg(format!("rc.report.{report}.filter={filter}"));
+  if let Some(sort) = sort {
+    task.arg(format!("rc.report.{report}.sort={sort}"));
+  }
+}
+
 impl TaskwarriorTui {
   pub async fn new(report: &str, init_event_loop: bool) -> Result<Self> {
     let task_exe = std::env::var("TASKWARRIOR_TUI_TASKWARRIOR_CLI").unwrap_or_else(|_| "task".to_string());
@@ -2843,7 +2905,7 @@ impl TaskwarriorTui {
 
     // This is already one argv value. A shell parse would corrupt project names
     // or filters containing apostrophes.
-    task.arg(format!("rc.report.{}.filter={}", self.report, self.filter.trim()));
+    add_report_filter(&mut task, &self.report, self.filter.as_str());
 
     if !self.current_context_filter.trim().is_empty() && self.task_version >= *TASKWARRIOR_VERSION_SUPPORTED {
       if let Some(args) = shlex::split(&self.current_context_filter) {
@@ -5191,6 +5253,36 @@ mod tests {
       view.push('\n');
     }
     view
+  }
+
+  #[test]
+  fn test_filter_sort_tokens() {
+    for (token, expected) in [
+      ("created", "entry-"),
+      ("date", "entry-"),
+      ("entry", "entry-"),
+      ("oldest", "entry+"),
+      ("due+,priority-", "due+,priority-"),
+    ] {
+      assert_eq!(filter_sort(&format!("+piotr sort:{token}")), ("+piotr".into(), Some(expected.into())));
+    }
+    assert_eq!(filter_sort("+piotr"), ("+piotr".into(), None));
+    assert_eq!(
+      filter_sort(r#"description:"sort:created meeting" sort:"#),
+      (r#"description:"sort:created meeting" sort:"#.into(), None)
+    );
+    assert_eq!(filter_sort("sort:date +piotr sort:oldest"), ("+piotr".into(), Some("entry+".into())));
+  }
+
+  #[test]
+  fn test_export_command_sort_override() {
+    let mut command = std::process::Command::new("task");
+    add_report_filter(&mut command, "next", "+piotr sort:created");
+    command.arg("export").arg("next");
+    let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    assert!(args.contains(&"rc.report.next.filter=+piotr".to_string()), "{args:?}");
+    assert!(args.contains(&"rc.report.next.sort=entry-".to_string()), "{args:?}");
+    println!("export command: {command:?}");
   }
 
   #[test]
