@@ -62,43 +62,7 @@ use crate::{
 
 const MAX_LINE: usize = 4096;
 
-fn has_tag(task: &Task, tag: &str) -> bool {
-  task.tags().as_ref().is_some_and(|tags| tags.iter().any(|t| t == tag))
-}
-
-// Keep the original report order and insert handoffs immediately after the
-// matching standing row. Rows without a standing project remain in handoffs.
-fn group_project_handoffs(tasks: Vec<Task>) -> Vec<Task> {
-  let (handoffs, rows): (Vec<_>, Vec<_>) = tasks.into_iter().partition(|t| has_tag(t, "piotr") && !has_tag(t, "view"));
-  let mut by_project: HashMap<String, Vec<Task>> = HashMap::new();
-  for task in handoffs {
-    if let Some(project) = task.project().filter(|p| p.as_str() != "admin" && !p.is_empty()) {
-      by_project.entry(project.to_string()).or_default().push(task);
-    }
-  }
-  let rank = |task: &Task| match task.priority().map(String::as_str) {
-    Some("H") => 0,
-    Some("M") => 1,
-    Some("L") => 2,
-    _ => 3,
-  };
-  for group in by_project.values_mut() {
-    group.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| (**b.entry()).cmp(&**a.entry())));
-  }
-  let mut result = Vec::new();
-  for row in rows {
-    let project = if has_tag(&row, "view") {
-      row.project().map(ToString::to_string)
-    } else {
-      None
-    };
-    result.push(row);
-    if let Some(mut group) = project.and_then(|p| by_project.remove(&p)) {
-      result.append(&mut group);
-    }
-  }
-  result
-}
+use crate::project_tree::{has_tag, is_overview};
 
 // Write commands whose output is discarded run with footnotes off. The project
 // footnote alone makes taskwarrior load every task in the database to compute
@@ -437,10 +401,10 @@ fn filter_sort(filter: &str) -> (String, Option<String>) {
       }
     } else if c == '\'' || c == '"' {
       quote = Some(c);
-    } else if c.is_whitespace() {
-      if let Some(begin) = start.take() {
-        spans.push((begin, i));
-      }
+    } else if c.is_whitespace()
+      && let Some(begin) = start.take()
+    {
+      spans.push((begin, i));
     }
   }
   if let Some(begin) = start {
@@ -901,12 +865,9 @@ impl TaskwarriorTui {
         self.hidden_tasks.retain(|_, write| *write > seq);
         match output {
           Ok(output) => {
-            if self.selection_follow
-              && self.current_selection_uuid.is_none()
-              && self.current_selection_id.is_none()
-              && let [uuid] = self.selected_task_uuids().as_slice()
+            if (self.selection_follow || self.report == "myprojects") && self.current_selection_uuid.is_none() && self.current_selection_id.is_none()
             {
-              self.current_selection_uuid = Some(*uuid);
+              self.current_selection_uuid = self.task_current().map(|task| *task.uuid());
             }
             self.selection_follow = true;
             self.apply_export(&desc, &output);
@@ -2264,13 +2225,11 @@ impl TaskwarriorTui {
   fn get_task_report(&mut self) -> (Vec<Vec<String>>, Vec<String>, Vec<String>) {
     self.task_report_table.generate_table(&self.tasks);
     let (mut rows, headers, columns) = self.task_report_table.simplify_table();
-    if self.report == "myprojects" {
-      if let Some(column) = columns.iter().position(|c| c.starts_with("description")) {
-        for (row, task) in rows.iter_mut().zip(&self.tasks) {
-          if has_tag(task, "piotr") && !has_tag(task, "view") {
-            row[column] = format!("  ↳ {}", row[column]);
-          }
-        }
+    if self.report == "myprojects"
+      && let Some(column) = columns.iter().position(|c| c.starts_with("description"))
+    {
+      for (row, prefix) in rows.iter_mut().zip(crate::project_tree::descriptions(&self.tasks)) {
+        row[column] = format!("{prefix}{}", row[column]);
       }
     }
     (rows, headers, columns)
@@ -2286,13 +2245,8 @@ impl TaskwarriorTui {
       // With the worker the export lands later, so the row to follow is
       // picked when it lands, not now.
       if self.worker.is_none() {
-        let task_uuids = self.selected_task_uuids();
-        if self.selection_follow
-          && self.current_selection_uuid.is_none()
-          && self.current_selection_id.is_none()
-          && let [uuid] = task_uuids.as_slice()
-        {
-          self.current_selection_uuid = Some(*uuid);
+        if (self.selection_follow || self.report == "myprojects") && self.current_selection_uuid.is_none() && self.current_selection_id.is_none() {
+          self.current_selection_uuid = self.task_current().map(|task| *task.uuid());
         }
         self.selection_follow = true;
       }
@@ -2339,16 +2293,14 @@ impl TaskwarriorTui {
   }
 
   pub fn selection_fix(&mut self) {
-    if let (Some(t), Some(id)) = (self.task_current(), self.current_selection_id)
-      && t.id() != Some(id)
+    if let Some(id) = self.current_selection_id
       && let Some(i) = self.task_index_by_id(id)
     {
       self.current_selection = i;
       self.current_selection_id = None;
     }
 
-    if let (Some(t), Some(uuid)) = (self.task_current(), self.current_selection_uuid)
-      && t.uuid() != &uuid
+    if let Some(uuid) = self.current_selection_uuid
       && let Some(i) = self.task_index_by_uuid(uuid)
     {
       self.current_selection = i;
@@ -2363,9 +2315,9 @@ impl TaskwarriorTui {
   }
 
   pub fn cursor_fix(&mut self) {
-    while !self.tasks.is_empty() && self.current_selection >= self.tasks.len() {
-      self.task_report_previous();
-    }
+    // Clamping through the navigation handler would clear the saved UUID
+    // before selection_fix can find it after rows disappear or regroup.
+    self.current_selection = self.current_selection.min(self.tasks.len().saturating_sub(1));
   }
 
   pub async fn update_task_details(&mut self) -> Result<()> {
@@ -2993,7 +2945,7 @@ impl TaskwarriorTui {
             imported.retain(|t| !self.hidden_tasks.contains_key(t.uuid()));
           }
           self.tasks = if self.report == "myprojects" {
-            group_project_handoffs(imported)
+            crate::project_tree::group(imported)
           } else {
             imported
           };
@@ -3025,15 +2977,23 @@ impl TaskwarriorTui {
     let mut task_uuids = vec![];
 
     for s in selected {
-      if self.tasks.is_empty() {
-        break;
+      if let Some(task) = self.tasks.get(s) {
+        task_uuids.push(*task.uuid());
       }
-      let task_id = self.tasks[s].id().unwrap_or_default();
-      let task_uuid = *self.tasks[s].uuid();
-      task_uuids.push(task_uuid);
     }
 
     task_uuids
+  }
+
+  fn actionable_task_uuids(&self) -> Result<Vec<Uuid>, String> {
+    let selected = self.selected_task_uuids();
+    if selected.is_empty() {
+      return Err("Select a task first.".into());
+    }
+    if self.tasks.iter().any(|task| selected.contains(task.uuid()) && is_overview(task)) {
+      return Err("Project overview rows cannot be started, completed or deleted. Press b to open the overview.".into());
+    }
+    Ok(selected)
   }
 
   pub fn task_subprocess(&mut self) -> Result<(), String> {
@@ -3184,6 +3144,9 @@ impl TaskwarriorTui {
       && selected == self.current_selection
     {
       command.arg(y.to_string());
+    }
+    if self.report == "myprojects" {
+      command.args(["--layout", "project"]);
     }
     command.stdin(std::process::Stdio::null());
     Some(command)
@@ -3381,12 +3344,29 @@ impl TaskwarriorTui {
     }
   }
 
+  async fn task_start_stop_or_shortcut(&mut self) -> Result<(), String> {
+    let selected = self.actionable_task_uuids()?;
+    if self.report == "myprojects"
+      && let Some(shortcut) = self
+        .tasks
+        .iter()
+        .filter(|task| selected.contains(task.uuid()))
+        .find_map(crate::project_tree::start_shortcut)
+    {
+      if selected.len() != 1 {
+        return Err("Select one task to open its source, work dialog or agent session.".into());
+      }
+      return self.task_shortcut(shortcut).await;
+    }
+    self.task_start_stop()
+  }
+
   pub fn task_start_stop(&mut self) -> Result<(), String> {
     if self.tasks.is_empty() {
       return Ok(());
     }
 
-    let task_uuids = self.selected_task_uuids();
+    let task_uuids = self.actionable_task_uuids()?;
 
     for task_uuid in &task_uuids {
       let command = match self.task_by_uuid(*task_uuid) {
@@ -3441,7 +3421,7 @@ impl TaskwarriorTui {
       return Ok(());
     }
 
-    let task_uuids = self.selected_task_uuids();
+    let task_uuids = self.actionable_task_uuids()?;
 
     let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &["delete".to_string()]);
     self.queue_write(TaskWrite::new("Delete", false, Select::Nothing, cmd), &task_uuids);
@@ -3454,7 +3434,7 @@ impl TaskwarriorTui {
     if self.tasks.is_empty() {
       return Ok(());
     }
-    let task_uuids = self.selected_task_uuids();
+    let task_uuids = self.actionable_task_uuids()?;
     let cmd = self.task_command(&NO_PROMPTS, &task_uuids, &["done".to_string()]);
     self.queue_write(TaskWrite::new("Done", false, Select::Nothing, cmd), &task_uuids);
     self.current_selection_uuid = None;
@@ -3847,7 +3827,10 @@ impl TaskwarriorTui {
           } else if input == KeyCode::Ctrl('y') {
             self.task_details_scroll_up();
           } else if input == self.keyconfig.done {
-            if self.config.uda_task_report_prompt_on_done {
+            if let Err(error) = self.actionable_task_uuids() {
+              self.error = Some(error);
+              self.mode = Mode::Tasks(Action::Error);
+            } else if self.config.uda_task_report_prompt_on_done {
               self.mode = Mode::Tasks(Action::DonePrompt);
               if self.task_current().is_none() {
                 self.mode = Mode::Tasks(Action::Report);
@@ -3862,7 +3845,10 @@ impl TaskwarriorTui {
               }
             }
           } else if input == self.keyconfig.delete {
-            if self.config.uda_task_report_prompt_on_delete {
+            if let Err(error) = self.actionable_task_uuids() {
+              self.error = Some(error);
+              self.mode = Mode::Tasks(Action::Error);
+            } else if self.config.uda_task_report_prompt_on_delete {
               self.mode = Mode::Tasks(Action::DeletePrompt);
               if self.task_current().is_none() {
                 self.mode = Mode::Tasks(Action::Report);
@@ -3877,7 +3863,7 @@ impl TaskwarriorTui {
               }
             }
           } else if input == self.keyconfig.start_stop {
-            match self.task_start_stop() {
+            match self.task_start_stop_or_shortcut().await {
               Ok(_) => self.update(true).await?,
               Err(e) => {
                 self.error = Some(e);
@@ -5347,7 +5333,10 @@ mod tests {
     let mut command = std::process::Command::new("task");
     add_report_filter(&mut command, "myprojects", "( +view sort:due+,priority- ) or ( status:pending +piotr )");
     let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-    assert!(args.contains(&"rc.report.myprojects.filter=( +view  ) or ( status:pending +piotr )".to_string()), "{args:?}");
+    assert!(
+      args.contains(&"rc.report.myprojects.filter=( +view  ) or ( status:pending +piotr )".to_string()),
+      "{args:?}"
+    );
     assert!(args.contains(&"rc.report.myprojects.sort=due+,priority-".to_string()), "{args:?}");
   }
 
@@ -5706,6 +5695,10 @@ mod tests {
     test_handoff_key_preserves_configured_action().await;
     test_handoff_start_stop_dispatch().await;
     test_grouped_handoffs_and_dispatch().await;
+    test_project_overview_actions_are_guarded().await;
+    test_project_start_uses_existing_shortcuts().await;
+    test_project_selection_survives_refresh_and_id_changes().await;
+    test_project_report_preserves_configured_filter().await;
     test_brief_key_toggles_floater_for_selected_task().await;
     test_tab_focuses_the_brief_pane().await;
     test_report_menu_refresh_error_keeps_reports().await;
@@ -6329,8 +6322,16 @@ mod tests {
     let mut no_project = app.tasks[5].clone();
     no_project.set_project(None::<String>);
     add_tag(&mut no_project, "piotr".into());
-    let expected = [standing.uuid(), high_new.uuid(), high_old.uuid(), low.uuid()].map(|u| *u);
-    app.tasks = group_project_handoffs(vec![low, admin, high_old, no_project, standing, high_new]);
+    let expected = [
+      standing.uuid(),
+      high_new.uuid(),
+      high_old.uuid(),
+      low.uuid(),
+      admin.uuid(),
+      no_project.uuid(),
+    ]
+    .map(|u| *u);
+    app.tasks = crate::project_tree::group(vec![low, standing, admin, high_old, no_project, high_new]);
     assert_eq!(app.tasks.iter().map(|t| *t.uuid()).collect::<Vec<_>>(), expected);
     app.report = "myprojects".into();
     let (jobs, queue) = std::sync::mpsc::channel();
@@ -6369,6 +6370,237 @@ mod tests {
     assert!(write.cmd.get_args().any(|a| a == expected[0].to_string().as_str()));
   }
 
+  async fn test_project_overview_actions_are_guarded() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.tasks.truncate(2);
+    app.tasks[0].set_tags(Some(vec!["view".to_string(), "piotr".to_string()]));
+    app.tasks[1].set_tags(Some(vec!["work".to_string(), "view".to_string()]));
+    app.tasks[1].uda_mut().insert("view_key".into(), UDAValue::Str("issue:source-id".into()));
+    let header = *app.tasks[0].uuid();
+    for report in ["myprojects", "next"] {
+      app.report = report.into();
+      for prompts in [true, false] {
+        app.config.uda_task_report_prompt_on_done = prompts;
+        app.config.uda_task_report_prompt_on_delete = prompts;
+        for key in [app.keyconfig.done, app.keyconfig.delete, app.keyconfig.start_stop] {
+          app.mode = Mode::Tasks(Action::Report);
+          app.current_selection = 0;
+          app.handle_input(key).await.unwrap();
+          assert_eq!(app.mode, Mode::Tasks(Action::Error));
+          assert!(app.error.as_ref().unwrap().contains("overview"));
+          assert!(queue.try_recv().is_err(), "overview action queued a job");
+          assert_eq!(*app.tasks[0].uuid(), header);
+        }
+      }
+    }
+    // A marked overview rejects the whole action rather than acting on a
+    // surprising subset of the selection.
+    app.marked = app.tasks.iter().map(|t| *t.uuid()).collect();
+    app.task_table_state.multiple_selection();
+    app.update_task_table_state();
+    assert!(app.task_done().is_err());
+    assert!(app.task_delete().is_err());
+    assert!(app.task_start_stop().is_err());
+    assert!(queue.try_recv().is_err());
+
+    // Ordinary children retain the original start, stop and completion paths.
+    app.marked.clear();
+    app.task_table_state.single_selection();
+    app.current_selection = 1;
+    let child = *app.tasks[1].uuid();
+    for (active, action) in [(false, "start"), (true, "stop")] {
+      app.tasks[1].set_start(if active { Some(chrono::Utc::now().naive_utc()) } else { None });
+      app.task_start_stop().unwrap();
+      let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+        panic!("expected child start/stop")
+      };
+      assert!(write.cmd.get_args().any(|arg| arg == action));
+      assert!(write.cmd.get_args().any(|arg| arg == format!("uuid:{child}").as_str()));
+    }
+    app.task_done().unwrap();
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected child completion")
+    };
+    assert!(write.cmd.get_args().any(|arg| arg == "done"));
+    assert!(write.cmd.get_args().any(|arg| arg == format!("uuid:{child}").as_str()));
+    assert!(app.task_by_uuid(header).is_some());
+  }
+
+  async fn test_project_start_uses_existing_shortcuts() {
+    use task_hookrs::annotation::Annotation;
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.tasks.truncate(1);
+    app.current_selection = 0;
+    app.config.uda_shortcuts_background = vec![0, 1, 4];
+    for slot in [0, 1, 4] {
+      app.config.uda_shortcuts[slot] = format!("project-shortcut-{slot}");
+    }
+    let uuid = *app.tasks[0].uuid();
+    for (report, tag, key, linked, recorded, active, expected) in [
+      ("myprojects", "work", "", true, false, false, Some(4)),
+      ("myprojects", "work", "", true, true, true, Some(0)),
+      ("myprojects", "work", "", true, true, false, Some(4)),
+      ("myprojects", "work", "", true, false, true, Some(4)),
+      ("myprojects", "piotr", "", true, true, true, None),
+      ("myprojects", "view", "issue:source-id", false, false, false, Some(1)),
+      ("myprojects", "view", "ask:source-id", false, false, false, Some(1)),
+      ("myprojects", "work", "", false, false, false, None),
+      ("next", "work", "", true, true, true, None),
+    ] {
+      app.report = report.into();
+      app.mode = Mode::Tasks(Action::Report);
+      let task = &mut app.tasks[0];
+      task.set_tags(Some(vec![tag.to_string()]));
+      task.uda_mut().clear();
+      if linked {
+        task.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+      }
+      if !key.is_empty() {
+        task.uda_mut().insert("view_key".into(), UDAValue::Str(key.into()));
+      }
+      task.set_start(if active { Some(chrono::Utc::now().naive_utc()) } else { None });
+      task.set_annotations::<_, Annotation>(Some(if recorded {
+        vec![Annotation::new(task.entry().clone(), "tmux session test-worker".into())]
+      } else {
+        vec![]
+      }));
+      let before = task.clone();
+      app.handle_input(app.keyconfig.start_stop).await.unwrap();
+      let writes: Vec<_> = queue
+        .try_iter()
+        .filter_map(|(_, job)| if let Job::Write(write) = job { Some(write) } else { None })
+        .collect();
+      assert_eq!(writes.len(), 1, "{report} {tag} {key}");
+      let write = &writes[0];
+      let args: Vec<_> = write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+      if let Some(slot) = expected {
+        assert_eq!(write.label, "Shortcut");
+        assert_eq!(write.cmd.get_program(), format!("project-shortcut-{slot}").as_str());
+        assert_eq!(args, vec![uuid.to_string()]);
+        assert!(
+          write
+            .cmd
+            .get_envs()
+            .any(|(key, value)| key == "TASKWARRIOR_TUI_REPORT" && value == Some(OsStr::new("myprojects")))
+        );
+      } else {
+        assert_eq!(write.label, "Start/stop");
+        assert!(args.contains(&if active { "stop".into() } else { "start".into() }));
+        assert!(args.contains(&format!("uuid:{uuid}")));
+      }
+      assert_eq!(app.tasks[0].start(), before.start());
+      assert_eq!(app.tasks[0].status(), before.status());
+      assert!(app.hidden_tasks.is_empty());
+    }
+    // Empty configuration uses the normal shortcut error; it never falls
+    // through to start or spawns a substitute after a failed jump.
+    app.report = "myprojects".into();
+    app.config.uda_shortcuts[0].clear();
+    app.mode = Mode::Tasks(Action::Report);
+    app.handle_input(app.keyconfig.start_stop).await.unwrap();
+    assert_eq!(app.mode, Mode::Tasks(Action::Error));
+    assert!(app.error.as_ref().unwrap().contains("empty shortcut"));
+    assert!(queue.try_recv().is_err());
+
+    app.tasks.push(app.tasks[0].clone());
+    *app.tasks[1].uuid_mut() = Uuid::new_v4();
+    app.marked = app.tasks.iter().map(|task| *task.uuid()).collect();
+    app.task_table_state.multiple_selection();
+    app.update_task_table_state();
+    app.mode = Mode::Tasks(Action::Report);
+    app.handle_input(app.keyconfig.start_stop).await.unwrap();
+    assert!(app.error.as_ref().unwrap().contains("Select one task"));
+    assert!(queue.try_recv().is_err());
+  }
+
+  async fn test_project_selection_survives_refresh_and_id_changes() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.report = "myprojects".into();
+    app.tasks.truncate(6);
+    app.current_selection = 5;
+    app.current_selection_uuid = None;
+    app.current_selection_id = None;
+    let selected = *app.tasks[5].uuid();
+    let header = *app.tasks[0].uuid();
+    let other = *app.tasks[1].uuid();
+    let output = std::process::Output {
+      status: std::process::ExitStatus::from_raw(0),
+      stdout: format!(
+        r#"[
+          {{"uuid":"{header}","id":1,"status":"pending","entry":"20200101T000000Z","description":"overview","project":"ci","tags":["view"]}},
+          {{"uuid":"{selected}","id":99,"status":"pending","entry":"20200101T000000Z","description":"selected","project":"ci"}},
+          {{"uuid":"{other}","id":2,"status":"pending","entry":"20200101T000000Z","description":"other","project":"other"}}
+        ]"#
+      )
+      .into_bytes(),
+      stderr: vec![],
+    };
+    let original = app.tasks.clone();
+    for multiple in [false, true] {
+      app.tasks = original.clone();
+      app.current_selection = 5;
+      app.current_selection_uuid = None;
+      app.current_selection_id = None;
+      // A configured shortcut may disable follow-on-modify. Project refreshes
+      // still keep the selected UUID, including the cursor in a marked list.
+      app.selection_follow = false;
+      if multiple {
+        app.marked = [selected, other].into_iter().collect();
+        app.task_table_state.multiple_selection();
+        app.update_task_table_state();
+      }
+      app.apply_job_result(JobResult::Export {
+        seq: 1,
+        desc: "test export".into(),
+        output: Ok(output.clone()),
+      });
+      assert_eq!(app.current_selection, 1);
+      assert_eq!(*app.task_current().unwrap().uuid(), selected);
+      assert_eq!(app.task_current().unwrap().id(), Some(99));
+      if multiple {
+        assert_eq!(
+          app.selected_task_uuids().into_iter().collect::<HashSet<_>>(),
+          HashSet::from([selected, other])
+        );
+      }
+    }
+    app.marked.clear();
+    app.task_table_state.single_selection();
+    let (rows, _, _) = app.get_task_report();
+    assert!(rows.iter().flatten().any(|cell| cell.contains("↳ [ready] selected")));
+    app.task_done().unwrap();
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected selected completion")
+    };
+    let args: Vec<_> = write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    assert!(args.contains(&"99".to_string()));
+    assert!(args.contains(&format!("uuid:{selected}")));
+    assert!(!args.contains(&format!("uuid:{other}")));
+  }
+
+  async fn test_project_report_preserves_configured_filter() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.report = "myprojects".into();
+    let filter = "status:pending -WAITING ( +view or ( +work -gordon -piotr -private -backlog linear_issue_id.any: ) )";
+    app.filter.update(filter, filter.len(), &mut app.changes);
+    let command = app.export_command();
+    let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    assert!(args.contains(&format!("rc.report.myprojects.filter=( {filter} ) or ( status:pending +piotr )")));
+    assert_eq!(args.iter().filter(|arg| arg.starts_with("rc.report.myprojects.filter=")).count(), 1);
+  }
+
   async fn test_brief_key_toggles_floater_for_selected_task() {
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
     let (jobs, queue) = std::sync::mpsc::channel();
@@ -6378,18 +6610,23 @@ mod tests {
     app.handoff_selected_row_y = Some((0, 12));
     let uuid = *app.tasks[0].uuid();
 
-    // Regular tasks open the same brief pane as +piotr handoff rows.
-    for handoff in [false, true] {
-      remove_tag(&mut app.tasks[0], "piotr");
-      if handoff {
-        add_tag(&mut app.tasks[0], "piotr".to_string());
-      }
+    // Project headers and both child kinds request the stable right-side pane;
+    // the same rows in other reports keep the original helper contract.
+    for (report, tag) in [
+      ("next", "work"),
+      ("handoffs", "piotr"),
+      ("myprojects", "view"),
+      ("myprojects", "work"),
+      ("myprojects", "piotr"),
+    ] {
+      app.report = report.into();
+      app.tasks[0].set_tags(Some(vec![tag.to_string()]));
 
       app.handle_input(KeyCode::Char('b')).await.unwrap();
 
       assert_eq!(app.current_selection, 0);
       let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-        panic!("expected brief toggle write for handoff={handoff}")
+        panic!("expected brief toggle write for {report} {tag}")
       };
       assert_eq!(write.label, "Brief");
       assert_eq!(
@@ -6399,14 +6636,18 @@ mod tests {
           .join("dev/dotfiles/scripts/__handoff_floater.sh")
           .to_string_lossy()
       );
+      let mut expected = vec![
+        "toggle".to_string(),
+        uuid.to_string(),
+        std::env::var("TMUX_PANE").unwrap_or_default(),
+        "12".to_string(),
+      ];
+      if report == "myprojects" {
+        expected.extend(["--layout".to_string(), "project".to_string()]);
+      }
       assert_eq!(
         write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-        vec![
-          "toggle".to_string(),
-          uuid.to_string(),
-          std::env::var("TMUX_PANE").unwrap_or_default(),
-          "12".to_string(),
-        ]
+        expected
       );
       assert!(queue.try_recv().is_err());
     }
