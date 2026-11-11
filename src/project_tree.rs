@@ -93,6 +93,22 @@ fn headers(tasks: &[Task]) -> HashSet<&str> {
   tasks.iter().filter(|t| is_overview(t)).filter_map(project).collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectGroup {
+  Named(String),
+  Unsorted,
+}
+
+pub fn project_group(task: &Task, context: &[Task]) -> ProjectGroup {
+  if is_overview(task) {
+    return project(task).map_or(ProjectGroup::Unsorted, |name| ProjectGroup::Named(name.to_owned()));
+  }
+  let projects = headers(context);
+  membership(task)
+    .filter(|name| projects.contains(name))
+    .map_or(ProjectGroup::Unsorted, |name| ProjectGroup::Named(name.to_owned()))
+}
+
 fn finished(task: &Task) -> bool {
   matches!(task.status(), TaskStatus::Completed | TaskStatus::Deleted)
 }
