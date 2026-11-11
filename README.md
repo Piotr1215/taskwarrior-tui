@@ -67,6 +67,10 @@ If you are compiling from source, you'll need the most recent stable rust compil
 
 `taskwarrior-tui` uses `taskwarrior`'s `.taskrc` for configuration.
 
+In text fields, Backspace deletes the previous character and Alt+k deletes from
+the cursor to the end of the line. Ctrl+h, Ctrl+j, Ctrl+k and Ctrl+l are reserved
+for terminal pane navigation.
+
 See the documentation for more information:
 
 - <https://kdheepak.com/taskwarrior-tui/configuration/keys>
