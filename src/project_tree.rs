@@ -218,6 +218,9 @@ fn readiness(task: &Task, context: &HashMap<Uuid, &Task>) -> Readiness {
   {
     return Readiness::Blocked;
   }
+  if has_tag(task, "BLOCKED") {
+    return Readiness::Blocked;
+  }
   if task.status() == &TaskStatus::Waiting || task.wait().is_some_and(|date| **date > chrono::Utc::now().naive_utc()) {
     return Readiness::Waiting;
   }
@@ -291,9 +294,23 @@ fn due_order(a: &Task, b: &Task) -> Ordering {
   }
 }
 
+fn view_rank(task: &Task) -> Option<f64> {
+  let value = match task.uda().get("view_rank")? {
+    UDAValue::U64(value) => *value as f64,
+    UDAValue::F64(value) => *value,
+    UDAValue::Str(value) => value.parse().ok()?,
+  };
+  value.is_finite().then_some(value)
+}
+
 fn view_order(a: &Task, b: &Task, sort: Sort, states: &HashMap<Uuid, Readiness>) -> Ordering {
   let order = match sort {
-    Sort::Execution => (!states[a.uuid()].ready()).cmp(&!states[b.uuid()].ready()),
+    Sort::Execution => match (view_rank(a), view_rank(b)) {
+      (Some(a), Some(b)) => a.total_cmp(&b),
+      (Some(_), None) => Ordering::Less,
+      (None, Some(_)) => Ordering::Greater,
+      (None, None) => (!states[a.uuid()].ready()).cmp(&!states[b.uuid()].ready()),
+    },
     Sort::Due => due_order(a, b),
     Sort::Priority => Ordering::Equal,
     Sort::Newest => (**b.entry()).cmp(&**a.entry()),
@@ -390,7 +407,7 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
         })
         .unwrap_or(inferred_kind);
       let source = if overview { legacy_header(task) } else { legacy_source(task) };
-      let state = if generated {
+      let mut state = if generated {
         uda_string(task, "view_state")
           .or_else(|| {
             (overview && task.description().ends_with(" · source unavailable"))
@@ -408,6 +425,12 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
       } else {
         readiness(task, &by_uuid).label().to_string()
       };
+      if !overview && generated {
+        let readiness = readiness(task, &by_uuid);
+        if !state.is_empty() && state != readiness.label() {
+          state = format!("{} · {state}", readiness.label());
+        }
+      }
       let source_issue = generated
         .then(|| {
           uda_string(task, "view_issue")
@@ -588,6 +611,67 @@ mod tests {
   }
 
   const SORTS: [Sort; 6] = [Sort::Execution, Sort::Due, Sort::Priority, Sort::Newest, Sort::Oldest, Sort::Title];
+
+  #[test]
+  fn next_queue_orders_ranks_and_prerequisites_and_preserves_rows() {
+    let mut issue = task(2, Some("ci"), &["view"]);
+    view(&mut issue, "view_key", "issue:ABC-1");
+    view(&mut issue, "view_state", "Triage");
+    issue.uda_mut().insert("view_rank".into(), UDAValue::U64(10));
+    depends(&mut issue, &[4]);
+    let mut handoff = task(3, Some("ci"), &["piotr"]);
+    handoff.uda_mut().insert("view_rank".into(), UDAValue::F64(20.5));
+    let mut prerequisite = task(4, Some("ci"), &["work"]);
+    view(&mut prerequisite, "view_rank", "30");
+    let mut unranked_high = task(5, Some("ci"), &["work"]);
+    unranked_high.set_priority(Some("H"));
+    let unranked = task(6, Some("ci"), &["work"]);
+    let context = vec![task(1, Some("ci"), &["view"]), unranked, issue, handoff, prerequisite, unranked_high];
+    let rows = arrange(context.clone(), &ViewOptions::default());
+    assert_eq!(ids(&rows), vec![1, 3, 4, 2, 5, 6]);
+    let shown = presentation(&rows, &context);
+    assert_eq!(shown[1].kind, "handoff");
+    assert_eq!(shown[2].state, "ready");
+    assert_eq!(shown[3].kind, "issue");
+    assert_eq!(shown[3].state, "blocked · Triage");
+    assert_eq!(start_shortcut(&rows[3]), Some(1));
+    assert_eq!(rows[3].depends(), Some(&vec![Uuid::from_u128(4)]));
+  }
+
+  #[test]
+  fn blocked_tag_stays_visible_and_unready_and_other_sorts_ignore_ranks() {
+    let mut blocked = task(2, Some("ci"), &["work", "BLOCKED"]);
+    blocked.uda_mut().insert("view_rank".into(), UDAValue::U64(10));
+    *blocked.description_mut() = "Zulu".into();
+    let mut ready = task(3, Some("ci"), &["work"]);
+    ready.uda_mut().insert("view_rank".into(), UDAValue::U64(20));
+    *ready.description_mut() = "Alpha".into();
+    let context = vec![task(1, Some("ci"), &["view"]), ready, blocked];
+    let rows = arrange(context.clone(), &ViewOptions::default());
+    assert_eq!(ids(&rows), vec![1, 2, 3]);
+    assert_eq!(presentation(&rows, &context)[1].state, "blocked");
+    assert_eq!(presentation(&rows, &context)[2].state, "ready");
+    assert_eq!(
+      ids(&arrange(
+        context.clone(),
+        &ViewOptions {
+          sort: Sort::Title,
+          ..Default::default()
+        }
+      )),
+      vec![1, 3, 2]
+    );
+    assert_eq!(
+      ids(&arrange(
+        context,
+        &ViewOptions {
+          ready_only: true,
+          ..Default::default()
+        }
+      )),
+      vec![1, 3]
+    );
+  }
 
   #[test]
   fn projects_arrangement_sorts_headers_and_keeps_each_uuid_once_with_orphans_last() {
@@ -809,7 +893,7 @@ mod tests {
     assert_eq!(rows[0].state, "source unavailable");
     assert_eq!(rows[0].description, "Active project context");
     assert_eq!(rows[1].kind, "issue");
-    assert_eq!(rows[1].state, "In Review");
+    assert_eq!(rows[1].state, "ready · In Review");
     assert_eq!(rows[1].linear, "DEVOPS-123");
     assert_eq!(rows[1].description, "  ↳ Fix report");
     assert_eq!(rows[2].kind, "handoff");
@@ -824,7 +908,7 @@ mod tests {
     view(&mut structured, "view_issue", "DEVOPS-999");
     let rows = presentation(&[structured], &context);
     assert_eq!(rows[0].kind, "task");
-    assert_eq!(rows[0].state, "Triage");
+    assert_eq!(rows[0].state, "ready · Triage");
     assert_eq!(rows[0].linear, "DEVOPS-999");
     assert_eq!(rows[0].description, "  ↳ Current clean title");
   }
@@ -846,7 +930,7 @@ mod tests {
       },
     );
     assert_eq!(ids(&arranged), vec![1, 2]);
-    assert_eq!(presentation(&arranged, &context)[1].state, "Triage");
+    assert_eq!(presentation(&arranged, &context)[1].state, "ready · Triage");
   }
 
   #[test]

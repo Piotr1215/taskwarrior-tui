@@ -6024,6 +6024,7 @@ mod tests {
     test_project_tab_restores_task_report().await;
     test_project_controls_and_columns().await;
     test_project_zoom().await;
+    test_next_queue_inside_zoom().await;
     test_project_tab_async_state().await;
     test_project_overview_actions_are_guarded().await;
     test_project_start_uses_existing_shortcuts().await;
@@ -6784,6 +6785,40 @@ mod tests {
     app.handle_input(KeyCode::Ctrl('o')).await.unwrap();
     assert_eq!(app.tasks.len(), 3);
     assert_eq!(*app.task_current().unwrap().uuid(), header_uuid);
+  }
+
+  async fn test_next_queue_inside_zoom() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.report = "myprojects".into();
+    let mut header = app.tasks[0].clone();
+    header.set_project(Some("alpha"));
+    header.set_tags(Some(vec!["view".to_string()]));
+    header.uda_mut().insert("view_key".into(), UDAValue::Str("standing:alpha".into()));
+    let mut blocked = app.tasks[1].clone();
+    blocked.set_project(Some("alpha"));
+    blocked.set_tags(Some(vec!["work".to_string(), "BLOCKED".to_string()]));
+    blocked.uda_mut().insert("view_rank".into(), UDAValue::U64(10));
+    let mut prerequisite = app.tasks[2].clone();
+    prerequisite.set_project(Some("alpha"));
+    prerequisite.set_tags(Some(vec!["work".to_string()]));
+    prerequisite.uda_mut().insert("view_rank".into(), UDAValue::U64(30));
+    blocked.set_depends::<_, Uuid>(Some(std::iter::once(*prerequisite.uuid())));
+    let mut ranked = prerequisite.clone();
+    *ranked.uuid_mut() = Uuid::new_v4();
+    ranked.uda_mut().insert("view_rank".into(), UDAValue::U64(20));
+    let mut other = prerequisite.clone();
+    *other.uuid_mut() = Uuid::new_v4();
+    other.set_project(Some("beta"));
+    let expected = vec![*header.uuid(), *ranked.uuid(), *prerequisite.uuid(), *blocked.uuid()];
+    app.project_input = vec![header, blocked, prerequisite, ranked, other];
+    app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
+    app.current_selection = app.task_index_by_uuid(expected[0]).unwrap();
+    app.handle_input(KeyCode::Ctrl('o')).await.unwrap();
+    app.handle_input(KeyCode::Char('6')).await.unwrap();
+    app.handle_input(KeyCode::Char('1')).await.unwrap();
+    assert_eq!(app.tasks.iter().map(|task| *task.uuid()).collect::<Vec<_>>(), expected);
+    let rows = crate::project_tree::presentation(&app.tasks, &app.project_input);
+    assert_eq!(rows[3].state, "blocked");
   }
 
   async fn test_project_controls_and_columns() {
