@@ -2169,7 +2169,11 @@ impl TaskwarriorTui {
     // capped columns stop growing, so trimming leaves the room to the description
     for (i, column) in columns.iter().enumerate() {
       let attribute = column.split('.').next().unwrap_or(column);
-      if let Some(max) = config.uda_task_report_column_max_width.get(attribute) {
+      if let Some(max) = config
+        .uda_task_report_column_max_width
+        .get(attribute)
+        .filter(|_| attribute != "linear_issue_id" || !headers.iter().any(|h| h == "Lin"))
+      {
         widths[i] = std::cmp::min(widths[i], *max);
       }
     }
@@ -2186,7 +2190,14 @@ impl TaskwarriorTui {
     // now start trimming
     let trim_target = maximum_column_width.saturating_sub(headers.len() as u16) as usize;
     while widths.iter().sum::<usize>() >= trim_target {
-      let index = widths.iter().position(|i| i == widths.iter().max().unwrap_or(&0)).unwrap_or_default();
+      let protected = headers.iter().position(|h| h == "Lin");
+      let index = widths
+        .iter()
+        .enumerate()
+        .filter(|(i, width)| Some(*i) != protected && **width > 1)
+        .max_by_key(|(_, width)| *width)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| widths.iter().position(|i| i == widths.iter().max().unwrap_or(&0)).unwrap_or_default());
       if widths[index] == 1 {
         break;
       }
@@ -2272,7 +2283,12 @@ impl TaskwarriorTui {
       .unmark_highlight_symbol(&self.config.uda_unmark_highlight_indicator)
       .mark_symbol(&self.config.uda_mark_indicator)
       .unmark_symbol(&self.config.uda_unmark_indicator)
-      .widths(&constraints);
+      .widths(&constraints)
+      .muted_suffix_column(if self.report == "myprojects" {
+        headers.iter().position(|h| h == "Lin")
+      } else {
+        None
+      });
 
     f.render_stateful_widget(t, table_rect, &mut self.task_table_state);
     self.handoff_selected_row_y = self
@@ -5803,6 +5819,16 @@ mod tests {
     // ID gains the selection indicator, the project stops at its cap and the
     // description fills the rest of the 60 cells less one separator per column.
     assert_eq!(widths, vec![4, 8, 44]);
+  }
+
+  #[test]
+  fn projects_linear_width_keeps_the_full_status() {
+    let config = width_test_config(&["uda.taskwarrior-tui.task-report.column-max-width.linear_issue_id 8"]);
+    let headers = ["ID", "Action / current update", "Lin"].map(String::from);
+    let columns = ["id", "description", "linear_issue_id"].map(String::from);
+    let tasks = vec![vec!["1".into(), "A long action".into(), "DEVOPS-1688 · Waiting for Review".into()]];
+    let widths = TaskwarriorTui::calculate_widths(&config, &tasks, &headers, &columns, 60);
+    assert!(widths[2] >= tasks[0][2].width());
   }
 
   #[test]

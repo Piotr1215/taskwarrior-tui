@@ -438,6 +438,20 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
             .or_else(|| uda_string(task, "view_key").and_then(|key| key.strip_prefix("issue:")))
         })
         .flatten();
+      let linear_id = source_issue.or_else(|| uda_string(task, "linear_issue_id")).unwrap_or_default();
+      let linear_status = if !overview && !linear_id.is_empty() {
+        if generated {
+          uda_string(task, "view_state").or_else(|| source.map(|(_, state, _)| state))
+        } else {
+          uda_string(task, "linear_status")
+        }
+      } else {
+        None
+      };
+      let linear = match linear_status {
+        Some(status) if !status.trim().is_empty() => format!("{linear_id} · {status}"),
+        _ => linear_id.to_string(),
+      };
       RowPresentation {
         project: if overview {
           task.project().cloned().unwrap_or_default()
@@ -449,7 +463,7 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
         kind: kind.into(),
         state,
         description: format!("{}{}", if grouped { "  ↳ " } else { "" }, clean_description(task)),
-        linear: source_issue.or_else(|| uda_string(task, "linear_issue_id")).unwrap_or_default().into(),
+        linear,
         mapping: if overview || grouped {
           String::new()
         } else if unresolved {
@@ -894,7 +908,7 @@ mod tests {
     assert_eq!(rows[0].description, "Active project context");
     assert_eq!(rows[1].kind, "issue");
     assert_eq!(rows[1].state, "ready · In Review");
-    assert_eq!(rows[1].linear, "DEVOPS-123");
+    assert_eq!(rows[1].linear, "DEVOPS-123 · In Review");
     assert_eq!(rows[1].description, "  ↳ Fix report");
     assert_eq!(rows[2].kind, "handoff");
     assert_eq!(rows[2].description, "  ↳ no task · DEVOPS-456 Todo · Keep my exact words");
@@ -909,7 +923,7 @@ mod tests {
     let rows = presentation(&[structured], &context);
     assert_eq!(rows[0].kind, "task");
     assert_eq!(rows[0].state, "ready · Triage");
-    assert_eq!(rows[0].linear, "DEVOPS-999");
+    assert_eq!(rows[0].linear, "DEVOPS-999 · Triage");
     assert_eq!(rows[0].description, "  ↳ Current clean title");
   }
 
@@ -1096,6 +1110,17 @@ mod tests {
     ]);
     assert_eq!(ids(&rows), vec![1, 2, 3, 4, 5]);
     assert!(descriptions(&rows)[3].starts_with("[ungrouped: admin]"));
+  }
+
+  #[test]
+  fn linear_status_follows_issue_id_and_plain_tasks_stay_unchanged() {
+    let mut issue = task(2, Some("ci"), &["work"]);
+    issue.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-1688".into()));
+    issue.uda_mut().insert("linear_status".into(), UDAValue::Str("Parked".into()));
+    let plain = task(3, Some("ci"), &["work"]);
+    let rows = presentation(&[issue, plain], &[]);
+    assert_eq!(rows[0].linear, "DEVOPS-1688 · Parked");
+    assert_eq!(rows[1].linear, "");
   }
 
   #[test]
