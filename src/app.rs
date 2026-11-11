@@ -62,6 +62,44 @@ use crate::{
 
 const MAX_LINE: usize = 4096;
 
+fn has_tag(task: &Task, tag: &str) -> bool {
+  task.tags().as_ref().is_some_and(|tags| tags.iter().any(|t| t == tag))
+}
+
+// Keep the original report order and insert handoffs immediately after the
+// matching standing row. Rows without a standing project remain in handoffs.
+fn group_project_handoffs(tasks: Vec<Task>) -> Vec<Task> {
+  let (handoffs, rows): (Vec<_>, Vec<_>) = tasks.into_iter().partition(|t| has_tag(t, "piotr") && !has_tag(t, "view"));
+  let mut by_project: HashMap<String, Vec<Task>> = HashMap::new();
+  for task in handoffs {
+    if let Some(project) = task.project().filter(|p| p.as_str() != "admin" && !p.is_empty()) {
+      by_project.entry(project.to_string()).or_default().push(task);
+    }
+  }
+  let rank = |task: &Task| match task.priority().map(String::as_str) {
+    Some("H") => 0,
+    Some("M") => 1,
+    Some("L") => 2,
+    _ => 3,
+  };
+  for group in by_project.values_mut() {
+    group.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| (**b.entry()).cmp(&**a.entry())));
+  }
+  let mut result = Vec::new();
+  for row in rows {
+    let project = if has_tag(&row, "view") {
+      row.project().map(ToString::to_string)
+    } else {
+      None
+    };
+    result.push(row);
+    if let Some(mut group) = project.and_then(|p| by_project.remove(&p)) {
+      result.append(&mut group);
+    }
+  }
+  result
+}
+
 // Write commands whose output is discarded run with footnotes off. The project
 // footnote alone makes taskwarrior load every task in the database to compute
 // project completion, about 0.7s per action on a 45k-task database.
@@ -2225,7 +2263,17 @@ impl TaskwarriorTui {
 
   fn get_task_report(&mut self) -> (Vec<Vec<String>>, Vec<String>, Vec<String>) {
     self.task_report_table.generate_table(&self.tasks);
-    self.task_report_table.simplify_table()
+    let (mut rows, headers, columns) = self.task_report_table.simplify_table();
+    if self.report == "myprojects" {
+      if let Some(column) = columns.iter().position(|c| c.starts_with("description")) {
+        for (row, task) in rows.iter_mut().zip(&self.tasks) {
+          if has_tag(task, "piotr") && !has_tag(task, "view") {
+            row[column] = format!("  ↳ {}", row[column]);
+          }
+        }
+      }
+    }
+    (rows, headers, columns)
   }
 
   pub async fn update(&mut self, force: bool) -> Result<()> {
@@ -2905,7 +2953,12 @@ impl TaskwarriorTui {
 
     // This is already one argv value. A shell parse would corrupt project names
     // or filters containing apostrophes.
-    add_report_filter(&mut task, &self.report, self.filter.as_str());
+    let filter = if self.report == "myprojects" {
+      format!("( {} ) or ( status:pending +piotr )", self.filter.trim())
+    } else {
+      self.filter.trim().to_string()
+    };
+    add_report_filter(&mut task, &self.report, &filter);
 
     if !self.current_context_filter.trim().is_empty() && self.task_version >= *TASKWARRIOR_VERSION_SUPPORTED {
       if let Some(args) = shlex::split(&self.current_context_filter) {
@@ -2939,7 +2992,11 @@ impl TaskwarriorTui {
           if !self.hidden_tasks.is_empty() {
             imported.retain(|t| !self.hidden_tasks.contains_key(t.uuid()));
           }
-          self.tasks = imported;
+          self.tasks = if self.report == "myprojects" {
+            group_project_handoffs(imported)
+          } else {
+            imported
+          };
           info!("Imported {} tasks", self.tasks.len());
           self.error = None;
           if self.mode == Mode::Tasks(Action::Error) {
@@ -3820,11 +3877,17 @@ impl TaskwarriorTui {
               }
             }
           } else if input == self.keyconfig.start_stop {
-            match self.task_start_stop() {
-              Ok(_) => self.update(true).await?,
-              Err(e) => {
-                self.error = Some(e);
-                self.mode = Mode::Tasks(Action::Error);
+            if matches!(self.report.as_str(), "handoffs" | "myprojects")
+              && let Some(command) = self.handoff_navigation_command()
+            {
+              self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
+            } else {
+              match self.task_start_stop() {
+                Ok(_) => self.update(true).await?,
+                Err(e) => {
+                  self.error = Some(e);
+                  self.mode = Mode::Tasks(Action::Error);
+                }
               }
             }
           } else if input == self.keyconfig.quick_tag {
@@ -5286,6 +5349,15 @@ mod tests {
   }
 
   #[test]
+  fn test_project_filter_sort_override() {
+    let mut command = std::process::Command::new("task");
+    add_report_filter(&mut command, "myprojects", "( +view sort:due+,priority- ) or ( status:pending +piotr )");
+    let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    assert!(args.contains(&"rc.report.myprojects.filter=( +view  ) or ( status:pending +piotr )".to_string()), "{args:?}");
+    assert!(args.contains(&"rc.report.myprojects.sort=due+,priority-".to_string()), "{args:?}");
+  }
+
+  #[test]
   fn test_centered_rect() {
     assert_eq!(centered_rect(50, 50, Rect::new(0, 0, 100, 100)), Rect::new(25, 25, 50, 50));
   }
@@ -5638,6 +5710,7 @@ mod tests {
     test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
     test_selection_signal_and_handoff_navigation().await;
     test_handoff_key_preserves_configured_action().await;
+    test_grouped_handoffs_and_dispatch().await;
     test_brief_key_toggles_floater_for_selected_task().await;
     test_tab_focuses_the_brief_pane().await;
     test_report_menu_refresh_error_keeps_reports().await;
@@ -6208,6 +6281,66 @@ mod tests {
     app.handle_input(KeyCode::Char('S')).await.unwrap();
     assert_eq!(app.current_selection, 1);
     assert!(queue.try_recv().is_err());
+  }
+
+  async fn test_grouped_handoffs_and_dispatch() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let mut standing = app.tasks[0].clone();
+    standing.set_project(Some("ci-infrastructure-improvements"));
+    add_tag(&mut standing, "view".into());
+    let mut high_old = app.tasks[1].clone();
+    high_old.set_project(Some("ci-infrastructure-improvements"));
+    high_old.set_priority(Some("H"));
+    add_tag(&mut high_old, "piotr".into());
+    let mut high_new = app.tasks[2].clone();
+    high_new.set_project(Some("ci-infrastructure-improvements"));
+    high_new.set_priority(Some("H"));
+    add_tag(&mut high_new, "piotr".into());
+    *high_old.entry_mut() = Date::from(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
+    *high_new.entry_mut() = Date::from(NaiveDate::from_ymd_opt(2021, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
+    let mut low = app.tasks[3].clone();
+    low.set_project(Some("ci-infrastructure-improvements"));
+    low.set_priority(Some("L"));
+    add_tag(&mut low, "piotr".into());
+    let mut admin = app.tasks[4].clone();
+    admin.set_project(Some("admin"));
+    add_tag(&mut admin, "piotr".into());
+    let mut no_project = app.tasks[5].clone();
+    no_project.set_project(None::<String>);
+    add_tag(&mut no_project, "piotr".into());
+    let expected = [standing.uuid(), high_new.uuid(), high_old.uuid(), low.uuid()].map(|u| *u);
+    app.tasks = group_project_handoffs(vec![low, admin, high_old, no_project, standing, high_new]);
+    assert_eq!(app.tasks.iter().map(|t| *t.uuid()).collect::<Vec<_>>(), expected);
+    app.report = "myprojects".into();
+    let (jobs, queue) = std::sync::mpsc::channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    app.worker = Some(Worker { jobs, results });
+    app.current_selection = 1;
+    app.handle_input(KeyCode::Char('s')).await.unwrap();
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected navigation")
+    };
+    assert_eq!(write.label, "Handoff");
+    assert_eq!(write.cmd.get_args().next().unwrap(), expected[1].to_string().as_str());
+    app.config.uda_task_report_prompt_on_done = false;
+    app.handle_input(app.keyconfig.done).await.unwrap();
+    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+      panic!("expected done")
+    };
+    assert_eq!(write.label, "Done");
+    assert!(write.cmd.get_args().any(|a| a == "done"));
+    app.current_selection = 0;
+    app.handle_input(KeyCode::Char('b')).await.unwrap();
+    // A refresh may have queued an export after done.
+    let write = queue
+      .try_iter()
+      .find_map(|(_, job)| match job {
+        Job::Write(w) => Some(w),
+        _ => None,
+      })
+      .unwrap();
+    assert_eq!(write.label, "Brief");
+    assert!(write.cmd.get_args().any(|a| a == expected[0].to_string().as_str()));
   }
 
   async fn test_brief_key_toggles_floater_for_selected_task() {
