@@ -3125,6 +3125,10 @@ impl TaskwarriorTui {
     // This is already one argv value. A shell parse would corrupt project names
     // or filters containing apostrophes.
     let filter = if self.report == "myprojects" {
+      // Taskwarrior only recognizes a custom report when it has columns.
+      // These columns are for export validation; the Projects tab renders its
+      // own structured columns without writing the user's taskrc.
+      task.arg("rc.report.myprojects.columns=id,description");
       format!("( {} ) or ( status:pending +piotr )", self.filter.trim())
     } else {
       self.filter.trim().to_string()
@@ -6613,6 +6617,7 @@ mod tests {
 
   async fn test_project_tab_restores_task_report() {
     let startup = TaskwarriorTui::new("myprojects", false).await.unwrap();
+    assert!(startup.error.is_none(), "unconfigured Projects startup failed: {:?}", startup.error);
     assert!(startup.filter.as_str().contains("+view"));
     assert!(!startup.export_command().get_args().any(|arg| arg.to_string_lossy().contains("(  )")));
     let custom = "report.myprojects.filter project:chosen +view\n";
