@@ -8,6 +8,34 @@ use regex::Regex;
 use task_hookrs::{status::TaskStatus, task::Task, uda::UDAValue};
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sort {
+  #[default]
+  Execution,
+  Due,
+  Priority,
+  Newest,
+  Oldest,
+  Title,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewOptions {
+  pub sort: Sort,
+  pub ready_only: bool,
+  pub handoffs_only: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowPresentation {
+  pub project: String,
+  pub kind: String,
+  pub state: String,
+  pub description: String,
+  pub linear: String,
+  pub mapping: String,
+}
+
 pub fn has_tag(task: &Task, tag: &str) -> bool {
   task.tags().as_ref().is_some_and(|tags| tags.iter().any(|t| t == tag))
 }
@@ -91,13 +119,17 @@ fn fallback_order(a: &Task, b: &Task) -> Ordering {
 // Kahn's algorithm chooses among available actions using the existing priority
 // and newest-first order, with due dates breaking equal-priority ties. Cycles
 // remain visible in that same deterministic order instead of losing rows.
-fn execution_order(mut tasks: Vec<Task>, unready: &HashSet<Uuid>) -> Vec<Task> {
-  tasks.sort_by(|a, b| {
+fn execution_order(tasks: Vec<Task>, unready: &HashSet<Uuid>) -> Vec<Task> {
+  dependency_order(tasks, |a, b| {
     unready
       .contains(a.uuid())
       .cmp(&unready.contains(b.uuid()))
       .then_with(|| fallback_order(a, b))
-  });
+  })
+}
+
+fn dependency_order(mut tasks: Vec<Task>, compare: impl FnMut(&Task, &Task) -> Ordering) -> Vec<Task> {
+  tasks.sort_by(compare);
   let indices: HashMap<_, _> = tasks.iter().enumerate().map(|(i, t)| (*t.uuid(), i)).collect();
   let mut remaining = vec![0; tasks.len()];
   let mut dependents = vec![Vec::new(); tasks.len()];
@@ -121,6 +153,274 @@ fn execution_order(mut tasks: Vec<Task>, unready: &HashSet<Uuid>) -> Vec<Task> {
   }
   result.extend(pending.into_iter().flatten());
   result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Readiness {
+  Ready,
+  Running,
+  Waiting,
+  Blocked,
+  Cycle,
+  Missing,
+  Finished,
+}
+
+impl Readiness {
+  fn ready(self) -> bool {
+    matches!(self, Self::Ready | Self::Running)
+  }
+
+  fn label(self) -> &'static str {
+    match self {
+      Self::Ready => "ready",
+      Self::Running => "running",
+      Self::Waiting => "waiting",
+      Self::Blocked => "blocked",
+      Self::Cycle => "cycle",
+      Self::Missing => "missing dep",
+      Self::Finished => "done",
+    }
+  }
+}
+
+fn readiness(task: &Task, context: &HashMap<Uuid, &Task>) -> Readiness {
+  if finished(task) {
+    return Readiness::Finished;
+  }
+  if dependency_cycle(*task.uuid(), context) {
+    return Readiness::Cycle;
+  }
+  if task.depends().into_iter().flatten().any(|dep| !context.contains_key(dep)) {
+    return Readiness::Missing;
+  }
+  if task
+    .depends()
+    .into_iter()
+    .flatten()
+    .any(|dep| context.get(dep).is_some_and(|dep| !finished(dep)))
+  {
+    return Readiness::Blocked;
+  }
+  if task.status() == &TaskStatus::Waiting || task.wait().is_some_and(|date| **date > chrono::Utc::now().naive_utc()) {
+    return Readiness::Waiting;
+  }
+  if task.start().is_some() || has_tag(task, "ACTIVE") {
+    return Readiness::Running;
+  }
+  Readiness::Ready
+}
+
+fn uda_string<'a>(task: &'a Task, name: &str) -> Option<&'a str> {
+  match task.uda().get(name) {
+    Some(UDAValue::Str(value)) if !value.is_empty() => Some(value),
+    _ => None,
+  }
+}
+
+fn generated(task: &Task) -> bool {
+  has_tag(task, "view")
+    && !has_tag(task, "piotr")
+    && (is_overview(task) || uda_string(task, "view_key").is_some_and(|key| key.starts_with("issue:") || key.starts_with("ask:")))
+}
+
+// The producer keeps legacy descriptions for compatibility. Recognize only
+// its precise no-task shape, and never parse ordinary handoff prose.
+fn legacy_source(task: &Task) -> Option<(&str, &str, &str)> {
+  if !generated(task) || is_overview(task) {
+    return None;
+  }
+  static SOURCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^no task · ([A-Z][A-Z0-9]*-[0-9]+) ([^·\r\n]+) · (.+)$").unwrap());
+  let captures = SOURCE.captures(task.description())?;
+  Some((captures.get(1)?.as_str(), captures.get(2)?.as_str().trim(), captures.get(3)?.as_str()))
+}
+
+fn legacy_header(task: &Task) -> Option<(&str, &str, &str)> {
+  if !generated(task) || !is_overview(task) {
+    return None;
+  }
+  static HEADER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^standing · ([A-Z][A-Z0-9]*-[0-9]+) (.+) \(([^()\r\n]+)\)$").unwrap());
+  let description = task.description().strip_suffix(" · source unavailable").unwrap_or(task.description());
+  let captures = HEADER.captures(description)?;
+  let state = captures.get(3)?.as_str().trim();
+  if state.is_empty() {
+    return None;
+  }
+  Some((captures.get(1)?.as_str(), state, captures.get(2)?.as_str()))
+}
+
+fn clean_description(task: &Task) -> &str {
+  if !generated(task) {
+    return task.description();
+  }
+  if let Some(title) = uda_string(task, "view_title") {
+    return title;
+  }
+  if is_overview(task) {
+    if let Some((_, _, title)) = legacy_header(task) {
+      return title;
+    }
+    let title = task.description().strip_prefix("standing · ").unwrap_or(task.description());
+    return title.strip_suffix(" · source unavailable").unwrap_or(title);
+  }
+  legacy_source(task).map_or(task.description(), |(_, _, title)| title)
+}
+
+fn due_order(a: &Task, b: &Task) -> Ordering {
+  match (a.due(), b.due()) {
+    (Some(a), Some(b)) => (**a).cmp(&**b),
+    (Some(_), None) => Ordering::Less,
+    (None, Some(_)) => Ordering::Greater,
+    _ => Ordering::Equal,
+  }
+}
+
+fn view_order(a: &Task, b: &Task, sort: Sort, states: &HashMap<Uuid, Readiness>) -> Ordering {
+  let order = match sort {
+    Sort::Execution => (!states[a.uuid()].ready()).cmp(&!states[b.uuid()].ready()),
+    Sort::Due => due_order(a, b),
+    Sort::Priority => Ordering::Equal,
+    Sort::Newest => (**b.entry()).cmp(&**a.entry()),
+    Sort::Oldest => (**a.entry()).cmp(&**b.entry()),
+    Sort::Title => clean_description(a).to_lowercase().cmp(&clean_description(b).to_lowercase()),
+  };
+  order.then_with(|| fallback_order(a, b))
+}
+
+// The Projects tab owns presentation order and filters. Sorting the full input
+// before hiding rows preserves transitive prerequisites through hidden tasks.
+// The legacy Tasks report continues to use group() and descriptions().
+pub fn arrange(tasks: Vec<Task>, options: &ViewOptions) -> Vec<Task> {
+  let by_uuid: HashMap<_, _> = tasks.iter().map(|task| (*task.uuid(), task)).collect();
+  let states: HashMap<_, _> = tasks.iter().map(|task| (*task.uuid(), readiness(task, &by_uuid))).collect();
+  let projects: HashSet<_> = headers(&tasks).into_iter().map(str::to_owned).collect();
+  let mut overviews = Vec::new();
+  let mut children: HashMap<String, Vec<Task>> = HashMap::new();
+  let mut unmatched = Vec::new();
+  let mut seen = HashSet::new();
+  for task in tasks {
+    if !seen.insert(*task.uuid()) {
+      continue;
+    }
+    if is_overview(&task) {
+      overviews.push(task);
+    } else if let Some(project) = membership(&task).filter(|project| projects.contains(*project)) {
+      children.entry(project.to_string()).or_default().push(task);
+    } else {
+      unmatched.push(task);
+    }
+  }
+  overviews.sort_by(|a, b| {
+    let a_project = a.project().map(String::as_str).unwrap_or_default();
+    let b_project = b.project().map(String::as_str).unwrap_or_default();
+    a_project
+      .is_empty()
+      .cmp(&b_project.is_empty())
+      .then_with(|| a_project.to_lowercase().cmp(&b_project.to_lowercase()))
+      .then_with(|| a.uuid().cmp(b.uuid()))
+  });
+  let keep = |task: &Task| (!options.ready_only || states[task.uuid()].ready()) && (!options.handoffs_only || has_tag(task, "piotr"));
+  let mut result = Vec::new();
+  for header in overviews {
+    let project = project(&header).map(str::to_owned);
+    result.push(header);
+    if let Some(group) = project.and_then(|project| children.remove(&project)) {
+      result.extend(
+        dependency_order(group, |a, b| view_order(a, b, options.sort, &states))
+          .into_iter()
+          .filter(&keep),
+      );
+    }
+  }
+  result.extend(
+    dependency_order(unmatched, |a, b| view_order(a, b, options.sort, &states))
+      .into_iter()
+      .filter(keep),
+  );
+  result
+}
+
+pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
+  let mut projects = headers(context);
+  projects.extend(headers(tasks));
+  let by_uuid: HashMap<_, _> = context.iter().chain(tasks).map(|task| (*task.uuid(), task)).collect();
+  tasks
+    .iter()
+    .map(|task| {
+      let overview = is_overview(task);
+      let generated = generated(task);
+      let grouped = !overview && membership(task).is_some_and(|project| projects.contains(project));
+      let unresolved = uda_string(task, "view_project") == Some("!unassigned");
+      let inferred_kind = if overview {
+        "project"
+      } else if has_tag(task, "piotr") {
+        "handoff"
+      } else if generated && uda_string(task, "view_key").is_some_and(|key| key.starts_with("issue:") || key.starts_with("ask:"))
+        || uda_string(task, "linear_issue_id").is_some()
+      {
+        "issue"
+      } else {
+        "task"
+      };
+      let kind = generated
+        .then(|| uda_string(task, "view_kind"))
+        .flatten()
+        .and_then(|kind| match kind {
+          "project" | "standing" => Some("project"),
+          "handoff" => Some("handoff"),
+          "issue" | "ask" | "review" => Some("issue"),
+          "task" => Some("task"),
+          _ => None,
+        })
+        .unwrap_or(inferred_kind);
+      let source = if overview { legacy_header(task) } else { legacy_source(task) };
+      let state = if generated {
+        uda_string(task, "view_state")
+          .or_else(|| {
+            (overview && task.description().ends_with(" · source unavailable"))
+              .then_some("source unavailable")
+              .or_else(|| source.map(|(_, state, _)| state))
+          })
+          .map(str::to_owned)
+          .unwrap_or_else(|| {
+            if overview {
+              String::new()
+            } else {
+              readiness(task, &by_uuid).label().to_string()
+            }
+          })
+      } else {
+        readiness(task, &by_uuid).label().to_string()
+      };
+      let source_issue = generated
+        .then(|| {
+          uda_string(task, "view_issue")
+            .or_else(|| source.map(|(issue, _, _)| issue))
+            .or_else(|| uda_string(task, "view_key").and_then(|key| key.strip_prefix("issue:")))
+        })
+        .flatten();
+      RowPresentation {
+        project: if overview {
+          task.project().cloned().unwrap_or_default()
+        } else if grouped {
+          String::new()
+        } else {
+          "Unsorted".into()
+        },
+        kind: kind.into(),
+        state,
+        description: format!("{}{}", if grouped { "  ↳ " } else { "" }, clean_description(task)),
+        linear: source_issue.or_else(|| uda_string(task, "linear_issue_id")).unwrap_or_default().into(),
+        mapping: if overview || grouped {
+          String::new()
+        } else if unresolved {
+          "unmapped".into()
+        } else {
+          "no overview".into()
+        },
+      }
+    })
+    .collect()
 }
 
 // Containment uses exact project identity, never depends or a prose match.
@@ -261,6 +561,316 @@ mod tests {
 
   fn depends(task: &mut Task, ids: &[u128]) {
     task.set_depends::<_, Uuid>(Some(ids.iter().map(|id| Uuid::from_u128(*id))));
+  }
+
+  fn view(task: &mut Task, key: &str, value: &str) {
+    task.uda_mut().insert(key.into(), UDAValue::Str(value.into()));
+  }
+
+  fn date(year: i32) -> Date {
+    Date::from(NaiveDate::from_ymd_opt(year, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap())
+  }
+
+  const SORTS: [Sort; 6] = [Sort::Execution, Sort::Due, Sort::Priority, Sort::Newest, Sort::Oldest, Sort::Title];
+
+  #[test]
+  fn projects_arrangement_sorts_headers_and_keeps_each_uuid_once_with_orphans_last() {
+    let header = task(1, Some("Zulu"), &["view"]);
+    let child = task(2, Some("Zulu"), &["work"]);
+    let rows = arrange(
+      vec![
+        task(5, None, &["piotr"]),
+        child.clone(),
+        header.clone(),
+        task(3, Some("alpha"), &["view"]),
+        task(4, Some("alpha"), &["piotr"]),
+        header,
+        child,
+        task(6, Some("Zulu"), &["view"]),
+        task(7, Some("admin"), &["piotr"]),
+      ],
+      &ViewOptions::default(),
+    );
+    assert_eq!(ids(&rows), vec![3, 4, 1, 2, 6, 5, 7]);
+    assert_eq!(rows.len(), rows.iter().map(|task| *task.uuid()).collect::<HashSet<_>>().len());
+  }
+
+  #[test]
+  fn presentation_uses_columns_without_changing_native_task_data() {
+    let mut linked = task(2, Some("admin"), &["piotr"]);
+    view(&mut linked, "view_project", "ai");
+    let mut unresolved = task(4, Some("ai"), &["piotr"]);
+    view(&mut unresolved, "view_project", "!unassigned");
+    let context = vec![task(1, Some("ai"), &["view"]), linked, task(3, Some("other"), &["work"]), unresolved];
+    let arranged = arrange(context.clone(), &ViewOptions::default());
+    let rows = presentation(&arranged, &context);
+    assert_eq!(rows[0].project, "ai");
+    assert_eq!(rows[0].kind, "project");
+    assert_eq!(rows[0].description, "task 1");
+    assert_eq!(rows[1].project, "");
+    assert_eq!(rows[1].kind, "handoff");
+    assert_eq!(rows[1].mapping, "");
+    assert_eq!(rows[1].description, "  ↳ task 2");
+    assert_eq!(arranged[1].project().map(String::as_str), Some("admin"));
+    assert_eq!(arranged[1].description(), "task 2");
+    assert!(rows[2..].iter().all(|row| row.project == "Unsorted"));
+    assert_eq!(rows[2].mapping, "no overview");
+    assert_eq!(rows[3].mapping, "unmapped");
+    assert_eq!(arranged[3].project().map(String::as_str), Some("ai"));
+  }
+
+  #[test]
+  fn project_sort_modes_use_their_requested_primary_order() {
+    let mut alpha = task(2, Some("ci"), &["work"]);
+    *alpha.description_mut() = "Alpha".into();
+    alpha.set_priority(Some("M"));
+    *alpha.entry_mut() = date(2022);
+    alpha.set_due(Some(date(2024)));
+    let mut bravo = task(3, Some("ci"), &["work"]);
+    *bravo.description_mut() = "Bravo".into();
+    bravo.set_priority(Some("H"));
+    *bravo.entry_mut() = date(2024);
+    bravo.set_due(Some(date(2027)));
+    let mut mike = task(4, Some("ci"), &["work"]);
+    *mike.description_mut() = "Mike".into();
+    mike.set_priority(Some("L"));
+    *mike.entry_mut() = date(2021);
+    let mut zulu = task(5, Some("ci"), &["work"]);
+    *zulu.description_mut() = "Zulu".into();
+    zulu.set_priority(Some("H"));
+    *zulu.entry_mut() = date(2020);
+    zulu.set_due(Some(date(2026)));
+    let context = vec![task(1, Some("ci"), &["view"]), alpha, bravo, mike, zulu];
+    for (sort, expected) in [
+      (Sort::Execution, vec![1, 5, 3, 2, 4]),
+      (Sort::Due, vec![1, 2, 5, 3, 4]),
+      (Sort::Priority, vec![1, 5, 3, 2, 4]),
+      (Sort::Newest, vec![1, 3, 2, 4, 5]),
+      (Sort::Oldest, vec![1, 5, 4, 2, 3]),
+      (Sort::Title, vec![1, 2, 3, 4, 5]),
+    ] {
+      assert_eq!(
+        ids(&arrange(context.clone(), &ViewOptions { sort, ..Default::default() })),
+        expected,
+        "{sort:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn all_project_sorts_keep_dependencies_and_hidden_prerequisite_chains_in_order() {
+    let mut dependent = task(2, Some("ci"), &["piotr"]);
+    *dependent.description_mut() = "Alpha".into();
+    dependent.set_priority(Some("H"));
+    dependent.set_due(Some(date(2025)));
+    depends(&mut dependent, &[3]);
+    let mut bridge = task(3, Some("ci"), &["work"]);
+    depends(&mut bridge, &[4]);
+    let mut prerequisite = task(4, Some("ci"), &["piotr"]);
+    *prerequisite.description_mut() = "Zulu".into();
+    prerequisite.set_priority(Some("L"));
+    let context = vec![task(1, Some("ci"), &["view"]), dependent, bridge, prerequisite];
+    for sort in SORTS {
+      let arranged = arrange(context.clone(), &ViewOptions { sort, ..Default::default() });
+      assert_eq!(ids(&arranged), vec![1, 4, 3, 2], "{sort:?}");
+      let arranged = arrange(
+        context.clone(),
+        &ViewOptions {
+          sort,
+          handoffs_only: true,
+          ..Default::default()
+        },
+      );
+      assert_eq!(ids(&arranged), vec![1, 4, 2], "{sort:?}");
+      assert_eq!(presentation(&arranged, &context)[2].state, "blocked");
+    }
+  }
+
+  #[test]
+  fn filters_keep_headers_and_use_full_context_for_readiness_and_cycles() {
+    let mut blocked = task(3, Some("ci"), &["piotr"]);
+    depends(&mut blocked, &[2]);
+    let mut waiting = task(5, Some("ci"), &["piotr"]);
+    *waiting.status_mut() = TaskStatus::Waiting;
+    let mut missing = task(6, Some("ci"), &["piotr"]);
+    depends(&mut missing, &[999]);
+    let mut cycle = task(7, Some("ci"), &["piotr"]);
+    depends(&mut cycle, &[8]);
+    let mut hidden_cycle = task(8, Some("ci"), &["work"]);
+    depends(&mut hidden_cycle, &[7]);
+    let mut running = task(9, Some("ci"), &["piotr"]);
+    running.set_start(Some(chrono::Utc::now().naive_utc()));
+    let context = vec![
+      task(1, Some("ci"), &["view"]),
+      task(2, Some("ci"), &["work"]),
+      blocked,
+      task(4, Some("ci"), &["piotr"]),
+      waiting,
+      missing,
+      cycle,
+      hidden_cycle,
+      running,
+      task(10, Some("empty"), &["view"]),
+    ];
+    let ready = arrange(
+      context.clone(),
+      &ViewOptions {
+        ready_only: true,
+        ..Default::default()
+      },
+    );
+    assert_eq!(ids(&ready), vec![1, 2, 4, 9, 10]);
+    let handoffs = arrange(
+      context.clone(),
+      &ViewOptions {
+        handoffs_only: true,
+        ..Default::default()
+      },
+    );
+    assert_eq!(
+      ids(&handoffs).into_iter().collect::<HashSet<_>>(),
+      HashSet::from([1, 3, 4, 5, 6, 7, 9, 10])
+    );
+    let states: HashMap<_, _> = handoffs
+      .iter()
+      .zip(presentation(&handoffs, &context))
+      .map(|(task, row)| (task.uuid().as_u128(), row.state))
+      .collect();
+    assert_eq!(states[&3], "blocked");
+    assert_eq!(states[&5], "waiting");
+    assert_eq!(states[&6], "missing dep");
+    assert_eq!(states[&7], "cycle");
+    assert_eq!(states[&9], "running");
+    let both = arrange(
+      context,
+      &ViewOptions {
+        ready_only: true,
+        handoffs_only: true,
+        ..Default::default()
+      },
+    );
+    assert_eq!(ids(&both), vec![1, 4, 9, 10]);
+  }
+
+  #[test]
+  fn completed_dependencies_in_hidden_context_stay_satisfied() {
+    let mut done = task(2, Some("outside"), &["work"]);
+    *done.status_mut() = TaskStatus::Completed;
+    let mut handoff = task(3, Some("ci"), &["piotr"]);
+    depends(&mut handoff, &[2]);
+    let context = vec![task(1, Some("ci"), &["view"]), done, handoff];
+    let arranged = arrange(
+      context.clone(),
+      &ViewOptions {
+        ready_only: true,
+        handoffs_only: true,
+        ..Default::default()
+      },
+    );
+    assert_eq!(ids(&arranged), vec![1, 3]);
+    assert_eq!(presentation(&arranged, &context)[1].state, "ready");
+  }
+
+  #[test]
+  fn presentation_cleans_only_known_generated_descriptions_and_prefers_structured_fields() {
+    let mut header = task(1, Some("ci"), &["view"]);
+    view(&mut header, "view_key", "standing:ci-id");
+    *header.description_mut() = "standing · Active project context · source unavailable".into();
+    let mut source = task(2, Some("ci"), &["view"]);
+    view(&mut source, "view_key", "issue:DEVOPS-123");
+    *source.description_mut() = "no task · DEVOPS-123 In Review · Fix report".into();
+    let mut handoff = task(3, Some("ci"), &["piotr", "view"]);
+    view(&mut handoff, "view_key", "issue:DEVOPS-456");
+    view(&mut handoff, "view_title", "Do not replace real prose");
+    *handoff.description_mut() = "no task · DEVOPS-456 Todo · Keep my exact words".into();
+    let mut plain = task(4, Some("ci"), &["work"]);
+    *plain.description_mut() = "standing · My literal title".into();
+    let mut malformed = task(5, Some("ci"), &["view"]);
+    view(&mut malformed, "view_key", "issue:DEVOPS-789");
+    *malformed.description_mut() = "no task · A personal note · Keep this".into();
+    let context = vec![header, source, handoff, plain, malformed];
+    let rows = presentation(&context, &context);
+    assert_eq!(rows[0].state, "source unavailable");
+    assert_eq!(rows[0].description, "Active project context");
+    assert_eq!(rows[1].kind, "issue");
+    assert_eq!(rows[1].state, "In Review");
+    assert_eq!(rows[1].linear, "DEVOPS-123");
+    assert_eq!(rows[1].description, "  ↳ Fix report");
+    assert_eq!(rows[2].kind, "handoff");
+    assert_eq!(rows[2].description, "  ↳ no task · DEVOPS-456 Todo · Keep my exact words");
+    assert_eq!(rows[3].description, "  ↳ standing · My literal title");
+    assert_eq!(rows[4].description, "  ↳ no task · A personal note · Keep this");
+
+    let mut structured = context[1].clone();
+    view(&mut structured, "view_kind", "task");
+    view(&mut structured, "view_title", "Current clean title");
+    view(&mut structured, "view_state", "Triage");
+    view(&mut structured, "view_issue", "DEVOPS-999");
+    let rows = presentation(&[structured], &context);
+    assert_eq!(rows[0].kind, "task");
+    assert_eq!(rows[0].state, "Triage");
+    assert_eq!(rows[0].linear, "DEVOPS-999");
+    assert_eq!(rows[0].description, "  ↳ Current clean title");
+  }
+
+  #[test]
+  fn generated_workflow_state_is_separate_from_dependency_readiness_filter() {
+    let mut source = task(2, Some("ci"), &["view"]);
+    view(&mut source, "view_key", "issue:DEVOPS-123");
+    view(&mut source, "view_state", "Triage");
+    let mut blocked = source.clone();
+    *blocked.uuid_mut() = Uuid::from_u128(3);
+    depends(&mut blocked, &[2]);
+    let context = vec![task(1, Some("ci"), &["view"]), source, blocked];
+    let arranged = arrange(
+      context.clone(),
+      &ViewOptions {
+        ready_only: true,
+        ..Default::default()
+      },
+    );
+    assert_eq!(ids(&arranged), vec![1, 2]);
+    assert_eq!(presentation(&arranged, &context)[1].state, "Triage");
+  }
+
+  #[test]
+  fn legacy_header_metadata_moves_into_columns_without_parsing_actual_task_prose() {
+    let description = "standing · ENGAI-137 Research agents (with tests) (In Review)";
+    let mut header = task(1, Some("ai"), &["view"]);
+    view(&mut header, "view_key", "standing:ai-id");
+    *header.description_mut() = description.into();
+    for unavailable in [false, true] {
+      *header.description_mut() = format!("{description}{}", if unavailable { " · source unavailable" } else { "" });
+      let rows = presentation(&[header.clone()], &[]);
+      assert_eq!(rows[0].description, "Research agents (with tests)");
+      assert_eq!(rows[0].linear, "ENGAI-137");
+      assert_eq!(rows[0].state, if unavailable { "source unavailable" } else { "In Review" });
+    }
+
+    view(&mut header, "view_title", "Structured title");
+    view(&mut header, "view_issue", "ENGAI-200");
+    view(&mut header, "view_state", "Structured state");
+    let rows = presentation(&[header.clone()], &[]);
+    assert_eq!(rows[0].description, "Structured title");
+    assert_eq!(rows[0].linear, "ENGAI-200");
+    assert_eq!(rows[0].state, "Structured state");
+
+    for tags in [&["work"][..], &["piotr"][..], &["view", "piotr"][..]] {
+      let mut actual = task(2, Some("ai"), tags);
+      *actual.description_mut() = description.into();
+      let rows = presentation(&[actual], &[]);
+      assert_eq!(rows[0].description, description);
+      assert_eq!(rows[0].linear, "");
+      assert_eq!(rows[0].state, "ready");
+    }
+
+    let mut unrecognized = task(3, Some("ai"), &["view"]);
+    view(&mut unrecognized, "view_key", "standing:ai-id");
+    *unrecognized.description_mut() = "Research ENGAI-137 and discuss (In Review)".into();
+    let rows = presentation(&[unrecognized.clone()], &[]);
+    assert_eq!(rows[0].description, unrecognized.description().as_str());
+    assert_eq!(rows[0].linear, "");
+    assert_eq!(rows[0].state, "");
   }
 
   #[test]
