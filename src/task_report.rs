@@ -186,8 +186,7 @@ impl TaskReportTable {
     };
 
     for line in data.split('\n') {
-      if line.starts_with(format!("report.{}.columns", report).as_str()) {
-        let column_names = line.split_once(' ').unwrap().1;
+      if let Some(column_names) = show_value(line, &format!("report.{}.columns", report)) {
         for column in column_names.split(',') {
           self.columns.push(column.to_string());
         }
@@ -202,8 +201,7 @@ impl TaskReportTable {
     let data = String::from_utf8_lossy(&output.stdout);
 
     for line in data.split('\n') {
-      if line.starts_with(format!("report.{}.labels", report).as_str()) {
-        let label_names = line.split_once(' ').unwrap().1;
+      if let Some(label_names) = show_value(line, &format!("report.{}.labels", report)) {
         for label in label_names.split(',') {
           self.labels.push(label.to_string());
         }
@@ -218,8 +216,7 @@ impl TaskReportTable {
     let data = String::from_utf8_lossy(&output.stdout);
 
     for line in data.split('\n') {
-      if line.starts_with(format!("report.{}.dateformat", report).as_str()) {
-        let taskwarrior_dateformat = line.split_once(' ').unwrap().1;
+      if let Some(taskwarrior_dateformat) = show_value(line, &format!("report.{}.dateformat", report)) {
         self.date_format = taskwarrior_to_chrono(taskwarrior_dateformat.trim());
       }
     }
@@ -518,5 +515,24 @@ impl TaskReportTable {
     };
 
     utils::display_control_chars(&value)
+  }
+}
+
+fn show_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+  let (name, value) = line.split_once(' ')?;
+  (name == key).then_some(value)
+}
+
+#[cfg(test)]
+mod show_value_tests {
+  use super::show_value;
+
+  #[test]
+  fn ignores_lines_without_values_for_all_report_fields() {
+    for field in ["columns", "labels", "dateformat"] {
+      let key = format!("report.current.{field}");
+      assert_eq!(show_value(&key, &key), None);
+      assert_eq!(show_value(&format!("{key} value"), &key), Some("value"));
+    }
   }
 }
