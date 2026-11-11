@@ -1378,7 +1378,10 @@ impl TaskwarriorTui {
         self.previous_mode = None;
         self.error = None;
         if self.report == "myprojects" {
-          f.render_widget(Paragraph::new(self.project_legend()).style(self.config.uda_style_command), rects[1]);
+          f.render_widget(
+            Paragraph::new(self.project_legend(rects[1].width)).style(self.config.uda_style_command),
+            rects[1],
+          );
           return;
         }
         let position = Self::get_position(&self.command);
@@ -2700,7 +2703,7 @@ impl TaskwarriorTui {
     self.update(true).await
   }
 
-  fn project_legend(&self) -> String {
+  fn project_legend(&self, width: u16) -> String {
     use crate::project_tree::Sort;
     let sort = match self.project_options.sort {
       Sort::Execution => "next",
@@ -2716,10 +2719,38 @@ impl TaskwarriorTui {
       KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
       other => format!("{other:?}"),
     };
+    let controls = [
+      "1 next".to_string(),
+      "2 due".to_string(),
+      "3 priority".to_string(),
+      "4 newest".to_string(),
+      "5 oldest".to_string(),
+      "6 title".to_string(),
+      format!("7 ready [{}]", toggle(self.project_options.ready_only)),
+      format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)),
+      "9 reset".to_string(),
+    ];
+    let label_width: usize = controls.iter().map(|label| label.width()).sum();
+    let gaps = controls.len() - 1;
+    let choices = if usize::from(width) >= label_width + 2 * gaps {
+      let spaces = usize::from(width) - label_width;
+      let mut line = String::new();
+      for (index, label) in controls.iter().enumerate() {
+        if index > 0 {
+          line.push_str(&" ".repeat(spaces / gaps + usize::from(index <= spaces % gaps)));
+        }
+        line.push_str(label);
+      }
+      format!("{line}\nOrder within projects: {sort}")
+    } else {
+      format!(
+        "{}\n{} | Order within projects: {sort}",
+        controls[..6].join("  "),
+        controls[6..].join("  ")
+      )
+    };
     format!(
-      "1 next  2 due  3 priority  4 newest  5 oldest  6 title\n7 ready [{}]  8 handoffs [{}]  9 reset | Order within projects: {sort}\n{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
-      toggle(self.project_options.ready_only),
-      toggle(self.project_options.handoffs_only),
+      "{choices}\n{} Tasks  {} Timesheet  {} act  b brief  {} acknowledge  {} reports  {} filter",
       key(self.keyconfig.previous_tab),
       key(self.keyconfig.next_tab),
       key(self.keyconfig.start_stop),
@@ -6700,11 +6731,11 @@ mod tests {
     assert!(!app.project_options.handoffs_only);
     app.handle_input(KeyCode::Char('8')).await.unwrap();
     assert_eq!(app.tasks.len(), 2, "handoff filter retains its project header");
-    assert!(app.project_legend().contains("handoffs [on]"));
+    assert!(app.project_legend(160).contains("handoffs [on]"));
     app.handle_input(KeyCode::Char('9')).await.unwrap();
     assert_eq!(app.tasks.len(), 3);
 
-    for width in [80, 160] {
+    for width in [80, 120, 160, 240] {
       let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
       terminal.draw(|frame| app.draw(frame)).unwrap();
       let buffer = terminal.backend().buffer();
@@ -6716,6 +6747,24 @@ mod tests {
         screen.contains("1 next") && screen.contains("9 reset"),
         "controls clipped at {width}: {screen}"
       );
+      if width >= 120 {
+        let controls = screen.lines().find(|line| line.starts_with("1 next")).unwrap();
+        for label in [
+          "2 due",
+          "3 priority",
+          "4 newest",
+          "5 oldest",
+          "6 title",
+          "7 ready",
+          "8 handoffs",
+          "9 reset",
+        ] {
+          assert!(controls.contains(label), "control missing from wide row at {width}: {controls}");
+        }
+        assert!(controls.ends_with("9 reset"), "wide controls should fill the row: {controls}");
+      } else {
+        assert!(screen.lines().any(|line| line.starts_with("7 ready")), "narrow controls must wrap");
+      }
       assert!(screen.contains("Type") && screen.contains("State"));
       assert!(!screen.contains("admin"), "native child category leaked into project column");
       let projects_x = (0..width).find(|x| buffer[(*x, 0)].symbol() == "P").unwrap();
