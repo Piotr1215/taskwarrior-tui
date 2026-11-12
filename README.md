@@ -72,6 +72,10 @@ the cursor to the end of the line. Ctrl+h, Ctrl+j, Ctrl+k and Ctrl+l are reserve
 for terminal pane navigation. In Projects, Ctrl+o zooms into a project,
 O toggles the header-only view and R moves to the next Projects report.
 Number keys run the configured shortcuts there as in any other report.
+`s` runs the action named in the Action column, and opens the brief on a
+project header. A step that moved ahead of another in its project's queue
+since the last refresh shows ↑ in State, and the title counts such steps,
+until the cursor reaches the row.
 
 Projects reports are named view settings, the way Taskwarrior reports name a
 filter and sort. They change only what the Projects view shows. The built-ins

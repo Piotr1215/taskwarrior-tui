@@ -402,6 +402,10 @@ pub struct TaskwarriorTui {
   project_zoom: Option<(crate::project_tree::ProjectGroup, Option<Uuid>)>,
   project_collapsed: bool,
   project_unsorted_count: usize,
+  // Steps that moved ahead in their project's queue since the last export;
+  // each keeps its marker until the cursor lands on it.
+  project_jumped: HashSet<Uuid>,
+  project_last_selected: Option<Uuid>,
   tab_marks_pending: Option<HashSet<Uuid>>,
 }
 
@@ -599,6 +603,8 @@ impl TaskwarriorTui {
       project_zoom: None,
       project_collapsed: false,
       project_unsorted_count: 0,
+      project_jumped: HashSet::new(),
+      project_last_selected: None,
       tab_marks_pending: None,
     };
 
@@ -1060,6 +1066,7 @@ impl TaskwarriorTui {
     let rect = f.area();
     self.terminal_width = rect.width;
     self.terminal_height = rect.height;
+    self.mark_project_row_seen();
 
     let chunks = Layout::default()
       .direction(Direction::Vertical)
@@ -1075,6 +1082,18 @@ impl TaskwarriorTui {
       Mode::Projects => self.draw_projects(f, main_layout),
       Mode::Timesheet => self.draw_timesheet(f, main_layout),
       Mode::Calendar => self.draw_calendar(f, main_layout),
+    }
+  }
+
+  // A moved step loses its marker once the cursor lands on it, before the
+  // title counts the rest.
+  fn mark_project_row_seen(&mut self) {
+    let selected = self.tasks.get(self.current_selection).map(|task| *task.uuid());
+    if self.report == "myprojects" && selected != self.project_last_selected {
+      if let Some(uuid) = selected {
+        self.project_jumped.remove(&uuid);
+      }
+      self.project_last_selected = selected;
     }
   }
 
@@ -1094,6 +1113,10 @@ impl TaskwarriorTui {
       Some((crate::project_tree::ProjectGroup::Unsorted, _)) if self.report == "myprojects" => "zoom: Unsorted".to_string(),
       _ if self.report == "myprojects" => "project workspace".to_string(),
       _ => self.report.clone(),
+    };
+    let workspace = match self.project_jumped.len() {
+      n if n > 0 && self.report == "myprojects" => format!("{workspace} ↑{n} moved up"),
+      _ => workspace,
     };
     let context = Line::from(vec![
       Span::from(workspace),
@@ -2342,7 +2365,11 @@ impl TaskwarriorTui {
             task.id().map(|id| id.to_string()).unwrap_or_default(),
             row.project,
             row.kind,
-            row.state,
+            if self.project_jumped.contains(task.uuid()) {
+              format!("↑ {}", row.state)
+            } else {
+              row.state
+            },
             row.action,
             utils::display_control_chars(&row.description),
             row.linear,
@@ -3338,6 +3365,10 @@ impl TaskwarriorTui {
             imported.retain(|t| !self.hidden_tasks.contains_key(t.uuid()));
           }
           self.tasks = if self.report == "myprojects" {
+            if !self.project_input.is_empty() {
+              self.project_jumped.extend(crate::project_tree::jumped(&self.project_input, &imported));
+            }
+            self.project_jumped.retain(|uuid| imported.iter().any(|task| task.uuid() == uuid));
             self.project_input = imported.clone();
             crate::project_tree::arrange(imported, &self.project_options)
           } else {
@@ -3749,6 +3780,15 @@ impl TaskwarriorTui {
   }
 
   async fn task_start_stop_or_shortcut(&mut self) -> Result<(), String> {
+    // A project header has nothing to start; s opens its brief, as b does.
+    if self.report == "myprojects"
+      && self.marked.is_empty()
+      && self.task_current().is_some_and(|task| is_overview(&task))
+      && let Some(command) = self.handoff_floater_toggle_command()
+    {
+      self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
+      return Ok(());
+    }
     let selected = self.actionable_task_uuids()?;
     if self.report == "myprojects"
       && let Some(shortcut) = self
@@ -6175,6 +6215,7 @@ mod tests {
     test_project_start_uses_existing_shortcuts().await;
     test_project_selection_survives_refresh_and_id_changes().await;
     test_project_report_preserves_configured_filter().await;
+    test_project_jump_marker().await;
     test_brief_key_toggles_floater_for_selected_task().await;
     test_tab_focuses_the_brief_pane().await;
     test_report_menu_refresh_error_keeps_reports().await;
@@ -7058,7 +7099,7 @@ mod tests {
     assert_eq!(rows[0][project], "ai-maintenance");
     assert!(rows.iter().skip(1).all(|row| row[project].is_empty()));
     let action = labels.iter().position(|label| label == "Action").unwrap();
-    assert_eq!(rows[0][action], "", "headers have no action");
+    assert_eq!(rows[0][action], "brief", "s on a header opens its brief");
     assert!(rows.iter().any(|row| row[lin] == "DEVOPS-123" && row[action] == "spawn"));
     assert!(rows.iter().any(|row| row[action] == "slack"), "a handoff shows its kind");
     assert!(!labels.contains(&"Mapping".to_string()));
@@ -7231,6 +7272,20 @@ mod tests {
           app.mode = Mode::Tasks(Action::Report);
           app.current_selection = 0;
           app.handle_input(key).await.unwrap();
+          if report == "myprojects" && key == app.keyconfig.start_stop {
+            // s on a header opens its brief instead of refusing.
+            assert_eq!(app.mode, Mode::Tasks(Action::Report));
+            let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
+              panic!("expected the header's brief")
+            };
+            assert_eq!(write.label, "Brief");
+            assert!(write.cmd.get_args().any(|arg| arg == header.to_string().as_str()));
+            // Only the refresh that follows any handled key may be queued.
+            while let Ok((_, job)) = queue.try_recv() {
+              assert!(!matches!(job, Job::Write(_)), "s on a header queued a task write");
+            }
+            continue;
+          }
           assert_eq!(app.mode, Mode::Tasks(Action::Error));
           assert!(app.error.as_ref().unwrap().contains("overview"));
           assert!(queue.try_recv().is_err(), "overview action queued a job");
@@ -7380,6 +7435,64 @@ mod tests {
     app.handle_input(app.keyconfig.start_stop).await.unwrap();
     assert!(app.error.as_ref().unwrap().contains("Select one task"));
     assert!(queue.try_recv().is_err());
+  }
+
+  async fn test_project_jump_marker() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.report = "myprojects".into();
+    app.project_input.clear();
+    app.project_zoom = None;
+    app.project_collapsed = false;
+    app.project_options = crate::project_tree::ViewOptions::default();
+    let [header, first, second, third] = [1u128, 2, 3, 4].map(Uuid::from_u128);
+    let export = |ranks: [u32; 3]| {
+      std::process::Output {
+      status: std::process::ExitStatus::from_raw(0),
+      stdout: format!(
+        r#"[
+          {{"uuid":"{header}","id":1,"status":"pending","entry":"20200101T000000Z","description":"ci","project":"ci","tags":["view"],"view_kind":"project","view_key":"standing:ci"}},
+          {{"uuid":"{first}","id":2,"status":"pending","entry":"20200101T000000Z","description":"first","project":"ci","view_rank":{}}},
+          {{"uuid":"{second}","id":3,"status":"pending","entry":"20200101T000000Z","description":"second","project":"ci","view_rank":{}}},
+          {{"uuid":"{third}","id":4,"status":"pending","entry":"20200101T000000Z","description":"third","project":"ci","view_rank":{}}}
+        ]"#,
+        ranks[0], ranks[1], ranks[2]
+      )
+      .into_bytes(),
+      stderr: vec![],
+    }
+    };
+    let draw = |app: &mut TaskwarriorTui| {
+      let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+      terminal.draw(|f| app.draw(f)).unwrap();
+      buffer_view(terminal.backend().buffer())
+    };
+
+    app.apply_export("first load", &export([10, 20, 30]));
+    assert!(app.project_jumped.is_empty(), "the first export has nothing to compare");
+    app.current_selection = 0;
+    assert!(!draw(&mut app).contains("moved up"));
+
+    app.apply_export("third moves up", &export([10, 20, 5]));
+    assert_eq!(app.project_jumped, HashSet::from([third]));
+    let row = app.tasks.iter().position(|task| *task.uuid() == third).unwrap();
+    let (rows, _, _) = app.get_task_report();
+    assert!(rows[row][3].starts_with("↑ "), "no marker on the moved step: {:?}", rows[row]);
+    let view = draw(&mut app);
+    assert!(view.contains("↑1 moved up"), "{view}");
+
+    // The marker survives refreshes until the cursor lands on the row.
+    app.apply_export("refresh", &export([10, 20, 5]));
+    assert_eq!(app.project_jumped, HashSet::from([third]));
+    app.current_selection = row;
+    let view = draw(&mut app);
+    assert!(app.project_jumped.is_empty());
+    assert!(!view.contains("moved up"), "{view}");
+
+    // A step that falls back marks no one.
+    app.apply_export("first falls back", &export([40, 20, 5]));
+    assert!(app.project_jumped.is_empty());
   }
 
   async fn test_project_selection_survives_refresh_and_id_changes() {
