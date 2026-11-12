@@ -84,6 +84,8 @@ It supports linked tasks and issue rows in Projects. Configure it in `.taskrc`:
 
 ```.taskrc
 uda.taskwarrior-tui.sync-issue.command=~/bin/sync-linear-issue --task
+# Optional: use Ctrl+S instead of S
+uda.taskwarrior-tui.keyconfig.sync-issue=Ctrl+s
 ```
 
 The helper must fetch only the linked issue and update its local task data.
