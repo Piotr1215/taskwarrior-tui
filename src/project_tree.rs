@@ -206,7 +206,7 @@ pub fn start_shortcut(task: &Task) -> Option<usize> {
 // key share start_shortcut(), so they cannot disagree. Headers have no action.
 pub fn action(task: &Task) -> String {
   if is_overview(task) {
-    return String::new();
+    return "brief".into();
   }
   let status = |name: &str| linear_state(task).is_some_and(|status| status.trim().eq_ignore_ascii_case(name));
   let name = match start_shortcut(task) {
@@ -254,6 +254,40 @@ pub fn project_group(task: &Task, context: &[Task]) -> ProjectGroup {
   membership(task)
     .filter(|name| projects.contains(name))
     .map_or(ProjectGroup::Unsorted, |name| ProjectGroup::Named(name.to_owned()))
+}
+
+// Steps whose rank moved past a step that was ahead of them in the same
+// project, between two exports. Only the moved step counts: a renumber keeps
+// the order, and a step that falls back leaves the others' ranks alone.
+pub fn jumped(before: &[Task], after: &[Task]) -> Vec<Uuid> {
+  let ranked = |tasks: &[Task]| -> Vec<(Uuid, ProjectGroup, f64)> {
+    tasks
+      .iter()
+      .filter(|task| !is_overview(task))
+      .filter_map(|task| match project_group(task, tasks) {
+        ProjectGroup::Named(name) => Some((*task.uuid(), ProjectGroup::Named(name), view_rank(task)?)),
+        ProjectGroup::Unsorted => None,
+      })
+      .collect()
+  };
+  let old: HashMap<_, _> = ranked(before).into_iter().map(|(uuid, group, rank)| (uuid, (group, rank))).collect();
+  let both: Vec<_> = ranked(after)
+    .into_iter()
+    .filter_map(|(uuid, group, now)| {
+      let (was_group, was) = old.get(&uuid)?;
+      (*was_group == group).then_some((uuid, group, *was, now))
+    })
+    .collect();
+  both
+    .iter()
+    .filter(|(_, group, was, now)| {
+      now < was
+        && both
+          .iter()
+          .any(|(_, other_group, other_was, other_now)| other_group == group && other_was < was && other_now > now)
+    })
+    .map(|(uuid, ..)| *uuid)
+    .collect()
 }
 
 fn finished(task: &Task) -> bool {
@@ -983,6 +1017,39 @@ mod tests {
   }
 
   #[test]
+  fn jumped_names_only_the_step_that_moved_ahead() {
+    let ranked = |id: u128, project: &str, rank: f64| {
+      let mut step = task(id, Some(project), &["work"]);
+      step.uda_mut().insert("view_rank".into(), UDAValue::F64(rank));
+      step
+    };
+    let queue = |ranks: [f64; 3], other: f64| {
+      vec![
+        header(1, "ci", "standing:ci"),
+        ranked(2, "ci", ranks[0]),
+        ranked(3, "ci", ranks[1]),
+        ranked(4, "ci", ranks[2]),
+        header(5, "docs", "standing:docs"),
+        ranked(6, "docs", other),
+        ranked(7, "loose", 1.0),
+      ]
+    };
+    let before = queue([10.0, 20.0, 30.0], 10.0);
+    // Step 4 moves ahead of 2 and 3; nothing else changed position.
+    assert_eq!(jumped(&before, &queue([10.0, 20.0, 5.0], 10.0)), vec![Uuid::from_u128(4)]);
+    // Step 2 falls behind the others: the others did not jump.
+    assert!(jumped(&before, &queue([40.0, 20.0, 30.0], 10.0)).is_empty());
+    // A renumber keeps the order, and a lower rank that passes no one is quiet.
+    assert!(jumped(&before, &queue([1.0, 2.0, 3.0], 10.0)).is_empty());
+    assert!(jumped(&before, &queue([5.0, 20.0, 30.0], 1.0)).is_empty());
+    // Rows new to the export or outside a project never count.
+    assert!(jumped(&[], &before).is_empty());
+    let mut moved = queue([10.0, 20.0, 30.0], 10.0);
+    moved[6].uda_mut().insert("view_rank".into(), UDAValue::F64(0.5));
+    assert!(jumped(&before, &moved).is_empty());
+  }
+
+  #[test]
   fn action_names_what_s_runs() {
     let mut triage = task(1, Some("ci"), &["view"]);
     view(&mut triage, "view_key", "issue:CI-1");
@@ -996,7 +1063,7 @@ mod tests {
     assert_eq!(action(&handoff), "pr");
     handoff.set_start(Some(date(2020)));
     assert_eq!(action(&handoff), "stop");
-    assert_eq!(action(&header(3, "ci", "standing:ci")), "");
+    assert_eq!(action(&header(3, "ci", "standing:ci")), "brief");
   }
 
   #[test]
@@ -1013,7 +1080,7 @@ mod tests {
     assert_eq!(rows[0].description, "task 1");
     assert_eq!(rows[1].project, "");
     assert_eq!(rows[1].kind, "handoff");
-    assert_eq!(rows[0].action, "", "headers have no s action");
+    assert_eq!(rows[0].action, "brief", "s on a header opens its brief");
     assert_eq!(rows[1].action, "start", "a handoff without a kind starts");
     assert_eq!(rows[1].description, "  ↳ task 2");
     assert_eq!(arranged[1].project().map(String::as_str), Some("admin"));
