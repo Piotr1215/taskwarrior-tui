@@ -77,6 +77,20 @@ project header. A step that moved ahead of another in its project's queue
 since the last refresh shows ↑ in State, and the title counts such steps,
 until the cursor reaches the row.
 
+Press `S` to sync the selected issue from Linear and refresh the report in
+the background. You can keep using the TUI during the sync. The configured
+helper receives only the selected task's UUID, regardless of marked rows.
+It supports linked tasks and issue rows in Projects. Configure it in `.taskrc`:
+
+```.taskrc
+uda.taskwarrior-tui.sync-issue.command=~/bin/sync-linear-issue --task
+# Optional: use Ctrl+S instead of S
+uda.taskwarrior-tui.keyconfig.sync-issue=Ctrl+s
+```
+
+The helper must fetch only the linked issue and update its local task data.
+Rows without an issue link show a message.
+
 Projects reports are named view settings, the way Taskwarrior reports name a
 filter and sort. They change only what the Projects view shows. The built-ins
 are `next` (the default), `todo`, `active`, `handoffs`, `ready`, `due`, `prio`,

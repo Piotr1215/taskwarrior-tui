@@ -389,6 +389,7 @@ pub struct TaskwarriorTui {
   last_write_seq: u64,
   export_in_flight: Option<u64>,
   report_export_floor: u64,
+  sync_status: Option<(u64, String, bool)>,
   project_filter_before: Option<String>,
   refresh_again: bool,
   // Rows removed before their write ran, keyed to the write's queue position.
@@ -592,6 +593,7 @@ impl TaskwarriorTui {
       last_write_seq: 0,
       export_in_flight: None,
       report_export_floor: 0,
+      sync_status: None,
       project_filter_before: None,
       refresh_again: false,
       hidden_tasks: HashMap::new(),
@@ -825,6 +827,7 @@ impl TaskwarriorTui {
       Err(job) => {
         if let Job::Write(mut write) = *job {
           let output = write.run();
+          self.finish_sync(self.job_seq + 1, write.label, output.as_ref().is_ok_and(|output| output.status.success()));
           self.apply_write_result(write.label, write.report_errors, write.select, output);
         }
       }
@@ -846,6 +849,18 @@ impl TaskwarriorTui {
         if let Err(e) = self.export_tasks() {
           self.error = Some(e.to_string());
         }
+      }
+    }
+  }
+
+  fn finish_sync(&mut self, seq: u64, label: &str, success: bool) {
+    if label == "Sync issue" && self.sync_status.as_ref().is_some_and(|(current, _, _)| *current == seq) {
+      if success {
+        if let Some((_, _, pending)) = self.sync_status.as_mut() {
+          *pending = false;
+        }
+      } else {
+        self.sync_status = None;
       }
     }
   }
@@ -907,6 +922,7 @@ impl TaskwarriorTui {
         output,
       } => {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
+        self.finish_sync(seq, label, output.as_ref().is_ok_and(|output| output.status.success()));
         self.apply_write_result(
           label,
           report_errors,
@@ -1080,8 +1096,15 @@ impl TaskwarriorTui {
     match self.mode {
       Mode::Tasks(action) => self.draw_task(f, main_layout, action),
       Mode::Projects => self.draw_projects(f, main_layout),
-      Mode::Timesheet => self.draw_timesheet(f, main_layout),
-      Mode::Calendar => self.draw_calendar(f, main_layout),
+      Mode::Timesheet | Mode::Calendar => {
+        let areas = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(main_layout);
+        if self.mode == Mode::Timesheet {
+          self.draw_timesheet(f, areas[0]);
+        } else {
+          self.draw_calendar(f, areas[0]);
+        }
+        self.draw_shortcut_footer(f, areas[1]);
+      }
     }
   }
 
@@ -1409,7 +1432,7 @@ impl TaskwarriorTui {
         self.error = None;
         if self.report == "myprojects" {
           f.render_widget(
-            Paragraph::new(self.project_legend(rects[1].width)).style(self.config.uda_style_command),
+            Paragraph::new(self.shortcut_legend(rects[1].width)).style(self.config.uda_style_command),
             rects[1],
           );
           return;
@@ -1425,6 +1448,11 @@ impl TaskwarriorTui {
           self.error.clone(),
           None,
         );
+        let footer = Rect {
+          height: rects[1].height.min(1),
+          ..rects[1]
+        };
+        self.draw_shortcut_footer(f, footer);
       }
       Action::Jump => {
         let position = Self::get_position(&self.command);
@@ -2025,12 +2053,6 @@ impl TaskwarriorTui {
     } else {
       Line::from(vec![title.0])
     };
-    // Use the existing command heading so the legend costs no task rows.
-    let mut title_spans = title_spans;
-    let legend = self.config.legend(&self.report);
-    if !legend.is_empty() {
-      title_spans.spans.push(Span::raw(format!(" | {legend}")));
-    }
     let title = Paragraph::new(Text::from(title_spans)).style(style);
     f.render_widget(title, rects[0]);
 
@@ -2751,44 +2773,103 @@ impl TaskwarriorTui {
     self.update(true).await
   }
 
-  // Number keys run the same shortcuts as in every report, so the footer lists
-  // the selected row's digit legend: a handoff's from legend.handoffs, any other
-  // row's from legend.default. Optional items drop from the end when narrow.
-  fn project_legend(&self, width: u16) -> String {
+  // Keep the footer in the existing command area and drop whole optional
+  // labels from the end when the terminal is narrow.
+  fn shortcut_legend(&self, width: u16) -> String {
     let key = |code: KeyCode| match code {
       KeyCode::Char(c) => c.to_string(),
       KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
       other => format!("{other:?}"),
     };
-    let mut items = vec![
-      (format!("R report: {}", self.project_report), true),
-      (format!("{} act", key(self.keyconfig.start_stop)), true),
-      ("b brief".to_string(), false),
-      (format!("{} ack", key(self.keyconfig.done)), false),
-      ("^O zoom".to_string(), false),
-      ("O collapse".to_string(), false),
-      (format!("{} filter", key(self.keyconfig.filter)), false),
-    ];
-    let handoff = self.task_current().is_some_and(|task| has_tag(&task, "piotr"));
-    let legend = if handoff {
-      self.config.legend("handoffs")
-    } else {
-      self.config.uda_legends.get("default").map(String::as_str).unwrap_or_default()
+    let mut items: Vec<(String, bool)> = match self.mode {
+      Mode::Tasks(_) | Mode::Projects => {
+        let projects = self.report == "myprojects";
+        let sync = match &self.sync_status {
+          Some((_, issue, true)) => format!("{} sync [Syncing {issue}…]", key(self.keyconfig.sync_issue)),
+          Some((_, issue, false)) => format!("{} sync [Synced {issue}]", key(self.keyconfig.sync_issue)),
+          None => format!("{} sync", key(self.keyconfig.sync_issue)),
+        };
+        let mut items = vec![
+          (
+            if projects {
+              format!("R report: {}", self.project_report)
+            } else {
+              format!("{} report: {}", key(self.keyconfig.report_menu), self.report)
+            },
+            self.sync_status.is_none(),
+          ),
+          (format!("{} act", key(self.keyconfig.start_stop)), self.sync_status.is_none()),
+          ("b brief".to_string(), false),
+          (sync, self.sync_status.is_some()),
+          (format!("{} {}", key(self.keyconfig.done), if projects { "ack" } else { "done" }), false),
+        ];
+        if projects {
+          items.extend([("^O zoom".to_string(), false), ("O collapse".to_string(), false)]);
+        }
+        items.push((format!("{} filter", key(self.keyconfig.filter)), false));
+        let handoff = self.report == "handoffs" || (projects && self.task_current().is_some_and(|task| has_tag(&task, "piotr")));
+        let legend = if handoff {
+          self.config.legend("handoffs")
+        } else if projects {
+          self.config.legend("default")
+        } else {
+          self.config.legend(&self.report)
+        };
+        items.extend([
+          (
+            format!("{}/{} views", key(self.keyconfig.previous_tab), key(self.keyconfig.next_tab)),
+            false,
+          ),
+          (format!("{} help", key(self.keyconfig.help)), false),
+        ]);
+        for item in legend
+          .split("  ")
+          .flat_map(|item| item.split('|'))
+          .map(str::trim)
+          .filter(|item| !item.is_empty())
+        {
+          let Some(token) = item.split_whitespace().next() else { continue };
+          if projects && !token.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+          }
+          let used = items
+            .iter()
+            .filter_map(|(label, _)| label.split_whitespace().next())
+            .any(|existing| existing == token || existing.split('/').any(|part| part == token));
+          if !used {
+            items.push((item.to_string(), false));
+          }
+        }
+        items
+      }
+      Mode::Timesheet => vec![
+        (format!("{}/{} scroll", key(self.keyconfig.up), key(self.keyconfig.down)), true),
+        (format!("{}/{} page", key(self.keyconfig.page_up), key(self.keyconfig.page_down)), false),
+        (
+          format!("{}/{} views", key(self.keyconfig.previous_tab), key(self.keyconfig.next_tab)),
+          false,
+        ),
+        (format!("{} quit", key(self.keyconfig.quit)), false),
+      ],
+      Mode::Calendar => {
+        let mut items = vec![(format!("{}/{} year", key(self.keyconfig.up), key(self.keyconfig.down)), true)];
+        if self.config.uda_change_focus_rotate {
+          items.push((
+            format!("{}/{} views", key(self.keyconfig.previous_tab), key(self.keyconfig.next_tab)),
+            false,
+          ));
+        } else {
+          items.push((format!("{} previous view", key(self.keyconfig.previous_tab)), false));
+        }
+        items.push((format!("{} quit", key(self.keyconfig.quit)), false));
+        items
+      }
     };
-    items.extend(
-      legend
-        .split("  ")
-        .flat_map(|item| item.split('|'))
-        .map(str::trim)
-        .filter(|item| item.starts_with(|c: char| c.is_ascii_digit()))
-        .map(|item| (item.to_string(), false)),
-    );
     let width = usize::from(width);
     while items.iter().map(|(item, _)| item.width()).sum::<usize>() + 2 * items.len().saturating_sub(1) > width {
       if let Some(index) = items.iter().rposition(|(_, required)| !required) {
         items.remove(index);
       } else {
-        // Extremely narrow terminals cannot show every required item. Keep whole labels.
         items.pop();
       }
       if items.is_empty() {
@@ -2796,6 +2877,13 @@ impl TaskwarriorTui {
       }
     }
     items.into_iter().map(|(item, _)| item).collect::<Vec<_>>().join("  ")
+  }
+
+  fn draw_shortcut_footer(&self, f: &mut Frame, rect: Rect) {
+    f.render_widget(
+      Paragraph::new(self.shortcut_legend(rect.width)).style(self.config.uda_style_command),
+      rect,
+    );
   }
 
   fn project_control(&mut self, key: KeyCode) -> bool {
@@ -3616,6 +3704,42 @@ impl TaskwarriorTui {
     Ok(command)
   }
 
+  fn task_sync_issue(&mut self) -> Result<(), String> {
+    let task = self.task_current().ok_or_else(|| "Select a task to sync.".to_string())?;
+    let nonempty = |name: &str| matches!(task.uda().get(name), Some(UDAValue::Str(value)) if !value.trim().is_empty());
+    let source_issue = has_tag(&task, "view")
+      && (nonempty("view_issue")
+        || matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.strip_prefix("issue:").is_some_and(|id| !id.trim().is_empty())));
+    let explicit_header = matches!(task.uda().get("view_kind"), Some(UDAValue::Str(kind)) if kind == "project")
+      || matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.starts_with("standing:") || key.starts_with("local:"));
+    if explicit_header || (is_overview(&task) && !source_issue) {
+      return Err("Project headers cannot be synced as issues.".into());
+    }
+    if !nonempty("linear_issue_id") && !source_issue {
+      return Err("Selected task has no linked Linear issue.".into());
+    }
+    let args = shlex::split(&self.config.uda_sync_issue_command)
+      .filter(|args| !args.is_empty())
+      .ok_or_else(|| "Configure uda.taskwarrior-tui.sync-issue.command with a valid command first.".to_string())?;
+    let program = shellexpand::tilde(&args[0]);
+    let mut command = std::process::Command::new(program.as_ref());
+    command.args(&args[1..]).arg(task.uuid().to_string()).stdin(std::process::Stdio::null());
+    let issue = ["linear_issue_id", "view_issue"]
+      .iter()
+      .find_map(|name| match task.uda().get(*name) {
+        Some(UDAValue::Str(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
+      })
+      .or_else(|| match task.uda().get("view_key") {
+        Some(UDAValue::Str(key)) => key.strip_prefix("issue:").filter(|key| !key.trim().is_empty()).map(str::to_string),
+        _ => None,
+      })
+      .unwrap_or_else(|| task.uuid().to_string());
+    self.sync_status = Some((self.job_seq + 1, issue, true));
+    self.queue_write(TaskWrite::new("Sync issue", true, Select::Nothing, (command, None)), &[]);
+    Ok(())
+  }
+
   fn task_send_gordon(&mut self) -> Result<(), String> {
     let command = self.gordon_command()?;
     self.queue_write(TaskWrite::new("Gordon", true, Select::Nothing, (command, None)), &[]);
@@ -4168,6 +4292,7 @@ impl TaskwarriorTui {
             self.keyconfig.previous_tab,
             self.keyconfig.help,
             self.keyconfig.refresh,
+            self.keyconfig.sync_issue,
           ];
           if !allowed.contains(&input) {
             return Ok(());
@@ -4194,8 +4319,8 @@ impl TaskwarriorTui {
         } else if input == KeyCode::PageDown || input == self.keyconfig.page_down {
           self.timesheet_scroll = self.timesheet_scroll.saturating_add(self.terminal_height);
         }
-        // Clamp scroll: viewport is terminal height minus the tab bar row.
-        let viewport = self.terminal_height.saturating_sub(1);
+        // The tab bar and shortcut footer each occupy one row.
+        let viewport = self.terminal_height.saturating_sub(2);
         let max_scroll = self.timesheet_line_count.saturating_sub(viewport);
         self.timesheet_scroll = self.timesheet_scroll.min(max_scroll);
       }
@@ -4260,11 +4385,6 @@ impl TaskwarriorTui {
             && let Some(command) = self.brief_focus_command()
           {
             self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
-          }
-          if input == KeyCode::Char('S')
-            && let Some(command) = self.handoff_navigation_command()
-          {
-            self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
           }
           if input == KeyCode::Esc {
             self.marked.clear();
@@ -4467,6 +4587,14 @@ impl TaskwarriorTui {
           } else if input == self.keyconfig.project_filter {
             if self.toggle_project_filter() {
               self.update(true).await?;
+            }
+          } else if input == self.keyconfig.sync_issue {
+            match self.task_sync_issue() {
+              Ok(()) => self.update(true).await?,
+              Err(error) => {
+                self.error = Some(error);
+                self.mode = Mode::Tasks(Action::Error);
+              }
             }
           } else if input == self.keyconfig.gordon {
             if let Err(error) = self.task_send_gordon() {
@@ -6141,6 +6269,7 @@ mod tests {
     setup();
 
     test_report_legend_and_pane_fit().await;
+    test_shortcut_footer_all_views().await;
     test_selected_project_filter_toggle().await;
 
     let app = TaskwarriorTui::new("next", false).await.unwrap();
@@ -6203,6 +6332,7 @@ mod tests {
     test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
     test_selection_signal_and_handoff_navigation().await;
     test_handoff_key_preserves_configured_action().await;
+    test_sync_issue_background().await;
     test_handoff_start_stop_dispatch().await;
     test_grouped_handoffs_and_dispatch().await;
     test_project_tab_restores_task_report().await;
@@ -6537,6 +6667,72 @@ mod tests {
     assert!(app.project_filter_before.is_none());
   }
 
+  async fn test_shortcut_footer_all_views() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.config.uda_legends.insert(
+      "next".into(),
+      "1 open | 2 triage | ^G gordon | b brief | p report | Q sync | / filter".into(),
+    );
+    app.config.uda_legends.insert("handoffs".into(), "3 brief | 6 reply".into());
+    app.keyconfig.report_menu = KeyCode::Char('p');
+    app.keyconfig.sync_issue = KeyCode::Char('Q');
+    app.config.uda_legends.insert("custom".into(), "4 custom".into());
+    app.report = "custom".into();
+    add_tag(&mut app.tasks[app.current_selection], "piotr".into());
+    assert!(app.shortcut_legend(160).contains("4 custom"));
+    assert!(!app.shortcut_legend(160).contains("6 reply"));
+    for width in [80, 160] {
+      for (mode, report) in [
+        (Mode::Tasks(Action::Report), "next"),
+        (Mode::Tasks(Action::Report), "handoffs"),
+        (Mode::Tasks(Action::Report), "myprojects"),
+        (Mode::Timesheet, "next"),
+        (Mode::Calendar, "next"),
+      ] {
+        app.mode = mode.clone();
+        app.report = report.into();
+        app.tasks[app.current_selection]
+          .tags_mut()
+          .as_mut()
+          .map(|tags| tags.retain(|tag| tag != "piotr"));
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let y = if mode == Mode::Tasks(Action::Report) && report != "myprojects" {
+          18
+        } else {
+          19
+        };
+        let footer = (0..width).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect::<String>();
+        assert_eq!(footer.trim_end(), app.shortcut_legend(width));
+        assert!(footer.trim_end().width() <= usize::from(width));
+        if matches!(mode, Mode::Tasks(_)) {
+          assert_eq!(footer.matches("Q sync").count(), 1, "{footer}");
+          assert!(!footer.contains("S sync"));
+          assert!(footer.contains("s act") && footer.contains("b brief"));
+          if report == "myprojects" {
+            assert!(footer.contains("R report:"));
+          } else {
+            assert!(footer.contains(&format!("p report: {report}")));
+            assert!(!footer.contains("O collapse") && !footer.contains("^O zoom"));
+            if width == 160 {
+              assert!(footer.contains(if report == "next" { "1 open  2 triage" } else { "3 brief  6 reply" }));
+              if report == "next" {
+                assert!(footer.contains("^G gordon"));
+                assert_eq!(footer.matches("/ filter").count(), 1);
+                assert_eq!(footer.matches("b brief").count(), 1);
+                assert_eq!(footer.matches("p report").count(), 1);
+              }
+            }
+          }
+        } else {
+          assert!(!footer.contains(" sync") && !footer.contains(" act") && !footer.contains(" brief"));
+          assert!(footer.contains(if mode == Mode::Timesheet { "scroll" } else { "year" }));
+          assert!(footer.contains("quit"));
+        }
+      }
+    }
+  }
+
   async fn test_report_legend_and_pane_fit() {
     let taskrc = std::env::var("TASKRC").unwrap();
     let original = std::fs::read(&taskrc).unwrap();
@@ -6565,7 +6761,8 @@ mod tests {
       let buffer = terminal.backend().buffer();
       let line = |y| (0..188).map(|x| buffer[(x, y)].symbol()).collect::<String>();
       assert!(line(2).contains("pane-row-00"), "first task hidden at height {height}: {}", line(2));
-      assert!(line(height - 2).starts_with("next | 1 open | 2 views"));
+      assert!(line(height - 2).starts_with("r report: next"));
+      assert!(line(height - 2).contains("1 open  2 views"));
       assert!(!line(height - 2).contains("Filter Tasks"));
       assert_eq!(app.task_report_height, height - 4);
       let visible = usize::from(height - 4).min(app.tasks.len());
@@ -6584,7 +6781,7 @@ mod tests {
     let mut terminal = Terminal::new(TestBackend::new(188, 19)).unwrap();
     terminal.draw(|f| app.draw(f)).unwrap();
     let view = buffer_view(terminal.backend().buffer());
-    assert!(view.contains("5 promote | 6 reply | 7 ack"));
+    assert!(view.contains("5 promote  6 reply  7 ack"));
     assert!(view.contains(&format!("pane-row-{:02}", app.tasks.len() - 1)));
 
     // Growing the pane must reveal the first row again when all tasks fit.
@@ -6745,47 +6942,117 @@ mod tests {
 
   async fn test_handoff_key_preserves_configured_action() {
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
-    assert!(app.tasks.len() >= 2);
     let (jobs, queue) = std::sync::mpsc::channel();
-    let (_results_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
     app.worker = Some(Worker { jobs, results });
     app.current_selection = 0;
-    app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
+    app.tasks[0]
+      .uda_mut()
+      .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    assert!(app.task_sync_issue().is_err());
+    app.config.uda_sync_issue_command = "~/sync --task".into();
     let uuid = *app.tasks[0].uuid();
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 0);
-    assert!(queue.try_recv().is_err());
-
-    add_tag(&mut app.tasks[0], "piotr".to_string());
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 0);
+    app.marked.insert(*app.tasks[1].uuid());
+    app.task_sync_issue().unwrap();
     let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected handoff write")
-    };
-    assert_eq!(write.label, "Handoff");
-    assert_eq!(
-      write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-      vec![uuid.to_string()]
-    );
-    assert!(queue.try_recv().is_err());
-
-    app.keyconfig.down = KeyCode::Char('S');
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 1);
-    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected handoff write")
+      panic!("expected sync write")
     };
     assert_eq!(
       write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-      vec![uuid.to_string()]
+      vec!["--task", &uuid.to_string()]
     );
-    assert!(queue.try_recv().is_err());
+    app.tasks[0].uda_mut().remove("linear_issue_id");
+    assert!(app.task_sync_issue().is_err());
+    add_tag(&mut app.tasks[0], "view".into());
+    app.tasks[0].uda_mut().insert("view_key".into(), UDAValue::Str("issue:DEVOPS-123".into()));
+    assert!(app.task_sync_issue().is_ok());
+    app.tasks[0].uda_mut().remove("view_key");
+    app.tasks[0].uda_mut().insert("view_issue".into(), UDAValue::Str("DEVOPS-123".into()));
+    assert!(app.task_sync_issue().is_ok());
+    let latest = app.sync_status.clone().unwrap();
+    app.finish_sync(latest.0 - 1, "Sync issue", true);
+    assert_eq!(app.sync_status.as_ref(), Some(&latest));
+    app.finish_sync(latest.0, "Other write", true);
+    assert_eq!(app.sync_status.as_ref(), Some(&latest));
+    app.finish_sync(latest.0, "Sync issue", true);
+    assert_eq!(app.sync_status, Some((latest.0, "DEVOPS-123".into(), false)));
+    app.tasks[0].uda_mut().insert("view_kind".into(), UDAValue::Str("project".into()));
+    assert!(app.task_sync_issue().is_err());
+  }
 
-    app.current_selection = 0;
-    app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
+  async fn test_sync_issue_background() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("tui-sync-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("sync helper");
+    let log = dir.join("args");
+    std::fs::write(&script, format!("#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$@\" > '{}'\n", log.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.worker = Some(Worker::spawn());
+    let uuid = *app.tasks[0].uuid();
+    app.tasks[0]
+      .uda_mut()
+      .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    app.config.uda_sync_issue_command = format!("'{}' --task", script.display());
+    let start = Instant::now();
     app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 1);
-    assert!(queue.try_recv().is_err());
+    assert!(start.elapsed() < Duration::from_millis(500));
+    assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+      for report in ["next", "myprojects"] {
+        app.report = report.into();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = if report == "myprojects" { 19 } else { 18 };
+        let footer = (0..width).map(|x| buffer[(x, row)].symbol()).collect::<String>();
+        let title = (0..width).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert!(footer.contains("S sync [Syncing DEVOPS-123…]"), "{footer}");
+        assert!(title.contains(if report == "myprojects" { "project workspace" } else { "next" }));
+        assert!(title.contains("[none]"));
+      }
+    }
+    app.report = "next".into();
+    for _ in 0..2 {
+      let result = tokio::time::timeout(Duration::from_secs(30), app.worker.as_mut().unwrap().results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+      app.handle_job_result(result).await.unwrap();
+    }
+    assert_eq!(app.task_current().unwrap().uuid(), &uuid);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("--task\n{uuid}\n"));
+    assert!(app.error.is_none(), "{:?}", app.error);
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+      for report in ["next", "myprojects"] {
+        app.report = report.into();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let row = if report == "myprojects" { 19 } else { 18 };
+        let footer = (0..width).map(|x| terminal.backend().buffer()[(x, row)].symbol()).collect::<String>();
+        assert!(footer.contains("S sync [Synced DEVOPS-123]"), "{footer}");
+      }
+    }
+    app.report = "next".into();
+    app.tasks[app.current_selection]
+      .uda_mut()
+      .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    app.config.uda_sync_issue_command = "/bin/false".into();
+    app.keyconfig = KeyConfig::new("uda.taskwarrior-tui.keyconfig.sync-issue Ctrl+s\n").unwrap();
+    app.handle_input(KeyCode::Ctrl('s')).await.unwrap();
+    assert!(app.sync_status.as_ref().is_some_and(|(_, _, pending)| *pending));
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+      terminal.draw(|frame| app.draw(frame)).unwrap();
+      let footer = (0..width).map(|x| terminal.backend().buffer()[(x, 18)].symbol()).collect::<String>();
+      assert!(footer.contains("^S sync [Syncing DEVOPS-123…]"), "{footer}");
+    }
+    app.wait_for_writes();
+    assert!(app.error.as_ref().is_some_and(|error| error.contains("Sync issue failed")));
+    assert!(app.sync_status.is_none());
+    assert_eq!(app.mode, Mode::Tasks(Action::Error));
+    std::fs::remove_dir_all(dir).unwrap();
   }
 
   async fn test_handoff_start_stop_dispatch() {
@@ -7138,7 +7405,7 @@ mod tests {
           .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
           .collect::<Vec<_>>()
           .join("\n");
-        let legend = app.project_legend(width);
+        let legend = app.shortcut_legend(width);
         let footer = screen.lines().last().unwrap().trim_end();
         assert_eq!(footer, legend, "footer clipped at {width}x{height}: {screen}");
         assert!(footer.starts_with("R report: next  s act"), "{footer}");
@@ -7147,6 +7414,7 @@ mod tests {
           "R report: next",
           "s act",
           "b brief",
+          "S sync",
           "x ack",
           "^O zoom",
           "O collapse",
@@ -7154,13 +7422,15 @@ mod tests {
           "0 jump",
           "3 brief",
           "6 ack+comment",
+          "[/] views",
+          "? help",
         ];
         assert!(footer.split("  ").all(|item| valid_items.contains(&item)), "partial item: {footer}");
         assert!(!legend.contains('\n'));
         assert!(legend.width() <= usize::from(width));
         if width == 250 {
           assert_eq!(
-            footer, "R report: next  s act  b brief  x ack  ^O zoom  O collapse  / filter  0 jump  3 brief  6 ack+comment",
+            footer, "R report: next  s act  b brief  S sync  x ack  ^O zoom  O collapse  / filter  [/] views  ? help  0 jump  3 brief  6 ack+comment",
             "a handoff row lists the handoffs digits"
           );
         }
@@ -7168,7 +7438,7 @@ mod tests {
     }
     app.current_selection = app.tasks.iter().position(|task| !has_tag(task, "piotr") && !is_overview(task)).unwrap();
     assert!(
-      app.project_legend(250).ends_with("0 jump  1 open  7 backlog"),
+      app.shortcut_legend(250).contains("0 jump  1 open  7 backlog"),
       "other rows list the default digits"
     );
     app.report = "next".into();
@@ -7712,8 +7982,6 @@ mod tests {
       .as_mut()
       .map(|tags| tags.retain(|tag| tag != "piotr"));
     assert!(app.handoff_navigation_command().is_none());
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.mode, Mode::Tasks(Action::Report));
     add_tag(&mut app.tasks[app.current_selection], "piotr".to_string());
     let command = app.handoff_navigation_command().unwrap();
     assert!(
@@ -8859,7 +9127,7 @@ mod tests {
       "                                                  ",
       "                                                  ",
       "                                                  ",
-      "next                                              ",
+      "r report: next  s act  b brief  S sync  x done    ",
       "(status:pending or status:waiting)                ",
     ]);
 
@@ -9262,6 +9530,15 @@ mod tests {
 
     app.calendar_year = 2020;
     app.mode = Mode::Calendar;
+    let footer = app.shortcut_legend(50);
+    for x in 0..50 {
+      expected[(x, 14)].set_style(app.config.uda_style_command);
+    }
+    for (x, c) in footer.chars().enumerate() {
+      expected[(x as u16, 14)]
+        .set_symbol(&c.to_string())
+        .set_style(app.config.uda_style_command);
+    }
 
     app.update(true).await.unwrap();
 
