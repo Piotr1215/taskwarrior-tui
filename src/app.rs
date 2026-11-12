@@ -1080,8 +1080,15 @@ impl TaskwarriorTui {
     match self.mode {
       Mode::Tasks(action) => self.draw_task(f, main_layout, action),
       Mode::Projects => self.draw_projects(f, main_layout),
-      Mode::Timesheet => self.draw_timesheet(f, main_layout),
-      Mode::Calendar => self.draw_calendar(f, main_layout),
+      Mode::Timesheet | Mode::Calendar => {
+        let areas = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(main_layout);
+        if self.mode == Mode::Timesheet {
+          self.draw_timesheet(f, areas[0]);
+        } else {
+          self.draw_calendar(f, areas[0]);
+        }
+        self.draw_shortcut_footer(f, areas[1]);
+      }
     }
   }
 
@@ -1409,7 +1416,7 @@ impl TaskwarriorTui {
         self.error = None;
         if self.report == "myprojects" {
           f.render_widget(
-            Paragraph::new(self.project_legend(rects[1].width)).style(self.config.uda_style_command),
+            Paragraph::new(self.shortcut_legend(rects[1].width)).style(self.config.uda_style_command),
             rects[1],
           );
           return;
@@ -1425,6 +1432,11 @@ impl TaskwarriorTui {
           self.error.clone(),
           None,
         );
+        let footer = Rect {
+          height: rects[1].height.min(1),
+          ..rects[1]
+        };
+        self.draw_shortcut_footer(f, footer);
       }
       Action::Jump => {
         let position = Self::get_position(&self.command);
@@ -2025,12 +2037,6 @@ impl TaskwarriorTui {
     } else {
       Line::from(vec![title.0])
     };
-    // Use the existing command heading so the legend costs no task rows.
-    let mut title_spans = title_spans;
-    let legend = self.config.legend(&self.report);
-    if !legend.is_empty() {
-      title_spans.spans.push(Span::raw(format!(" | {legend}")));
-    }
     let title = Paragraph::new(Text::from(title_spans)).style(style);
     f.render_widget(title, rects[0]);
 
@@ -2751,45 +2757,98 @@ impl TaskwarriorTui {
     self.update(true).await
   }
 
-  // Number keys run the same shortcuts as in every report, so the footer lists
-  // the selected row's digit legend: a handoff's from legend.handoffs, any other
-  // row's from legend.default. Optional items drop from the end when narrow.
-  fn project_legend(&self, width: u16) -> String {
+  // Keep the footer in the existing command area and drop whole optional
+  // labels from the end when the terminal is narrow.
+  fn shortcut_legend(&self, width: u16) -> String {
     let key = |code: KeyCode| match code {
       KeyCode::Char(c) => c.to_string(),
       KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
       other => format!("{other:?}"),
     };
-    let mut items = vec![
-      (format!("R report: {}", self.project_report), true),
-      (format!("{} act", key(self.keyconfig.start_stop)), true),
-      ("b brief".to_string(), false),
-      (format!("{} sync", key(self.keyconfig.sync_issue)), false),
-      (format!("{} ack", key(self.keyconfig.done)), false),
-      ("^O zoom".to_string(), false),
-      ("O collapse".to_string(), false),
-      (format!("{} filter", key(self.keyconfig.filter)), false),
-    ];
-    let handoff = self.task_current().is_some_and(|task| has_tag(&task, "piotr"));
-    let legend = if handoff {
-      self.config.legend("handoffs")
-    } else {
-      self.config.uda_legends.get("default").map(String::as_str).unwrap_or_default()
+    let mut items: Vec<(String, bool)> = match self.mode {
+      Mode::Tasks(_) | Mode::Projects => {
+        let projects = self.report == "myprojects";
+        let mut items = vec![
+          (
+            if projects {
+              format!("R report: {}", self.project_report)
+            } else {
+              format!("{} report: {}", key(self.keyconfig.report_menu), self.report)
+            },
+            true,
+          ),
+          (format!("{} act", key(self.keyconfig.start_stop)), true),
+          ("b brief".to_string(), false),
+          (format!("{} sync", key(self.keyconfig.sync_issue)), false),
+          (format!("{} {}", key(self.keyconfig.done), if projects { "ack" } else { "done" }), false),
+        ];
+        if projects {
+          items.extend([("^O zoom".to_string(), false), ("O collapse".to_string(), false)]);
+        }
+        items.push((format!("{} filter", key(self.keyconfig.filter)), false));
+        let handoff = self.report == "handoffs" || (projects && self.task_current().is_some_and(|task| has_tag(&task, "piotr")));
+        let legend = if handoff {
+          self.config.legend("handoffs")
+        } else if projects {
+          self.config.legend("default")
+        } else {
+          self.config.legend(&self.report)
+        };
+        items.extend([
+          (
+            format!("{}/{} views", key(self.keyconfig.previous_tab), key(self.keyconfig.next_tab)),
+            false,
+          ),
+          (format!("{} help", key(self.keyconfig.help)), false),
+        ]);
+        for item in legend
+          .split("  ")
+          .flat_map(|item| item.split('|'))
+          .map(str::trim)
+          .filter(|item| !item.is_empty())
+        {
+          let Some(token) = item.split_whitespace().next() else { continue };
+          if projects && !token.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+          }
+          let used = items
+            .iter()
+            .filter_map(|(label, _)| label.split_whitespace().next())
+            .any(|existing| existing == token || existing.split('/').any(|part| part == token));
+          if !used {
+            items.push((item.to_string(), false));
+          }
+        }
+        items
+      }
+      Mode::Timesheet => vec![
+        (format!("{}/{} scroll", key(self.keyconfig.up), key(self.keyconfig.down)), true),
+        (format!("{}/{} page", key(self.keyconfig.page_up), key(self.keyconfig.page_down)), false),
+        (
+          format!("{}/{} views", key(self.keyconfig.previous_tab), key(self.keyconfig.next_tab)),
+          false,
+        ),
+        (format!("{} quit", key(self.keyconfig.quit)), false),
+      ],
+      Mode::Calendar => {
+        let mut items = vec![(format!("{}/{} year", key(self.keyconfig.up), key(self.keyconfig.down)), true)];
+        if self.config.uda_change_focus_rotate {
+          items.push((
+            format!("{}/{} views", key(self.keyconfig.previous_tab), key(self.keyconfig.next_tab)),
+            false,
+          ));
+        } else {
+          items.push((format!("{} previous view", key(self.keyconfig.previous_tab)), false));
+        }
+        items.push((format!("{} quit", key(self.keyconfig.quit)), false));
+        items
+      }
     };
-    items.extend(
-      legend
-        .split("  ")
-        .flat_map(|item| item.split('|'))
-        .map(str::trim)
-        .filter(|item| item.starts_with(|c: char| c.is_ascii_digit()))
-        .map(|item| (item.to_string(), false)),
-    );
     let width = usize::from(width);
     while items.iter().map(|(item, _)| item.width()).sum::<usize>() + 2 * items.len().saturating_sub(1) > width {
       if let Some(index) = items.iter().rposition(|(_, required)| !required) {
         items.remove(index);
       } else {
-        // Extremely narrow terminals cannot show every required item. Keep whole labels.
         items.pop();
       }
       if items.is_empty() {
@@ -2797,6 +2856,13 @@ impl TaskwarriorTui {
       }
     }
     items.into_iter().map(|(item, _)| item).collect::<Vec<_>>().join("  ")
+  }
+
+  fn draw_shortcut_footer(&self, f: &mut Frame, rect: Rect) {
+    f.render_widget(
+      Paragraph::new(self.shortcut_legend(rect.width)).style(self.config.uda_style_command),
+      rect,
+    );
   }
 
   fn project_control(&mut self, key: KeyCode) -> bool {
@@ -4220,8 +4286,8 @@ impl TaskwarriorTui {
         } else if input == KeyCode::PageDown || input == self.keyconfig.page_down {
           self.timesheet_scroll = self.timesheet_scroll.saturating_add(self.terminal_height);
         }
-        // Clamp scroll: viewport is terminal height minus the tab bar row.
-        let viewport = self.terminal_height.saturating_sub(1);
+        // The tab bar and shortcut footer each occupy one row.
+        let viewport = self.terminal_height.saturating_sub(2);
         let max_scroll = self.timesheet_line_count.saturating_sub(viewport);
         self.timesheet_scroll = self.timesheet_scroll.min(max_scroll);
       }
@@ -6170,6 +6236,7 @@ mod tests {
     setup();
 
     test_report_legend_and_pane_fit().await;
+    test_shortcut_footer_all_views().await;
     test_selected_project_filter_toggle().await;
 
     let app = TaskwarriorTui::new("next", false).await.unwrap();
@@ -6567,6 +6634,72 @@ mod tests {
     assert!(app.project_filter_before.is_none());
   }
 
+  async fn test_shortcut_footer_all_views() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.config.uda_legends.insert(
+      "next".into(),
+      "1 open | 2 triage | ^G gordon | b brief | p report | Q sync | / filter".into(),
+    );
+    app.config.uda_legends.insert("handoffs".into(), "3 brief | 6 reply".into());
+    app.keyconfig.report_menu = KeyCode::Char('p');
+    app.keyconfig.sync_issue = KeyCode::Char('Q');
+    app.config.uda_legends.insert("custom".into(), "4 custom".into());
+    app.report = "custom".into();
+    add_tag(&mut app.tasks[app.current_selection], "piotr".into());
+    assert!(app.shortcut_legend(160).contains("4 custom"));
+    assert!(!app.shortcut_legend(160).contains("6 reply"));
+    for width in [80, 160] {
+      for (mode, report) in [
+        (Mode::Tasks(Action::Report), "next"),
+        (Mode::Tasks(Action::Report), "handoffs"),
+        (Mode::Tasks(Action::Report), "myprojects"),
+        (Mode::Timesheet, "next"),
+        (Mode::Calendar, "next"),
+      ] {
+        app.mode = mode.clone();
+        app.report = report.into();
+        app.tasks[app.current_selection]
+          .tags_mut()
+          .as_mut()
+          .map(|tags| tags.retain(|tag| tag != "piotr"));
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let y = if mode == Mode::Tasks(Action::Report) && report != "myprojects" {
+          18
+        } else {
+          19
+        };
+        let footer = (0..width).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect::<String>();
+        assert_eq!(footer.trim_end(), app.shortcut_legend(width));
+        assert!(footer.trim_end().width() <= usize::from(width));
+        if matches!(mode, Mode::Tasks(_)) {
+          assert_eq!(footer.matches("Q sync").count(), 1, "{footer}");
+          assert!(!footer.contains("S sync"));
+          assert!(footer.contains("s act") && footer.contains("b brief"));
+          if report == "myprojects" {
+            assert!(footer.contains("R report:"));
+          } else {
+            assert!(footer.contains(&format!("p report: {report}")));
+            assert!(!footer.contains("O collapse") && !footer.contains("^O zoom"));
+            if width == 160 {
+              assert!(footer.contains(if report == "next" { "1 open  2 triage" } else { "3 brief  6 reply" }));
+              if report == "next" {
+                assert!(footer.contains("^G gordon"));
+                assert_eq!(footer.matches("/ filter").count(), 1);
+                assert_eq!(footer.matches("b brief").count(), 1);
+                assert_eq!(footer.matches("p report").count(), 1);
+              }
+            }
+          }
+        } else {
+          assert!(!footer.contains(" sync") && !footer.contains(" act") && !footer.contains(" brief"));
+          assert!(footer.contains(if mode == Mode::Timesheet { "scroll" } else { "year" }));
+          assert!(footer.contains("quit"));
+        }
+      }
+    }
+  }
+
   async fn test_report_legend_and_pane_fit() {
     let taskrc = std::env::var("TASKRC").unwrap();
     let original = std::fs::read(&taskrc).unwrap();
@@ -6595,7 +6728,8 @@ mod tests {
       let buffer = terminal.backend().buffer();
       let line = |y| (0..188).map(|x| buffer[(x, y)].symbol()).collect::<String>();
       assert!(line(2).contains("pane-row-00"), "first task hidden at height {height}: {}", line(2));
-      assert!(line(height - 2).starts_with("next | 1 open | 2 views"));
+      assert!(line(height - 2).starts_with("r report: next"));
+      assert!(line(height - 2).contains("1 open  2 views"));
       assert!(!line(height - 2).contains("Filter Tasks"));
       assert_eq!(app.task_report_height, height - 4);
       let visible = usize::from(height - 4).min(app.tasks.len());
@@ -6614,7 +6748,7 @@ mod tests {
     let mut terminal = Terminal::new(TestBackend::new(188, 19)).unwrap();
     terminal.draw(|f| app.draw(f)).unwrap();
     let view = buffer_view(terminal.backend().buffer());
-    assert!(view.contains("5 promote | 6 reply | 7 ack"));
+    assert!(view.contains("5 promote  6 reply  7 ack"));
     assert!(view.contains(&format!("pane-row-{:02}", app.tasks.len() - 1)));
 
     // Growing the pane must reveal the first row again when all tasks fit.
@@ -7195,7 +7329,7 @@ mod tests {
           .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
           .collect::<Vec<_>>()
           .join("\n");
-        let legend = app.project_legend(width);
+        let legend = app.shortcut_legend(width);
         let footer = screen.lines().last().unwrap().trim_end();
         assert_eq!(footer, legend, "footer clipped at {width}x{height}: {screen}");
         assert!(footer.starts_with("R report: next  s act"), "{footer}");
@@ -7212,13 +7346,15 @@ mod tests {
           "0 jump",
           "3 brief",
           "6 ack+comment",
+          "[/] views",
+          "? help",
         ];
         assert!(footer.split("  ").all(|item| valid_items.contains(&item)), "partial item: {footer}");
         assert!(!legend.contains('\n'));
         assert!(legend.width() <= usize::from(width));
         if width == 250 {
           assert_eq!(
-            footer, "R report: next  s act  b brief  S sync  x ack  ^O zoom  O collapse  / filter  0 jump  3 brief  6 ack+comment",
+            footer, "R report: next  s act  b brief  S sync  x ack  ^O zoom  O collapse  / filter  [/] views  ? help  0 jump  3 brief  6 ack+comment",
             "a handoff row lists the handoffs digits"
           );
         }
@@ -7226,7 +7362,7 @@ mod tests {
     }
     app.current_selection = app.tasks.iter().position(|task| !has_tag(task, "piotr") && !is_overview(task)).unwrap();
     assert!(
-      app.project_legend(250).ends_with("0 jump  1 open  7 backlog"),
+      app.shortcut_legend(250).contains("0 jump  1 open  7 backlog"),
       "other rows list the default digits"
     );
     app.report = "next".into();
@@ -8915,7 +9051,7 @@ mod tests {
       "                                                  ",
       "                                                  ",
       "                                                  ",
-      "next                                              ",
+      "r report: next  s act  b brief  S sync  x done    ",
       "(status:pending or status:waiting)                ",
     ]);
 
@@ -9318,6 +9454,15 @@ mod tests {
 
     app.calendar_year = 2020;
     app.mode = Mode::Calendar;
+    let footer = app.shortcut_legend(50);
+    for x in 0..50 {
+      expected[(x, 14)].set_style(app.config.uda_style_command);
+    }
+    for (x, c) in footer.chars().enumerate() {
+      expected[(x as u16, 14)]
+        .set_symbol(&c.to_string())
+        .set_style(app.config.uda_style_command);
+    }
 
     app.update(true).await.unwrap();
 
