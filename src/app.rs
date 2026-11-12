@@ -2740,7 +2740,7 @@ impl TaskwarriorTui {
       (format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)), true),
       ("9 reset".to_string(), false),
       ("^O zoom".to_string(), false),
-      ("^L collapse".to_string(), false),
+      ("O collapse".to_string(), false),
       (format!("{} act", key(self.keyconfig.start_stop)), true),
       ("b brief".to_string(), false),
       (format!("{} ack", key(self.keyconfig.done)), false),
@@ -2787,7 +2787,7 @@ impl TaskwarriorTui {
         }
         selected
       }
-      KeyCode::Ctrl('l') => {
+      KeyCode::Char('O') => {
         self.project_collapsed = !self.project_collapsed;
         if self.project_collapsed && self.project_zoom.is_none() {
           match selected_group {
@@ -6878,7 +6878,7 @@ mod tests {
     app.project_input = vec![header, child, second, unmatched];
     app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
     app.current_selection = 1;
-    app.handle_input(KeyCode::Ctrl('l')).await.unwrap();
+    app.handle_input(KeyCode::Char('O')).await.unwrap();
     assert_eq!(app.tasks.len(), 1);
     assert_eq!(app.project_unsorted_count, 1);
     assert_eq!(*app.task_current().unwrap().uuid(), header_id);
@@ -6898,7 +6898,7 @@ mod tests {
     assert!(matches!(app.project_zoom, Some((crate::project_tree::ProjectGroup::Unsorted, None))));
     app.handle_input(KeyCode::Esc).await.unwrap();
     assert_eq!(app.current_selection, 1);
-    app.handle_input(KeyCode::Ctrl('l')).await.unwrap();
+    app.handle_input(KeyCode::Char('O')).await.unwrap();
     assert_eq!(app.tasks.len(), 4);
     assert_eq!(app.current_selection, 3);
   }
@@ -7047,7 +7047,7 @@ mod tests {
           "8 handoffs [off]",
           "9 reset",
           "^O zoom",
-          "^L collapse",
+          "O collapse",
           "s act",
           "b brief",
           "x ack",
@@ -7061,7 +7061,7 @@ mod tests {
         if width == 250 {
           assert_eq!(
             footer,
-            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  ^O zoom  ^L collapse  s act  b brief  x ack  r reports  / filter"
+            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  ^O zoom  O collapse  s act  b brief  x ack  r reports  / filter"
           );
         }
       }
