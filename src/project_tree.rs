@@ -33,6 +33,7 @@ pub struct RowPresentation {
   pub state: String,
   pub description: String,
   pub linear: String,
+  pub linear_status: String,
   pub mapping: String,
 }
 
@@ -407,30 +408,15 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
         })
         .unwrap_or(inferred_kind);
       let source = if overview { legacy_header(task) } else { legacy_source(task) };
-      let mut state = if generated {
+      let state = if overview && generated {
         uda_string(task, "view_state")
-          .or_else(|| {
-            (overview && task.description().ends_with(" · source unavailable"))
-              .then_some("source unavailable")
-              .or_else(|| source.map(|(_, state, _)| state))
-          })
-          .map(str::to_owned)
-          .unwrap_or_else(|| {
-            if overview {
-              String::new()
-            } else {
-              readiness(task, &by_uuid).label().to_string()
-            }
-          })
+          .or_else(|| (task.description().ends_with(" · source unavailable")).then_some("source unavailable"))
+          .or_else(|| source.map(|(_, state, _)| state))
+          .unwrap_or_default()
+          .to_string()
       } else {
         readiness(task, &by_uuid).label().to_string()
       };
-      if !overview && generated {
-        let readiness = readiness(task, &by_uuid);
-        if !state.is_empty() && state != readiness.label() {
-          state = format!("{} · {state}", readiness.label());
-        }
-      }
       let source_issue = generated
         .then(|| {
           uda_string(task, "view_issue")
@@ -438,6 +424,8 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
             .or_else(|| uda_string(task, "view_key").and_then(|key| key.strip_prefix("issue:")))
         })
         .flatten();
+      let linear_id = source_issue.or_else(|| uda_string(task, "linear_issue_id")).unwrap_or_default();
+      let linear_status = uda_string(task, "linear_status").unwrap_or_default().to_string();
       RowPresentation {
         project: if overview {
           task.project().cloned().unwrap_or_default()
@@ -449,7 +437,8 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
         kind: kind.into(),
         state,
         description: format!("{}{}", if grouped { "  ↳ " } else { "" }, clean_description(task)),
-        linear: source_issue.or_else(|| uda_string(task, "linear_issue_id")).unwrap_or_default().into(),
+        linear: linear_id.to_string(),
+        linear_status,
         mapping: if overview || grouped {
           String::new()
         } else if unresolved {
@@ -633,7 +622,7 @@ mod tests {
     assert_eq!(shown[1].kind, "handoff");
     assert_eq!(shown[2].state, "ready");
     assert_eq!(shown[3].kind, "issue");
-    assert_eq!(shown[3].state, "blocked · Triage");
+    assert_eq!(shown[3].state, "blocked");
     assert_eq!(start_shortcut(&rows[3]), Some(1));
     assert_eq!(rows[3].depends(), Some(&vec![Uuid::from_u128(4)]));
   }
@@ -893,7 +882,7 @@ mod tests {
     assert_eq!(rows[0].state, "source unavailable");
     assert_eq!(rows[0].description, "Active project context");
     assert_eq!(rows[1].kind, "issue");
-    assert_eq!(rows[1].state, "ready · In Review");
+    assert_eq!(rows[1].state, "ready");
     assert_eq!(rows[1].linear, "DEVOPS-123");
     assert_eq!(rows[1].description, "  ↳ Fix report");
     assert_eq!(rows[2].kind, "handoff");
@@ -908,7 +897,7 @@ mod tests {
     view(&mut structured, "view_issue", "DEVOPS-999");
     let rows = presentation(&[structured], &context);
     assert_eq!(rows[0].kind, "task");
-    assert_eq!(rows[0].state, "ready · Triage");
+    assert_eq!(rows[0].state, "ready");
     assert_eq!(rows[0].linear, "DEVOPS-999");
     assert_eq!(rows[0].description, "  ↳ Current clean title");
   }
@@ -930,7 +919,7 @@ mod tests {
       },
     );
     assert_eq!(ids(&arranged), vec![1, 2]);
-    assert_eq!(presentation(&arranged, &context)[1].state, "ready · Triage");
+    assert_eq!(presentation(&arranged, &context)[1].state, "ready");
   }
 
   #[test]
@@ -1096,6 +1085,19 @@ mod tests {
     ]);
     assert_eq!(ids(&rows), vec![1, 2, 3, 4, 5]);
     assert!(descriptions(&rows)[3].starts_with("[ungrouped: admin]"));
+  }
+
+  #[test]
+  fn linear_status_has_its_own_field_and_plain_tasks_stay_unchanged() {
+    let mut issue = task(2, Some("ci"), &["work"]);
+    issue.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-1688".into()));
+    issue.uda_mut().insert("linear_status".into(), UDAValue::Str("Parked".into()));
+    let plain = task(3, Some("ci"), &["work"]);
+    let rows = presentation(&[issue, plain], &[]);
+    assert_eq!(rows[0].linear, "DEVOPS-1688");
+    assert_eq!(rows[0].linear_status, "Parked");
+    assert_eq!(rows[1].linear_status, "");
+    assert_eq!(rows[1].linear, "");
   }
 
   #[test]

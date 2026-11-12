@@ -11,7 +11,7 @@ use kasuari::{
 use ratatui::{
   buffer::Buffer,
   layout::{Constraint, Rect},
-  style::Style,
+  style::{Modifier, Style},
   widgets::{Block, StatefulWidget, Widget},
 };
 use unicode_segmentation::{Graphemes, UnicodeSegmentation};
@@ -195,6 +195,7 @@ pub struct Table<'a, H, R> {
   unmark_highlight_symbol: Option<&'a str>,
   /// Data to display in each row
   rows: R,
+  muted_status_column: Option<usize>,
 }
 
 impl<'a, H, R> Default for Table<'a, H, R>
@@ -218,6 +219,7 @@ where
       mark_highlight_symbol: None,
       unmark_highlight_symbol: None,
       rows: R::default(),
+      muted_status_column: None,
     }
   }
 }
@@ -244,8 +246,14 @@ where
       mark_highlight_symbol: None,
       unmark_highlight_symbol: None,
       rows,
+      muted_status_column: None,
     }
   }
+  pub fn muted_status_column(mut self, column: Option<usize>) -> Self {
+    self.muted_status_column = column;
+    self
+  }
+
   pub fn block(mut self, block: Block<'a>) -> Table<'a, H, R> {
     self.block = Some(block);
     self
@@ -554,7 +562,12 @@ where
               format!("{elt:<width$}", elt = elt, width = *w as usize)
             }
           };
-          buf.set_stringn(x, y + i as u16, s, *w as usize, style);
+          let cell_style = if self.muted_status_column == Some(c) && matches!(s.trim().to_ascii_lowercase().as_str(), "parked" | "backlog") {
+            style.add_modifier(Modifier::DIM)
+          } else {
+            style
+          };
+          buf.set_stringn(x, y + i as u16, s, *w as usize, cell_style);
           x += *w + self.column_spacing;
         }
       }
