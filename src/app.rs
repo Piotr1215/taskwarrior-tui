@@ -1141,25 +1141,17 @@ impl TaskwarriorTui {
       n if n > 0 && self.report == "myprojects" => format!("{workspace} ↑{n} moved up"),
       _ => workspace,
     };
-    let context = if let Some((_, issue, pending)) = &self.sync_status {
-      Line::from(if *pending {
-        format!("Syncing {issue}…")
+    let context = Line::from(vec![
+      Span::from(workspace),
+      Span::from(" "),
+      Span::from("["),
+      Span::from(if self.current_context.is_empty() {
+        "none"
       } else {
-        format!("Synced {issue}")
-      })
-    } else {
-      Line::from(vec![
-        Span::from(workspace),
-        Span::from(" "),
-        Span::from("["),
-        Span::from(if self.current_context.is_empty() {
-          "none"
-        } else {
-          &self.current_context
-        }),
-        Span::from("]"),
-      ])
-    };
+        &self.current_context
+      }),
+      Span::from("]"),
+    ]);
     let tabs = Tabs::new(tab_names)
       .block(navbar_block.clone())
       .select(selected_tab)
@@ -2792,6 +2784,11 @@ impl TaskwarriorTui {
     let mut items: Vec<(String, bool)> = match self.mode {
       Mode::Tasks(_) | Mode::Projects => {
         let projects = self.report == "myprojects";
+        let sync = match &self.sync_status {
+          Some((_, issue, true)) => format!("{} sync [Syncing {issue}…]", key(self.keyconfig.sync_issue)),
+          Some((_, issue, false)) => format!("{} sync [Synced {issue}]", key(self.keyconfig.sync_issue)),
+          None => format!("{} sync", key(self.keyconfig.sync_issue)),
+        };
         let mut items = vec![
           (
             if projects {
@@ -2799,11 +2796,11 @@ impl TaskwarriorTui {
             } else {
               format!("{} report: {}", key(self.keyconfig.report_menu), self.report)
             },
-            true,
+            self.sync_status.is_none(),
           ),
-          (format!("{} act", key(self.keyconfig.start_stop)), true),
+          (format!("{} act", key(self.keyconfig.start_stop)), self.sync_status.is_none()),
           ("b brief".to_string(), false),
-          (format!("{} sync", key(self.keyconfig.sync_issue)), false),
+          (sync, self.sync_status.is_some()),
           (format!("{} {}", key(self.keyconfig.done), if projects { "ack" } else { "done" }), false),
         ];
         if projects {
@@ -7007,9 +7004,13 @@ mod tests {
       for report in ["next", "myprojects"] {
         app.report = report.into();
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        let screen = buffer_view(terminal.backend().buffer());
-        assert!(screen.contains("Syncing DEVOPS-123…"), "{screen}");
-        assert!(screen.contains("S sync"), "{screen}");
+        let buffer = terminal.backend().buffer();
+        let row = if report == "myprojects" { 19 } else { 18 };
+        let footer = (0..width).map(|x| buffer[(x, row)].symbol()).collect::<String>();
+        let title = (0..width).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert!(footer.contains("S sync [Syncing DEVOPS-123…]"), "{footer}");
+        assert!(title.contains(if report == "myprojects" { "project workspace" } else { "next" }));
+        assert!(title.contains("[none]"));
       }
     }
     app.report = "next".into();
@@ -7025,9 +7026,15 @@ mod tests {
     assert!(app.error.is_none(), "{:?}", app.error);
     for width in [80, 160] {
       let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
-      terminal.draw(|frame| app.draw(frame)).unwrap();
-      assert!(buffer_view(terminal.backend().buffer()).contains("Synced DEVOPS-123"));
+      for report in ["next", "myprojects"] {
+        app.report = report.into();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let row = if report == "myprojects" { 19 } else { 18 };
+        let footer = (0..width).map(|x| terminal.backend().buffer()[(x, row)].symbol()).collect::<String>();
+        assert!(footer.contains("S sync [Synced DEVOPS-123]"), "{footer}");
+      }
     }
+    app.report = "next".into();
     app.tasks[app.current_selection]
       .uda_mut()
       .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
@@ -7035,6 +7042,12 @@ mod tests {
     app.keyconfig = KeyConfig::new("uda.taskwarrior-tui.keyconfig.sync-issue Ctrl+s\n").unwrap();
     app.handle_input(KeyCode::Ctrl('s')).await.unwrap();
     assert!(app.sync_status.as_ref().is_some_and(|(_, _, pending)| *pending));
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+      terminal.draw(|frame| app.draw(frame)).unwrap();
+      let footer = (0..width).map(|x| terminal.backend().buffer()[(x, 18)].symbol()).collect::<String>();
+      assert!(footer.contains("^S sync [Syncing DEVOPS-123…]"), "{footer}");
+    }
     app.wait_for_writes();
     assert!(app.error.as_ref().is_some_and(|error| error.contains("Sync issue failed")));
     assert!(app.sync_status.is_none());
