@@ -208,11 +208,7 @@ pub fn action(task: &Task) -> String {
   if is_overview(task) {
     return String::new();
   }
-  let status = |name: &str| {
-    uda_string(task, "linear_status")
-      .or_else(|| uda_string(task, "view_state"))
-      .is_some_and(|status| status.trim().eq_ignore_ascii_case(name))
-  };
+  let status = |name: &str| linear_state(task).is_some_and(|status| status.trim().eq_ignore_ascii_case(name));
   let name = match start_shortcut(task) {
     Some(1) if uda_string(task, "view_key").is_some_and(|key| key.starts_with("ask:")) => "review",
     Some(1) if status("triage") => "triage",
@@ -388,6 +384,12 @@ fn uda_string<'a>(task: &'a Task, name: &str) -> Option<&'a str> {
   }
 }
 
+// A task's Linear workflow state. Mirror rows from the producer carry it in
+// view_state; tasks synced from Linear carry it in linear_status.
+fn linear_state(task: &Task) -> Option<&str> {
+  uda_string(task, "linear_status").or_else(|| (generated(task) && !is_overview(task)).then(|| uda_string(task, "view_state")).flatten())
+}
+
 fn generated(task: &Task) -> bool {
   has_tag(task, "view")
     && !has_tag(task, "piotr")
@@ -503,9 +505,8 @@ pub fn arrange(tasks: Vec<Task>, options: &ViewOptions) -> Vec<Task> {
       .then_with(|| a_project.to_lowercase().cmp(&b_project.to_lowercase()))
       .then_with(|| a.uuid().cmp(b.uuid()))
   });
-  let hidden_status = |task: &Task| {
-    uda_string(task, "linear_status").is_some_and(|status| options.hide_statuses.iter().any(|hide| hide.eq_ignore_ascii_case(status.trim())))
-  };
+  let hidden_status =
+    |task: &Task| linear_state(task).is_some_and(|status| options.hide_statuses.iter().any(|hide| hide.eq_ignore_ascii_case(status.trim())));
   let keep =
     |task: &Task| (!options.ready_only || states[task.uuid()].ready()) && (!options.handoffs_only || has_tag(task, "piotr")) && !hidden_status(task);
   let mut result = Vec::new();
@@ -585,7 +586,7 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
         })
         .flatten();
       let linear_id = source_issue.or_else(|| uda_string(task, "linear_issue_id")).unwrap_or_default();
-      let linear_status = uda_string(task, "linear_status").unwrap_or_default().to_string();
+      let linear_status = linear_state(task).unwrap_or_default().to_string();
       RowPresentation {
         project: if overview {
           task.project().cloned().unwrap_or_default()
@@ -919,7 +920,7 @@ mod tests {
   fn report_filters_hide_rows_and_projects() {
     let mut triage = task(11, Some("ci"), &["view"]);
     view(&mut triage, "view_key", "issue:CI-1");
-    view(&mut triage, "linear_status", "triage");
+    view(&mut triage, "view_state", "triage");
     let mut started = task(12, Some("ci"), &["work"]);
     view(&mut started, "linear_status", "In Progress");
     let mut blocked = task(21, Some("docs"), &["work"]);
@@ -948,6 +949,13 @@ mod tests {
       ids(&todo),
       vec![1, 12, 2, 21, 3, 4, 41],
       "Triage and Backlog rows hide, whatever the case"
+    );
+    let shown = presentation(&arrange(context.clone(), &ViewOptions::default()), &context);
+    assert_eq!(shown[1].linear_status, "triage", "a mirror row's view_state is its Linear status");
+    assert_eq!(shown[2].linear_status, "In Progress");
+    assert_eq!(
+      shown[0].linear_status, "",
+      "a header's view_state is the project state, shown under State"
     );
 
     let active = arrange(context.clone(), &builtin("active"));
