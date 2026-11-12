@@ -113,6 +113,33 @@ uda.taskwarrior-tui.projects.report.handoffs.handoffs-only=yes
 uda.taskwarrior-tui.projects.report.overview.collapsed=yes
 ```
 
+### Daily workflow
+
+Use Projects to choose and run the next action with its project context in
+view. From Tasks, press `]` to open Projects and `[` to return with the Tasks
+filter and selection preserved. You can also press `r` and select `myprojects`.
+
+1. In the morning, spend three minutes choosing an outcome. Press `O` to show
+   project headers, select a project and press `b` or `s` to read its overview.
+   Press `O` to expand the rows, then `Ctrl+O` to focus on that project.
+2. To start work, read a row's Action column and press `b` for its brief.
+   Press `s` to run its action: open a source, start work or open a prepared
+   handoff. Press `d` after the work is complete or the handoff is acknowledged.
+   If configured, `Ctrl+G` gives the assistant the selected context for the
+   next action.
+3. After an interruption, press `R` until the footer shows `handoffs`. Review
+   one waiting action, then cycle back to `next`. The report order is
+   configurable, so the number of presses can vary.
+4. At the end of work or a session, revisit the project header's overview and
+   choose the next concrete row. A project header is not a completed action.
+
+The built-in `todo` report hides Triage, Backlog and Parked rows. `ready` shows
+rows whose task prerequisites are met. `active` hides projects without visible
+children. Press `Ctrl+O` or `Esc` to leave project zoom.
+
+Keys `0` through `9` run configured shortcuts. Older instructions that use
+number keys to sort Projects are obsolete.
+
 See the documentation for more information:
 
 - <https://kdheepak.com/taskwarrior-tui/configuration/keys>
