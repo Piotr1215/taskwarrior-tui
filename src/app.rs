@@ -61,6 +61,7 @@ use crate::{
 };
 
 const MAX_LINE: usize = 4096;
+const SYNC_CONFIRMATION_DURATION: Duration = Duration::from_secs(3);
 
 use crate::project_tree::{has_tag, is_overview};
 
@@ -191,6 +192,7 @@ enum Step {
   Event(Event<KeyCode>),
   Job(JobResult),
   Hangup,
+  SyncTimeout,
 }
 
 // Closing the terminal sends SIGHUP to the TUI's process group, which would
@@ -389,7 +391,8 @@ pub struct TaskwarriorTui {
   last_write_seq: u64,
   export_in_flight: Option<u64>,
   report_export_floor: u64,
-  sync_status: Option<(u64, String, bool)>,
+  // A pending sync has no deadline; a successful one has a short-lived confirmation.
+  sync_status: Option<(u64, String, Option<Instant>)>,
   project_filter_before: Option<String>,
   refresh_again: bool,
   // Rows removed before their write ran, keyed to the write's queue position.
@@ -726,19 +729,33 @@ impl TaskwarriorTui {
         self.requires_redraw = false;
       }
       terminal.draw(|f| self.draw(f))?;
+      let sync_deadline = self.sync_status.as_ref().and_then(|(_, _, deadline)| *deadline);
+      let timeout = async {
+        match sync_deadline {
+          Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+          None => std::future::pending().await,
+        }
+      };
+      tokio::pin!(timeout);
       let step = match self.worker.as_mut() {
         Some(worker) => tokio::select! {
           event = self.event_loop.rx.recv() => event.map(Step::Event),
           Some(result) = worker.results.recv() => Some(Step::Job(result)),
           () = hangup.recv() => Some(Step::Hangup),
+          () = &mut timeout => Some(Step::SyncTimeout),
         },
-        None => self.event_loop.rx.recv().await.map(Step::Event),
+        None => tokio::select! {
+          event = self.event_loop.rx.recv() => event.map(Step::Event),
+          () = &mut timeout => Some(Step::SyncTimeout),
+        },
       };
       if let Some(Step::Hangup) = step {
         debug!("Hangup, exiting");
         break;
       } else if let Some(Step::Job(result)) = step {
         self.handle_job_result(result).await?;
+      } else if let Some(Step::SyncTimeout) = step {
+        self.expire_sync(Instant::now());
       } else if let Some(Step::Event(event)) = step {
         match event {
           Event::Input(input) => {
@@ -856,12 +873,22 @@ impl TaskwarriorTui {
   fn finish_sync(&mut self, seq: u64, label: &str, success: bool) {
     if label == "Sync issue" && self.sync_status.as_ref().is_some_and(|(current, _, _)| *current == seq) {
       if success {
-        if let Some((_, _, pending)) = self.sync_status.as_mut() {
-          *pending = false;
+        if let Some((_, _, deadline)) = self.sync_status.as_mut() {
+          *deadline = Some(Instant::now() + SYNC_CONFIRMATION_DURATION);
         }
       } else {
         self.sync_status = None;
       }
+    }
+  }
+
+  fn expire_sync(&mut self, now: Instant) {
+    if self
+      .sync_status
+      .as_ref()
+      .is_some_and(|(_, _, deadline)| deadline.is_some_and(|deadline| now >= deadline))
+    {
+      self.sync_status = None;
     }
   }
 
@@ -1432,7 +1459,7 @@ impl TaskwarriorTui {
         self.error = None;
         if self.report == "myprojects" {
           f.render_widget(
-            Paragraph::new(self.shortcut_legend(rects[1].width)).style(self.config.uda_style_command),
+            Paragraph::new(self.shortcut_legend_line(rects[1].width)).style(self.config.uda_style_command),
             rects[1],
           );
           return;
@@ -2785,8 +2812,8 @@ impl TaskwarriorTui {
       Mode::Tasks(_) | Mode::Projects => {
         let projects = self.report == "myprojects";
         let sync = match &self.sync_status {
-          Some((_, issue, true)) => format!("{} sync [Syncing {issue}…]", key(self.keyconfig.sync_issue)),
-          Some((_, issue, false)) => format!("{} sync [Synced {issue}]", key(self.keyconfig.sync_issue)),
+          Some((_, issue, None)) => format!("{} sync [Syncing {issue}…]", key(self.keyconfig.sync_issue)),
+          Some((_, issue, Some(_))) => format!("{} sync [Synced {issue}]", key(self.keyconfig.sync_issue)),
           None => format!("{} sync", key(self.keyconfig.sync_issue)),
         };
         let mut items = vec![
@@ -2879,9 +2906,24 @@ impl TaskwarriorTui {
     items.into_iter().map(|(item, _)| item).collect::<Vec<_>>().join("  ")
   }
 
+  fn shortcut_legend_line(&self, width: u16) -> Line<'static> {
+    let legend = self.shortcut_legend(width);
+    if let Some((_, issue, Some(_))) = &self.sync_status {
+      let confirmation = format!("[Synced {issue}]");
+      if let Some((before, after)) = legend.split_once(&confirmation) {
+        return Line::from(vec![
+          Span::raw(before.to_string()),
+          Span::styled(confirmation, Style::default().add_modifier(Modifier::SLOW_BLINK)),
+          Span::raw(after.to_string()),
+        ]);
+      }
+    }
+    Line::raw(legend)
+  }
+
   fn draw_shortcut_footer(&self, f: &mut Frame, rect: Rect) {
     f.render_widget(
-      Paragraph::new(self.shortcut_legend(rect.width)).style(self.config.uda_style_command),
+      Paragraph::new(self.shortcut_legend_line(rect.width)).style(self.config.uda_style_command),
       rect,
     );
   }
@@ -3735,7 +3777,7 @@ impl TaskwarriorTui {
         _ => None,
       })
       .unwrap_or_else(|| task.uuid().to_string());
-    self.sync_status = Some((self.job_seq + 1, issue, true));
+    self.sync_status = Some((self.job_seq + 1, issue, None));
     self.queue_write(TaskWrite::new("Sync issue", true, Select::Nothing, (command, None)), &[]);
     Ok(())
   }
@@ -6333,6 +6375,7 @@ mod tests {
     test_selection_signal_and_handoff_navigation().await;
     test_handoff_key_preserves_configured_action().await;
     test_sync_issue_background().await;
+    test_sync_confirmation_expires().await;
     test_handoff_start_stop_dispatch().await;
     test_grouped_handoffs_and_dispatch().await;
     test_project_tab_restores_task_report().await;
@@ -6975,7 +7018,7 @@ mod tests {
     app.finish_sync(latest.0, "Other write", true);
     assert_eq!(app.sync_status.as_ref(), Some(&latest));
     app.finish_sync(latest.0, "Sync issue", true);
-    assert_eq!(app.sync_status, Some((latest.0, "DEVOPS-123".into(), false)));
+    assert!(matches!(&app.sync_status, Some((seq, issue, Some(_))) if *seq == latest.0 && issue == "DEVOPS-123"));
     app.tasks[0].uda_mut().insert("view_kind".into(), UDAValue::Str("project".into()));
     assert!(app.task_sync_issue().is_err());
   }
@@ -7041,7 +7084,7 @@ mod tests {
     app.config.uda_sync_issue_command = "/bin/false".into();
     app.keyconfig = KeyConfig::new("uda.taskwarrior-tui.keyconfig.sync-issue Ctrl+s\n").unwrap();
     app.handle_input(KeyCode::Ctrl('s')).await.unwrap();
-    assert!(app.sync_status.as_ref().is_some_and(|(_, _, pending)| *pending));
+    assert!(app.sync_status.as_ref().is_some_and(|(_, _, deadline)| deadline.is_none()));
     for width in [80, 160] {
       let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
       terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -7053,6 +7096,49 @@ mod tests {
     assert!(app.sync_status.is_none());
     assert_eq!(app.mode, Mode::Tasks(Action::Error));
     std::fs::remove_dir_all(dir).unwrap();
+  }
+
+  async fn test_sync_confirmation_expires() {
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    let now = Instant::now();
+
+    // An arbitrarily long running helper remains visible, and an older write
+    // cannot complete or expire the newly selected issue.
+    app.sync_status = Some((2, "DEMO-2".into(), None));
+    app.expire_sync(now + Duration::from_secs(60));
+    app.finish_sync(1, "Sync issue", true);
+    app.finish_sync(2, "Other write", true);
+    assert_eq!(app.sync_status, Some((2, "DEMO-2".into(), None)));
+    app.finish_sync(2, "Sync issue", true);
+    let deadline = app.sync_status.as_ref().unwrap().2.unwrap();
+    assert!(deadline >= now + SYNC_CONFIRMATION_DURATION);
+
+    for width in [80, 160] {
+      for report in ["next", "myprojects"] {
+        app.report = report.into();
+        app.sync_status = None;
+        let normal = app.shortcut_legend(width);
+        app.sync_status = Some((2, "DEMO-2".into(), Some(deadline)));
+        app.expire_sync(deadline - Duration::from_millis(1));
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let row = if report == "myprojects" { 19 } else { 18 };
+        let buffer = terminal.backend().buffer();
+        let footer = (0..width).map(|x| buffer[(x, row)].symbol()).collect::<String>();
+        let confirmation = footer.find("[Synced DEMO-2]").unwrap();
+        assert!(buffer[(confirmation as u16, row)].modifier.contains(Modifier::SLOW_BLINK));
+        assert!(!buffer[(0, row)].modifier.contains(Modifier::SLOW_BLINK));
+        app.expire_sync(deadline);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let footer = (0..width).map(|x| terminal.backend().buffer()[(x, row)].symbol()).collect::<String>();
+        assert_eq!(footer.trim_end(), normal);
+      }
+    }
+
+    app.sync_status = Some((3, "DEMO-3".into(), None));
+    app.finish_sync(2, "Sync issue", true);
+    app.expire_sync(deadline + Duration::from_secs(1));
+    assert_eq!(app.sync_status, Some((3, "DEMO-3".into(), None)));
   }
 
   async fn test_handoff_start_stop_dispatch() {
