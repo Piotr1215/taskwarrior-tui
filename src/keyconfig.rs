@@ -11,6 +11,7 @@ pub struct KeyConfig {
   pub quit: KeyCode,
   pub refresh: KeyCode,
   pub gordon: KeyCode,
+  pub sync_issue: KeyCode,
   pub go_to_bottom: KeyCode,
   pub go_to_top: KeyCode,
   pub down: KeyCode,
@@ -62,6 +63,7 @@ impl Default for KeyConfig {
       quit: KeyCode::Char('q'),
       refresh: KeyCode::Ctrl('r'),
       gordon: KeyCode::Ctrl('g'),
+      sync_issue: KeyCode::Char('S'),
       go_to_bottom: KeyCode::Char('G'),
       go_to_top: KeyCode::Char('g'),
       down: KeyCode::Char('j'),
@@ -120,6 +122,7 @@ impl KeyConfig {
     let quit = Self::get_config("uda.taskwarrior-tui.keyconfig.quit", data);
     let refresh = Self::get_config("uda.taskwarrior-tui.keyconfig.refresh", data);
     let gordon = Self::get_config("uda.taskwarrior-tui.keyconfig.gordon", data);
+    let sync_issue = Self::get_config("uda.taskwarrior-tui.keyconfig.sync-issue", data);
     let go_to_bottom = Self::get_config("uda.taskwarrior-tui.keyconfig.go-to-bottom", data);
     let go_to_top = Self::get_config("uda.taskwarrior-tui.keyconfig.go-to-top", data);
     let down = Self::get_config("uda.taskwarrior-tui.keyconfig.down", data);
@@ -162,6 +165,7 @@ impl KeyConfig {
     self.quit = quit.unwrap_or(self.quit);
     self.refresh = refresh.unwrap_or(self.refresh);
     self.gordon = gordon.unwrap_or(self.gordon);
+    self.sync_issue = sync_issue.unwrap_or(self.sync_issue);
     self.go_to_bottom = go_to_bottom.unwrap_or(self.go_to_bottom);
     self.go_to_top = go_to_top.unwrap_or(self.go_to_top);
     self.down = down.unwrap_or(self.down);
@@ -209,6 +213,7 @@ impl KeyConfig {
       &self.quit,
       &self.refresh,
       &self.gordon,
+      &self.sync_issue,
       &self.go_to_bottom,
       &self.go_to_top,
       &self.down,
@@ -239,6 +244,9 @@ impl KeyConfig {
       &self.next_tab,
       &self.previous_tab,
     ];
+    if elements.iter().filter(|key| ***key == self.sync_issue).count() != 1 {
+      return Err(anyhow!("Duplicate keys found in key config"));
+    }
     let l = elements.len();
     elements.dedup();
     if l == elements.len() {
@@ -296,6 +304,12 @@ mod tests {
 
   #[test]
   fn gordon_key_defaults_to_ctrl_g_and_accepts_custom_character() {
+    assert_eq!(KeyConfig::new("").unwrap().sync_issue, KeyCode::Char('S'));
+    assert_eq!(
+      KeyConfig::new("uda.taskwarrior-tui.keyconfig.sync-issue Q\n").unwrap().sync_issue,
+      KeyCode::Char('Q')
+    );
+    assert!(KeyConfig::new("uda.taskwarrior-tui.keyconfig.sync-issue j\n").is_err());
     assert_eq!(KeyConfig::new("").unwrap().gordon, KeyCode::Ctrl('g'));
     assert_eq!(
       KeyConfig::new("uda.taskwarrior-tui.keyconfig.gordon Q\n").unwrap().gordon,

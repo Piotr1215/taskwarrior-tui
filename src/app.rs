@@ -2764,6 +2764,7 @@ impl TaskwarriorTui {
       (format!("R report: {}", self.project_report), true),
       (format!("{} act", key(self.keyconfig.start_stop)), true),
       ("b brief".to_string(), false),
+      (format!("{} sync", key(self.keyconfig.sync_issue)), false),
       (format!("{} ack", key(self.keyconfig.done)), false),
       ("^O zoom".to_string(), false),
       ("O collapse".to_string(), false),
@@ -3616,6 +3617,30 @@ impl TaskwarriorTui {
     Ok(command)
   }
 
+  fn task_sync_issue(&mut self) -> Result<(), String> {
+    let task = self.task_current().ok_or_else(|| "Select a task to sync.".to_string())?;
+    let nonempty = |name: &str| matches!(task.uda().get(name), Some(UDAValue::Str(value)) if !value.trim().is_empty());
+    let source_issue = has_tag(&task, "view")
+      && (nonempty("view_issue")
+        || matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.strip_prefix("issue:").is_some_and(|id| !id.trim().is_empty())));
+    let explicit_header = matches!(task.uda().get("view_kind"), Some(UDAValue::Str(kind)) if kind == "project")
+      || matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.starts_with("standing:") || key.starts_with("local:"));
+    if explicit_header || (is_overview(&task) && !source_issue) {
+      return Err("Project headers cannot be synced as issues.".into());
+    }
+    if !nonempty("linear_issue_id") && !source_issue {
+      return Err("Selected task has no linked Linear issue.".into());
+    }
+    let args = shlex::split(&self.config.uda_sync_issue_command)
+      .filter(|args| !args.is_empty())
+      .ok_or_else(|| "Configure uda.taskwarrior-tui.sync-issue.command with a valid command first.".to_string())?;
+    let program = shellexpand::tilde(&args[0]);
+    let mut command = std::process::Command::new(program.as_ref());
+    command.args(&args[1..]).arg(task.uuid().to_string()).stdin(std::process::Stdio::null());
+    self.queue_write(TaskWrite::new("Sync issue", true, Select::Nothing, (command, None)), &[]);
+    Ok(())
+  }
+
   fn task_send_gordon(&mut self) -> Result<(), String> {
     let command = self.gordon_command()?;
     self.queue_write(TaskWrite::new("Gordon", true, Select::Nothing, (command, None)), &[]);
@@ -4168,6 +4193,7 @@ impl TaskwarriorTui {
             self.keyconfig.previous_tab,
             self.keyconfig.help,
             self.keyconfig.refresh,
+            self.keyconfig.sync_issue,
           ];
           if !allowed.contains(&input) {
             return Ok(());
@@ -4260,11 +4286,6 @@ impl TaskwarriorTui {
             && let Some(command) = self.brief_focus_command()
           {
             self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
-          }
-          if input == KeyCode::Char('S')
-            && let Some(command) = self.handoff_navigation_command()
-          {
-            self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
           }
           if input == KeyCode::Esc {
             self.marked.clear();
@@ -4467,6 +4488,14 @@ impl TaskwarriorTui {
           } else if input == self.keyconfig.project_filter {
             if self.toggle_project_filter() {
               self.update(true).await?;
+            }
+          } else if input == self.keyconfig.sync_issue {
+            match self.task_sync_issue() {
+              Ok(()) => self.update(true).await?,
+              Err(error) => {
+                self.error = Some(error);
+                self.mode = Mode::Tasks(Action::Error);
+              }
             }
           } else if input == self.keyconfig.gordon {
             if let Err(error) = self.task_send_gordon() {
@@ -6203,6 +6232,7 @@ mod tests {
     test_gordon_keeps_the_terminal_and_sends_only_current_task().await;
     test_selection_signal_and_handoff_navigation().await;
     test_handoff_key_preserves_configured_action().await;
+    test_sync_issue_background().await;
     test_handoff_start_stop_dispatch().await;
     test_grouped_handoffs_and_dispatch().await;
     test_project_tab_restores_task_report().await;
@@ -6745,47 +6775,74 @@ mod tests {
 
   async fn test_handoff_key_preserves_configured_action() {
     let mut app = TaskwarriorTui::new("next", false).await.unwrap();
-    assert!(app.tasks.len() >= 2);
     let (jobs, queue) = std::sync::mpsc::channel();
-    let (_results_sender, results) = tokio::sync::mpsc::unbounded_channel();
+    let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
     app.worker = Some(Worker { jobs, results });
     app.current_selection = 0;
-    app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
+    app.tasks[0]
+      .uda_mut()
+      .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    assert!(app.task_sync_issue().is_err());
+    app.config.uda_sync_issue_command = "~/sync --task".into();
     let uuid = *app.tasks[0].uuid();
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 0);
-    assert!(queue.try_recv().is_err());
-
-    add_tag(&mut app.tasks[0], "piotr".to_string());
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 0);
+    app.marked.insert(*app.tasks[1].uuid());
+    app.task_sync_issue().unwrap();
     let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected handoff write")
-    };
-    assert_eq!(write.label, "Handoff");
-    assert_eq!(
-      write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-      vec![uuid.to_string()]
-    );
-    assert!(queue.try_recv().is_err());
-
-    app.keyconfig.down = KeyCode::Char('S');
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 1);
-    let (_, Job::Write(write)) = queue.try_recv().unwrap() else {
-      panic!("expected handoff write")
+      panic!("expected sync write")
     };
     assert_eq!(
       write.cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-      vec![uuid.to_string()]
+      vec!["--task", &uuid.to_string()]
     );
-    assert!(queue.try_recv().is_err());
+    app.tasks[0].uda_mut().remove("linear_issue_id");
+    assert!(app.task_sync_issue().is_err());
+    add_tag(&mut app.tasks[0], "view".into());
+    app.tasks[0].uda_mut().insert("view_key".into(), UDAValue::Str("issue:DEVOPS-123".into()));
+    assert!(app.task_sync_issue().is_ok());
+    app.tasks[0].uda_mut().remove("view_key");
+    app.tasks[0].uda_mut().insert("view_issue".into(), UDAValue::Str("DEVOPS-123".into()));
+    assert!(app.task_sync_issue().is_ok());
+    app.tasks[0].uda_mut().insert("view_kind".into(), UDAValue::Str("project".into()));
+    assert!(app.task_sync_issue().is_err());
+  }
 
-    app.current_selection = 0;
-    app.tasks[0].tags_mut().as_mut().map(|tags| tags.retain(|tag| tag != "piotr"));
+  async fn test_sync_issue_background() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("tui-sync-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("sync helper");
+    let log = dir.join("args");
+    std::fs::write(&script, format!("#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$@\" > '{}'\n", log.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = TaskwarriorTui::new("next", false).await.unwrap();
+    app.worker = Some(Worker::spawn());
+    let uuid = *app.tasks[0].uuid();
+    app.tasks[0]
+      .uda_mut()
+      .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    app.config.uda_sync_issue_command = format!("'{}' --task", script.display());
+    let start = Instant::now();
     app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.current_selection, 1);
-    assert!(queue.try_recv().is_err());
+    assert!(start.elapsed() < Duration::from_millis(500));
+    assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    for _ in 0..2 {
+      let result = tokio::time::timeout(Duration::from_secs(30), app.worker.as_mut().unwrap().results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+      app.handle_job_result(result).await.unwrap();
+    }
+    assert_eq!(app.task_current().unwrap().uuid(), &uuid);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("--task\n{uuid}\n"));
+    assert!(app.error.is_none(), "{:?}", app.error);
+    app.tasks[app.current_selection]
+      .uda_mut()
+      .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
+    app.config.uda_sync_issue_command = "/bin/false".into();
+    app.task_sync_issue().unwrap();
+    app.wait_for_writes();
+    assert!(app.error.as_ref().is_some_and(|error| error.contains("Sync issue failed")));
+    std::fs::remove_dir_all(dir).unwrap();
   }
 
   async fn test_handoff_start_stop_dispatch() {
@@ -7147,6 +7204,7 @@ mod tests {
           "R report: next",
           "s act",
           "b brief",
+          "S sync",
           "x ack",
           "^O zoom",
           "O collapse",
@@ -7160,7 +7218,7 @@ mod tests {
         assert!(legend.width() <= usize::from(width));
         if width == 250 {
           assert_eq!(
-            footer, "R report: next  s act  b brief  x ack  ^O zoom  O collapse  / filter  0 jump  3 brief  6 ack+comment",
+            footer, "R report: next  s act  b brief  S sync  x ack  ^O zoom  O collapse  / filter  0 jump  3 brief  6 ack+comment",
             "a handoff row lists the handoffs digits"
           );
         }
@@ -7712,8 +7770,6 @@ mod tests {
       .as_mut()
       .map(|tags| tags.retain(|tag| tag != "piotr"));
     assert!(app.handoff_navigation_command().is_none());
-    app.handle_input(KeyCode::Char('S')).await.unwrap();
-    assert_eq!(app.mode, Mode::Tasks(Action::Report));
     add_tag(&mut app.tasks[app.current_selection], "piotr".to_string());
     let command = app.handoff_navigation_command().unwrap();
     assert!(
