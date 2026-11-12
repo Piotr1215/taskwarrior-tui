@@ -69,8 +69,31 @@ If you are compiling from source, you'll need the most recent stable rust compil
 
 In text fields, Backspace deletes the previous character and Alt+k deletes from
 the cursor to the end of the line. Ctrl+h, Ctrl+j, Ctrl+k and Ctrl+l are reserved
-for terminal pane navigation. In Projects, Ctrl+o zooms into a project and
-O toggles the header-only view.
+for terminal pane navigation. In Projects, Ctrl+o zooms into a project,
+O toggles the header-only view and R moves to the next Projects report.
+Number keys run the configured shortcuts there as in any other report.
+
+Projects reports are named view settings, the way Taskwarrior reports name a
+filter and sort. They change only what the Projects view shows. The built-ins
+are `next` (the default), `todo`, `active`, `handoffs`, `ready`, `due`, `prio`,
+`newest` and `oldest`. Change one or add your own in `.taskrc`:
+
+```.taskrc
+# Cycle order for R; without it, the built-ins come first.
+uda.taskwarrior-tui.projects.reports=next,todo,active,handoffs
+# next (rank, then prerequisites), due, prio, newest, oldest or title
+uda.taskwarrior-tui.projects.report.todo.sort=next
+# Linear states whose rows the report hides
+uda.taskwarrior-tui.projects.report.todo.hide-status=Triage,Backlog,Parked
+# Hide projects left with no rows, projects that exist only in Taskwarrior
+uda.taskwarrior-tui.projects.report.active.hide-empty=yes
+uda.taskwarrior-tui.projects.report.active.hide-local=no
+# Show only dependency-ready rows, or only handoffs
+uda.taskwarrior-tui.projects.report.ready.ready-only=yes
+uda.taskwarrior-tui.projects.report.handoffs.handoffs-only=yes
+# Start the report with only project headers shown
+uda.taskwarrior-tui.projects.report.overview.collapsed=yes
+```
 
 See the documentation for more information:
 
