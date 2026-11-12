@@ -6,7 +6,7 @@ use ratatui::{
   symbols::{bar::FULL, line::DOUBLE_VERTICAL},
 };
 
-trait TaskWarriorBool {
+pub(crate) trait TaskWarriorBool {
   fn get_bool(&self) -> Option<bool>;
 }
 
@@ -135,6 +135,7 @@ pub struct Config {
   pub uda_shortcuts: Vec<String>,
   pub uda_shortcuts_background: Vec<usize>,
   pub uda_legends: HashMap<String, String>,
+  pub uda_project_reports: Vec<crate::project_tree::Report>,
   pub uda_report_contexts: HashMap<String, String>,
   pub uda_report_show_info: HashMap<String, bool>,
   pub uda_change_focus_rotate: bool,
@@ -312,6 +313,7 @@ impl Config {
       uda_shortcuts,
       uda_shortcuts_background,
       uda_legends: Self::get_uda_legends(data),
+      uda_project_reports: Self::get_project_reports(data),
       uda_report_contexts: Self::get_report_options(data, "context"),
       uda_report_show_info: Self::get_report_options(data, "show-info")
         .into_iter()
@@ -369,6 +371,22 @@ impl Config {
         Some((report.to_string(), text))
       })
       .collect()
+  }
+
+  // Projects view reports: uda.taskwarrior-tui.projects.report.<name>.<setting>.
+  pub(crate) fn get_project_reports(data: &str) -> Vec<crate::project_tree::Report> {
+    let mut defined: Vec<String> = Vec::new();
+    for line in data.lines() {
+      if let Some(name) = line
+        .strip_prefix(crate::project_tree::REPORT_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(name, _)| name.to_string())
+        .filter(|name| !defined.contains(name))
+      {
+        defined.push(name);
+      }
+    }
+    crate::project_tree::reports(|key| Self::get_config(key, data), &defined)
   }
 
   pub fn legend(&self, report: &str) -> &str {

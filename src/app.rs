@@ -396,6 +396,8 @@ pub struct TaskwarriorTui {
   tasks_tab: Option<ReportView>,
   projects_tab: Option<ReportView>,
   project_options: crate::project_tree::ViewOptions,
+  // Name of the active Projects report; R moves to the next configured one.
+  project_report: String,
   project_input: Vec<Task>,
   project_zoom: Option<(crate::project_tree::ProjectGroup, Option<Uuid>)>,
   project_collapsed: bool,
@@ -592,6 +594,7 @@ impl TaskwarriorTui {
       tasks_tab: None,
       projects_tab: None,
       project_options: crate::project_tree::ViewOptions::default(),
+      project_report: String::new(),
       project_input: Vec::new(),
       project_zoom: None,
       project_collapsed: false,
@@ -604,6 +607,7 @@ impl TaskwarriorTui {
     }
 
     app.task_report_table.date_time_vague_precise = app.config.uda_task_report_date_time_vague_more_precise;
+    app.apply_project_report(0);
 
     app.update(true).await?;
 
@@ -2317,41 +2321,34 @@ impl TaskwarriorTui {
         &self.project_input
       };
       let presentation = crate::project_tree::presentation(&self.tasks, context);
-      let show_mapping = presentation.iter().any(|row| !row.mapping.is_empty());
-      let mut labels = vec!["ID", "Project", "Type", "State", "Action / current update", "Lin", "Status", "Due"];
-      let mut columns = vec![
+      let labels = vec!["ID", "Project", "Type", "State", "Action", "Description", "Lin", "Status", "Due"];
+      let columns = vec![
         "id",
         "project",
         "view_kind",
         "view_state",
+        "view_action",
         "description",
         "linear_issue_id",
         "linear_status",
         "due.relative",
       ];
-      if show_mapping {
-        labels.insert(4, "Mapping");
-        columns.insert(4, "view_mapping");
-      }
       let mut rows: Vec<Vec<String>> = self
         .tasks
         .iter()
         .zip(presentation)
         .map(|(task, row)| {
-          let mut cells = vec![
+          vec![
             task.id().map(|id| id.to_string()).unwrap_or_default(),
             row.project,
             row.kind,
             row.state,
+            row.action,
             utils::display_control_chars(&row.description),
             row.linear,
             row.linear_status,
             self.task_report_table.get_string_attribute("due.relative", task, &self.tasks),
-          ];
-          if show_mapping {
-            cells.insert(4, row.mapping);
-          }
-          cells
+          ]
         })
         .collect();
       if self.project_unsorted_count > 0 {
@@ -2727,42 +2724,38 @@ impl TaskwarriorTui {
     self.update(true).await
   }
 
+  // Number keys run the same shortcuts as in every report, so the footer lists
+  // the selected row's digit legend: a handoff's from legend.handoffs, any other
+  // row's from legend.default. Optional items drop from the end when narrow.
   fn project_legend(&self, width: u16) -> String {
-    use crate::project_tree::Sort;
-    let sort = match self.project_options.sort {
-      Sort::Execution => "next",
-      Sort::Due => "due",
-      Sort::Priority => "priority",
-      Sort::Newest => "newest",
-      Sort::Oldest => "oldest",
-      Sort::Title => "title",
-    };
-    let toggle = |enabled| if enabled { "on" } else { "off" };
     let key = |code: KeyCode| match code {
       KeyCode::Char(c) => c.to_string(),
       KeyCode::Ctrl(c) => format!("^{}", c.to_ascii_uppercase()),
       other => format!("{other:?}"),
     };
-    // Retain the mode, both filters and the primary action before optional controls.
     let mut items = vec![
-      (format!("[{sort}]"), true),
-      ("1 next".to_string(), false),
-      ("2 due".to_string(), false),
-      ("3 priority".to_string(), false),
-      ("4 newest".to_string(), false),
-      ("5 oldest".to_string(), false),
-      ("6 title".to_string(), false),
-      (format!("7 ready [{}]", toggle(self.project_options.ready_only)), true),
-      (format!("8 handoffs [{}]", toggle(self.project_options.handoffs_only)), true),
-      ("9 reset".to_string(), false),
-      ("^O zoom".to_string(), false),
-      ("O collapse".to_string(), false),
+      (format!("R report: {}", self.project_report), true),
       (format!("{} act", key(self.keyconfig.start_stop)), true),
       ("b brief".to_string(), false),
       (format!("{} ack", key(self.keyconfig.done)), false),
-      (format!("{} reports", key(self.keyconfig.report_menu)), false),
+      ("^O zoom".to_string(), false),
+      ("O collapse".to_string(), false),
       (format!("{} filter", key(self.keyconfig.filter)), false),
     ];
+    let handoff = self.task_current().is_some_and(|task| has_tag(&task, "piotr"));
+    let legend = if handoff {
+      self.config.legend("handoffs")
+    } else {
+      self.config.uda_legends.get("default").map(String::as_str).unwrap_or_default()
+    };
+    items.extend(
+      legend
+        .split("  ")
+        .flat_map(|item| item.split('|'))
+        .map(str::trim)
+        .filter(|item| item.starts_with(|c: char| c.is_ascii_digit()))
+        .map(|item| (item.to_string(), false)),
+    );
     let width = usize::from(width);
     while items.iter().map(|(item, _)| item.width()).sum::<usize>() + 2 * items.len().saturating_sub(1) > width {
       if let Some(index) = items.iter().rposition(|(_, required)| !required) {
@@ -2779,7 +2772,6 @@ impl TaskwarriorTui {
   }
 
   fn project_control(&mut self, key: KeyCode) -> bool {
-    use crate::project_tree::{Sort, ViewOptions};
     if self.report != "myprojects" {
       return false;
     }
@@ -2818,54 +2810,27 @@ impl TaskwarriorTui {
         }
         selected
       }
-      KeyCode::Char('1') => {
-        self.project_options.sort = Sort::Execution;
-        selected
-      }
-      KeyCode::Char('2') => {
-        self.project_options.sort = Sort::Due;
-        selected
-      }
-      KeyCode::Char('3') => {
-        self.project_options.sort = Sort::Priority;
-        selected
-      }
-      KeyCode::Char('4') => {
-        self.project_options.sort = Sort::Newest;
-        selected
-      }
-      KeyCode::Char('5') => {
-        self.project_options.sort = Sort::Oldest;
-        selected
-      }
-      KeyCode::Char('6') => {
-        self.project_options.sort = Sort::Title;
-        selected
-      }
-      KeyCode::Char('7') => {
-        self.project_options.ready_only = !self.project_options.ready_only;
-        selected
-      }
-      KeyCode::Char('8') => {
-        self.project_options.handoffs_only = !self.project_options.handoffs_only;
-        selected
-      }
-      KeyCode::Char('9') => {
-        self.project_options = ViewOptions::default();
+      KeyCode::Char('R') => {
+        let reports = &self.config.uda_project_reports;
+        let next = reports
+          .iter()
+          .position(|report| report.name == self.project_report)
+          .map_or(0, |index| (index + 1) % reports.len().max(1));
+        if self.apply_project_report(next) && self.project_collapsed && self.project_zoom.is_none() {
+          match selected_group {
+            Some(crate::project_tree::ProjectGroup::Unsorted) => select_unsorted = true,
+            Some(group) => {
+              self.arrange_project_rows();
+              return self.collapse_to_group(group);
+            }
+            None => {}
+          }
+        }
         selected
       }
       _ => return false,
     };
-    self.tasks = crate::project_tree::arrange(
-      self
-        .project_input
-        .iter()
-        .filter(|task| !self.hidden_tasks.contains_key(task.uuid()))
-        .cloned()
-        .collect(),
-      &self.project_options,
-    );
-    self.apply_project_zoom();
+    self.arrange_projects();
     if select_unsorted {
       self.current_selection = if self.project_unsorted_count > 0 {
         self.tasks.len()
@@ -2884,6 +2849,38 @@ impl TaskwarriorTui {
     self.cursor_fix();
     self.update_task_table_state();
     true
+  }
+
+  // Switch to the report at `index` of the configured cycle. Returns whether one
+  // exists; an empty configuration keeps the built-in defaults. A report can
+  // start collapsed; otherwise the O state carries over.
+  fn apply_project_report(&mut self, index: usize) -> bool {
+    let Some(report) = self.config.uda_project_reports.get(index).cloned() else {
+      self.project_report = "next".into();
+      self.project_options = crate::project_tree::ViewOptions::default();
+      return false;
+    };
+    self.project_report = report.name;
+    self.project_options = report.options;
+    self.project_collapsed |= report.collapsed;
+    true
+  }
+
+  fn arrange_projects(&mut self) {
+    self.arrange_project_rows();
+    self.apply_project_zoom();
+  }
+
+  fn arrange_project_rows(&mut self) {
+    self.tasks = crate::project_tree::arrange(
+      self
+        .project_input
+        .iter()
+        .filter(|task| !self.hidden_tasks.contains_key(task.uuid()))
+        .cloned()
+        .collect(),
+      &self.project_options,
+    );
   }
 
   fn project_row_count(&self) -> usize {
@@ -2934,6 +2931,10 @@ impl TaskwarriorTui {
     }
     self.report = report.to_string();
     self.config.uda_legends = Config::get_uda_legends(data);
+    self.config.uda_project_reports = Config::get_project_reports(data);
+    // Pick up edited report settings, keeping the active report by name.
+    let active = self.config.uda_project_reports.iter().position(|r| r.name == self.project_report);
+    self.apply_project_report(active.unwrap_or(0));
     self.project_filter_before = None;
     self.config.filter = Config::get_filter(data, &self.report)?;
     if !self.config.filter.trim().is_empty() {
@@ -6865,7 +6866,9 @@ mod tests {
     assert_eq!(app.mode, Mode::Tasks(Action::Report));
     assert!(app.tasks_tab.as_ref().unwrap().marked.contains(&selected));
     assert!(app.filter.as_str().contains("+view"), "missing report uses scoped project default");
-    app.handle_input(KeyCode::Char('2')).await.unwrap();
+    assert_eq!(app.project_report, "next", "Projects opens on its first report");
+    app.handle_input(KeyCode::Char('R')).await.unwrap();
+    assert_eq!(app.project_report, "todo");
     app.handle_input(app.keyconfig.previous_tab).await.unwrap();
     assert_eq!(app.report, "next");
     assert_eq!(app.filter.as_str(), before);
@@ -6873,7 +6876,8 @@ mod tests {
     assert!(app.marked.contains(&selected));
     assert!(!app.task_report_info_show);
     app.handle_input(app.keyconfig.next_tab).await.unwrap();
-    assert!(matches!(app.project_options.sort, crate::project_tree::Sort::Due));
+    assert_eq!(app.project_report, "todo", "the report survives a tab round trip");
+    assert_eq!(app.project_options.hide_statuses, ["Triage", "Backlog", "Parked"]);
     app.handle_input(app.keyconfig.next_tab).await.unwrap();
     assert_eq!(app.mode, Mode::Timesheet);
     app.handle_input(app.keyconfig.previous_tab).await.unwrap();
@@ -6961,11 +6965,17 @@ mod tests {
     assert_eq!(app.tasks.len(), 2);
     assert_eq!(*app.task_current().unwrap().uuid(), selected);
     assert!(app.project_zoom.is_some());
-    app.handle_input(KeyCode::Char('6')).await.unwrap();
-    app.handle_input(KeyCode::Char('8')).await.unwrap();
-    assert_eq!(app.tasks.len(), 2);
-    assert!(matches!(app.project_options.sort, crate::project_tree::Sort::Title));
+    while app.project_report != "handoffs" {
+      app.handle_input(KeyCode::Char('R')).await.unwrap();
+    }
+    assert_eq!(app.tasks.len(), 2, "zoom holds while reports change");
+    assert!(app.project_options.handoffs_only);
     app.handle_input(KeyCode::Esc).await.unwrap();
+    assert_eq!(app.tasks.len(), 2, "the handoffs report hides beta, which has none");
+    assert_eq!(*app.task_current().unwrap().uuid(), selected);
+    while app.project_report != "next" {
+      app.handle_input(KeyCode::Char('R')).await.unwrap();
+    }
     assert_eq!(app.tasks.len(), 3);
     assert_eq!(*app.task_current().unwrap().uuid(), selected);
     app.current_selection = 0;
@@ -7004,8 +7014,10 @@ mod tests {
     app.tasks = crate::project_tree::arrange(app.project_input.clone(), &app.project_options);
     app.current_selection = app.task_index_by_uuid(expected[0]).unwrap();
     app.handle_input(KeyCode::Ctrl('o')).await.unwrap();
-    app.handle_input(KeyCode::Char('6')).await.unwrap();
-    app.handle_input(KeyCode::Char('1')).await.unwrap();
+    for _ in 0..app.config.uda_project_reports.len() {
+      app.handle_input(KeyCode::Char('R')).await.unwrap();
+    }
+    assert_eq!(app.project_report, "next", "R wraps around to the first report");
     assert_eq!(app.tasks.iter().map(|task| *task.uuid()).collect::<Vec<_>>(), expected);
     let rows = crate::project_tree::presentation(&app.tasks, &app.project_input);
     assert_eq!(rows[3].state, "blocked");
@@ -7023,6 +7035,7 @@ mod tests {
     child.set_project(Some("admin"));
     child.set_tags(Some(vec!["piotr".to_string()]));
     child.uda_mut().insert("view_project".into(), UDAValue::Str("ai-maintenance".into()));
+    child.uda_mut().insert("kind".into(), UDAValue::Str("slack".into()));
     let child_uuid = *child.uuid();
     let mut work = app.tasks[2].clone();
     work.set_project(Some("ai-maintenance"));
@@ -7044,20 +7057,37 @@ mod tests {
     let project = columns.iter().position(|column| column == "project").unwrap();
     assert_eq!(rows[0][project], "ai-maintenance");
     assert!(rows.iter().skip(1).all(|row| row[project].is_empty()));
-    for number in ['1', '2', '3', '4', '5', '6', '7', '8', '9'] {
-      app.handle_input(KeyCode::Char(number)).await.unwrap();
-      assert_eq!(*app.task_current().unwrap().uuid(), child_uuid, "selection drift on {number}");
-      assert_eq!(format!("{:?}", app.project_input), original, "view key mutated source tasks");
+    let action = labels.iter().position(|label| label == "Action").unwrap();
+    assert_eq!(rows[0][action], "", "headers have no action");
+    assert!(rows.iter().any(|row| row[lin] == "DEVOPS-123" && row[action] == "spawn"));
+    assert!(rows.iter().any(|row| row[action] == "slack"), "a handoff shows its kind");
+    assert!(!labels.contains(&"Mapping".to_string()));
+    for _ in 0..app.config.uda_project_reports.len() {
+      app.handle_input(KeyCode::Char('R')).await.unwrap();
+      assert_eq!(
+        *app.task_current().unwrap().uuid(),
+        child_uuid,
+        "selection drift on {}",
+        app.project_report
+      );
+      assert_eq!(format!("{:?}", app.project_input), original, "report mutated source tasks");
       assert_ne!(app.mode, Mode::Tasks(Action::Error));
+      match app.project_report.as_str() {
+        "todo" | "handoffs" => assert_eq!(app.tasks.len(), 2, "{} hides the Backlog issue", app.project_report),
+        _ => assert_eq!(app.tasks.len(), 3, "{} keeps every row", app.project_report),
+      }
     }
-    assert!(!app.project_options.ready_only);
-    assert!(!app.project_options.handoffs_only);
-    app.handle_input(KeyCode::Char('8')).await.unwrap();
-    assert_eq!(app.tasks.len(), 2, "handoff filter retains its project header");
-    assert!(app.project_legend(160).contains("handoffs [on]"));
-    app.handle_input(KeyCode::Char('9')).await.unwrap();
-    assert_eq!(app.tasks.len(), 3);
+    assert_eq!(app.project_report, "next");
+    assert!(!app.project_control(KeyCode::Char('1')), "number keys reach the shortcuts");
 
+    app
+      .config
+      .uda_legends
+      .insert("default".into(), "0 jump  1 open  7 backlog  b brief".into());
+    app
+      .config
+      .uda_legends
+      .insert("handoffs".into(), "0 jump | 3 brief | 6 ack+comment".into());
     for width in [80, 120, 250] {
       for height in [8, 15] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -7070,42 +7100,36 @@ mod tests {
         let legend = app.project_legend(width);
         let footer = screen.lines().last().unwrap().trim_end();
         assert_eq!(footer, legend, "footer clipped at {width}x{height}: {screen}");
-        assert!(footer.starts_with("[next]"));
+        assert!(footer.starts_with("R report: next  s act"), "{footer}");
         assert!(!footer.contains("Tasks") && !footer.contains("Timesheet"));
-        for label in ["7 ready [off]", "8 handoffs [off]", "s act"] {
-          assert!(footer.contains(label), "missing {label} at {width}x{height}: {footer}");
-        }
         let valid_items = [
-          "[next]",
-          "1 next",
-          "2 due",
-          "3 priority",
-          "4 newest",
-          "5 oldest",
-          "6 title",
-          "7 ready [off]",
-          "8 handoffs [off]",
-          "9 reset",
-          "^O zoom",
-          "O collapse",
+          "R report: next",
           "s act",
           "b brief",
           "x ack",
-          "r reports",
+          "^O zoom",
+          "O collapse",
           "/ filter",
+          "0 jump",
+          "3 brief",
+          "6 ack+comment",
         ];
         assert!(footer.split("  ").all(|item| valid_items.contains(&item)), "partial item: {footer}");
         assert!(!legend.contains('\n'));
         assert!(legend.width() <= usize::from(width));
-        assert!(screen.lines().filter(|row| row.contains("7 ready")).count() == 1);
         if width == 250 {
           assert_eq!(
-            footer,
-            "[next]  1 next  2 due  3 priority  4 newest  5 oldest  6 title  7 ready [off]  8 handoffs [off]  9 reset  ^O zoom  O collapse  s act  b brief  x ack  r reports  / filter"
+            footer, "R report: next  s act  b brief  x ack  ^O zoom  O collapse  / filter  0 jump  3 brief  6 ack+comment",
+            "a handoff row lists the handoffs digits"
           );
         }
       }
     }
+    app.current_selection = app.tasks.iter().position(|task| !has_tag(task, "piotr") && !is_overview(task)).unwrap();
+    assert!(
+      app.project_legend(250).ends_with("0 jump  1 open  7 backlog"),
+      "other rows list the default digits"
+    );
     app.report = "next".into();
     let (_, _, columns) = app.get_task_report();
     assert!(!columns.iter().any(|column| column == "view_kind"));
@@ -7160,8 +7184,12 @@ mod tests {
     app.tasks.clear();
     app.project_input.clear();
     app.current_selection_uuid = Some(selected);
-    assert!(app.project_control(KeyCode::Char('2')));
-    assert_eq!(app.current_selection_uuid, Some(selected), "sort while loading lost the saved UUID");
+    assert!(app.project_control(KeyCode::Char('R')));
+    assert_eq!(
+      app.current_selection_uuid,
+      Some(selected),
+      "report change while loading lost the saved UUID"
+    );
 
     app.apply_export("fixture", &output);
     let hidden = *app.tasks[0].uuid();
@@ -7177,10 +7205,10 @@ mod tests {
       desc: "failed refresh".into(),
       output: Ok(invalid),
     });
-    app.project_control(KeyCode::Char('9'));
+    app.project_control(KeyCode::Char('R'));
     assert!(
       !app.tasks.iter().any(|task| *task.uuid() == hidden),
-      "sort resurrected a removed row after export failure"
+      "report change resurrected a removed row after export failure"
     );
   }
 
@@ -7257,18 +7285,18 @@ mod tests {
       app.config.uda_shortcuts[slot] = format!("project-shortcut-{slot}");
     }
     let uuid = *app.tasks[0].uuid();
-    for (report, tag, key, linked, recorded, active, expected) in [
-      ("myprojects", "work", "", true, false, false, Some(4)),
-      ("myprojects", "work", "", true, true, true, Some(0)),
-      ("myprojects", "work", "", true, true, false, Some(4)),
-      ("myprojects", "work", "", true, false, true, Some(4)),
-      ("myprojects", "piotr", "", true, true, true, None),
-      ("myprojects", "view", "issue:source-id", false, false, false, Some(1)),
-      ("myprojects", "view", "ask:source-id", false, false, false, Some(1)),
-      ("myprojects", "view", "issue:source-id", true, true, true, Some(1)),
-      ("myprojects", "view", "ask:source-id", true, true, true, Some(1)),
-      ("myprojects", "work", "", false, false, false, None),
-      ("next", "work", "", true, true, true, None),
+    for (report, tag, key, linked, recorded, active, expected, label) in [
+      ("myprojects", "work", "", true, false, false, Some(4), "spawn"),
+      ("myprojects", "work", "", true, true, true, Some(0), "jump"),
+      ("myprojects", "work", "", true, true, false, Some(4), "spawn"),
+      ("myprojects", "work", "", true, false, true, Some(4), "spawn"),
+      ("myprojects", "piotr", "", true, true, true, None, "stop"),
+      ("myprojects", "view", "issue:source-id", false, false, false, Some(1), "open"),
+      ("myprojects", "view", "ask:source-id", false, false, false, Some(1), "review"),
+      ("myprojects", "view", "issue:source-id", true, true, true, Some(1), "open"),
+      ("myprojects", "view", "ask:source-id", true, true, true, Some(1), "review"),
+      ("myprojects", "work", "", false, false, false, None, "start"),
+      ("next", "work", "", true, true, true, None, "jump"),
     ] {
       app.report = report.into();
       app.mode = Mode::Tasks(Action::Report);
@@ -7288,6 +7316,7 @@ mod tests {
         vec![]
       }));
       let before = task.clone();
+      assert_eq!(crate::project_tree::action(&before), label, "{report} {tag} {key}");
       app.handle_input(app.keyconfig.start_stop).await.unwrap();
       let writes: Vec<_> = queue
         .try_iter()
@@ -7315,6 +7344,23 @@ mod tests {
       assert_eq!(app.tasks[0].status(), before.status());
       assert!(app.hidden_tasks.is_empty());
     }
+    // Number keys in Projects run the configured shortcut for the selected row.
+    app.report = "myprojects".into();
+    app.mode = Mode::Tasks(Action::Report);
+    app.handle_input(KeyCode::Char('4')).await.unwrap();
+    let writes: Vec<_> = queue
+      .try_iter()
+      .filter_map(|(_, job)| if let Job::Write(write) = job { Some(write) } else { None })
+      .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].cmd.get_program(), "project-shortcut-4");
+    assert!(
+      writes[0]
+        .cmd
+        .get_envs()
+        .any(|(key, value)| key == "TASKWARRIOR_TUI_REPORT" && value == Some(OsStr::new("myprojects")))
+    );
+
     // Empty configuration uses the normal shortcut error; it never falls
     // through to start or spawns a substitute after a failed jump.
     app.report = "myprojects".into();

@@ -19,11 +19,131 @@ pub enum Sort {
   Title,
 }
 
+impl Sort {
+  pub fn parse(value: &str) -> Option<Self> {
+    match value.trim().to_lowercase().as_str() {
+      "next" => Some(Self::Execution),
+      "due" => Some(Self::Due),
+      "prio" | "priority" => Some(Self::Priority),
+      "newest" => Some(Self::Newest),
+      "oldest" => Some(Self::Oldest),
+      "title" => Some(Self::Title),
+      _ => None,
+    }
+  }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewOptions {
   pub sort: Sort,
   pub ready_only: bool,
   pub handoffs_only: bool,
+  // Linear workflow states whose rows this view hides, compared without case.
+  pub hide_statuses: Vec<String>,
+  // Drop a project header when none of its rows survive the other filters.
+  pub hide_empty: bool,
+  // Drop projects that exist only in Taskwarrior (view_key local:...).
+  pub hide_local: bool,
+}
+
+// A named set of Projects view settings, the way a Taskwarrior report names a
+// filter and sort. Reports change only what the view shows, never task data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+  pub name: String,
+  pub options: ViewOptions,
+  pub collapsed: bool,
+}
+
+impl Report {
+  fn new(name: &str, sort: Sort) -> Self {
+    Self {
+      name: name.into(),
+      options: ViewOptions { sort, ..Default::default() },
+      collapsed: false,
+    }
+  }
+}
+
+pub const REPORT_PREFIX: &str = "uda.taskwarrior-tui.projects.report.";
+pub const REPORT_LIST: &str = "uda.taskwarrior-tui.projects.reports";
+
+// The former sort keys and toggles, now reports. `next` stays the default.
+pub fn builtin_reports() -> Vec<Report> {
+  let with = |name: &str, change: fn(&mut Report)| {
+    let mut report = Report::new(name, Sort::Execution);
+    change(&mut report);
+    report
+  };
+  vec![
+    Report::new("next", Sort::Execution),
+    with("todo", |r| {
+      r.options.hide_statuses = ["Triage", "Backlog", "Parked"].map(String::from).to_vec();
+    }),
+    with("active", |r| r.options.hide_empty = true),
+    with("handoffs", |r| {
+      r.options.handoffs_only = true;
+      r.options.hide_empty = true;
+    }),
+    with("ready", |r| r.options.ready_only = true),
+    Report::new("due", Sort::Due),
+    Report::new("prio", Sort::Priority),
+    Report::new("newest", Sort::Newest),
+    Report::new("oldest", Sort::Oldest),
+  ]
+}
+
+// Read the reports from `task show` style settings. `get` returns a setting's
+// value; `defined` lists every report name that has at least one setting. The
+// optional list fixes the cycle order; without it, the built-ins come first
+// and other defined reports follow in the order they appear.
+pub fn reports(get: impl Fn(&str) -> Option<String>, defined: &[String]) -> Vec<Report> {
+  let builtins = builtin_reports();
+  let names: Vec<String> = match get(REPORT_LIST) {
+    Some(list) if list.split(',').any(|name| !name.trim().is_empty()) => list.split(',').map(str::trim).map(str::to_owned).collect(),
+    _ => builtins.iter().map(|report| report.name.clone()).chain(defined.iter().cloned()).collect(),
+  };
+  let mut seen = HashSet::new();
+  let flag = |name: &str, setting: &str| {
+    get(&format!("{REPORT_PREFIX}{name}.{setting}")).map(|value| crate::config::TaskWarriorBool::get_bool(value.as_str()))
+  };
+  names
+    .into_iter()
+    .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace) && seen.insert(name.clone()))
+    .map(|name| {
+      let mut report = builtins
+        .iter()
+        .find(|report| report.name == name)
+        .cloned()
+        .unwrap_or_else(|| Report::new(&name, Sort::Execution));
+      if let Some(sort) = get(&format!("{REPORT_PREFIX}{name}.sort")).as_deref().and_then(Sort::parse) {
+        report.options.sort = sort;
+      }
+      if let Some(statuses) = get(&format!("{REPORT_PREFIX}{name}.hide-status")) {
+        report.options.hide_statuses = statuses
+          .split(',')
+          .map(str::trim)
+          .filter(|status| !status.is_empty())
+          .map(str::to_owned)
+          .collect();
+      }
+      let options = &mut report.options;
+      for (setting, field) in [
+        ("ready-only", &mut options.ready_only),
+        ("handoffs-only", &mut options.handoffs_only),
+        ("hide-empty", &mut options.hide_empty),
+        ("hide-local", &mut options.hide_local),
+      ] {
+        if let Some(Some(value)) = flag(&name, setting) {
+          *field = value;
+        }
+      }
+      if let Some(Some(value)) = flag(&name, "collapsed") {
+        report.collapsed = value;
+      }
+      report
+    })
+    .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -31,10 +151,10 @@ pub struct RowPresentation {
   pub project: String,
   pub kind: String,
   pub state: String,
+  pub action: String,
   pub description: String,
   pub linear: String,
   pub linear_status: String,
-  pub mapping: String,
 }
 
 pub fn has_tag(task: &Task, tag: &str) -> bool {
@@ -50,6 +170,11 @@ pub fn is_overview(task: &Task) -> bool {
         None | Some(UDAValue::Str(_)) => true,
         _ => false,
       }
+}
+
+// Projects created for us live only in Taskwarrior; Linear headers use standing:.
+fn is_local(task: &Task) -> bool {
+  is_overview(task) && matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.starts_with("local:"))
 }
 
 // Use the configured shortcuts rather than starting an issue merely to open
@@ -75,6 +200,31 @@ pub fn start_shortcut(task: &Task) -> Option<usize> {
     });
   }
   None
+}
+
+// What `s` does on a row, named the way the boards name it. The column and the
+// key share start_shortcut(), so they cannot disagree. Headers have no action.
+pub fn action(task: &Task) -> String {
+  if is_overview(task) {
+    return String::new();
+  }
+  let status = |name: &str| {
+    uda_string(task, "linear_status")
+      .or_else(|| uda_string(task, "view_state"))
+      .is_some_and(|status| status.trim().eq_ignore_ascii_case(name))
+  };
+  let name = match start_shortcut(task) {
+    Some(1) if uda_string(task, "view_key").is_some_and(|key| key.starts_with("ask:")) => "review",
+    Some(1) if status("triage") => "triage",
+    Some(1) => "open",
+    Some(0) => "jump",
+    Some(_) => "spawn",
+    None if task.start().is_some() => "stop",
+    // Starting a handoff runs its kind through the on-modify navigator.
+    None if has_tag(task, "piotr") => uda_string(task, "kind").unwrap_or("start"),
+    None => "start",
+  };
+  name.to_string()
 }
 
 // Administrative work is global, even when a standing admin row exists.
@@ -353,18 +503,29 @@ pub fn arrange(tasks: Vec<Task>, options: &ViewOptions) -> Vec<Task> {
       .then_with(|| a_project.to_lowercase().cmp(&b_project.to_lowercase()))
       .then_with(|| a.uuid().cmp(b.uuid()))
   });
-  let keep = |task: &Task| (!options.ready_only || states[task.uuid()].ready()) && (!options.handoffs_only || has_tag(task, "piotr"));
+  let hidden_status = |task: &Task| {
+    uda_string(task, "linear_status").is_some_and(|status| options.hide_statuses.iter().any(|hide| hide.eq_ignore_ascii_case(status.trim())))
+  };
+  let keep =
+    |task: &Task| (!options.ready_only || states[task.uuid()].ready()) && (!options.handoffs_only || has_tag(task, "piotr")) && !hidden_status(task);
   let mut result = Vec::new();
   for header in overviews {
     let project = project(&header).map(str::to_owned);
-    result.push(header);
-    if let Some(group) = project.and_then(|project| children.remove(&project)) {
-      result.extend(
+    let rows: Vec<Task> = project
+      .and_then(|project| children.remove(&project))
+      .map(|group| {
         dependency_order(group, |a, b| view_order(a, b, options.sort, &states))
           .into_iter()
-          .filter(&keep),
-      );
+          .filter(&keep)
+          .collect()
+      })
+      .unwrap_or_default();
+    // A hidden project takes its rows with it rather than sending them to Unsorted.
+    if (options.hide_local && is_local(&header)) || (options.hide_empty && rows.is_empty()) {
+      continue;
     }
+    result.push(header);
+    result.extend(rows);
   }
   result.extend(
     dependency_order(unmatched, |a, b| view_order(a, b, options.sort, &states))
@@ -384,7 +545,6 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
       let overview = is_overview(task);
       let generated = generated(task);
       let grouped = !overview && membership(task).is_some_and(|project| projects.contains(project));
-      let unresolved = uda_string(task, "view_project") == Some("!unassigned");
       let inferred_kind = if overview {
         "project"
       } else if has_tag(task, "piotr") {
@@ -436,16 +596,10 @@ pub fn presentation(tasks: &[Task], context: &[Task]) -> Vec<RowPresentation> {
         },
         kind: kind.into(),
         state,
+        action: action(task),
         description: format!("{}{}", if grouped { "  ↳ " } else { "" }, clean_description(task)),
         linear: linear_id.to_string(),
         linear_status,
-        mapping: if overview || grouped {
-          String::new()
-        } else if unresolved {
-          "unmapped".into()
-        } else {
-          "no overview".into()
-        },
       }
     })
     .collect()
@@ -684,6 +838,159 @@ mod tests {
     assert_eq!(rows.len(), rows.iter().map(|task| *task.uuid()).collect::<HashSet<_>>().len());
   }
 
+  fn settings(lines: &[(&str, &str)]) -> (impl Fn(&str) -> Option<String>, Vec<String>) {
+    let map: HashMap<String, String> = lines.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let mut defined = Vec::new();
+    for (key, _) in lines {
+      if let Some((name, _)) = key.strip_prefix(REPORT_PREFIX).and_then(|rest| rest.split_once('.'))
+        && !defined.contains(&name.to_string())
+      {
+        defined.push(name.to_string());
+      }
+    }
+    (move |key: &str| map.get(key).cloned(), defined)
+  }
+
+  fn names(reports: &[Report]) -> Vec<&str> {
+    reports.iter().map(|report| report.name.as_str()).collect()
+  }
+
+  #[test]
+  fn reports_default_to_builtins_with_next_first() {
+    let (get, defined) = settings(&[]);
+    let reports = reports(get, &defined);
+    assert_eq!(
+      names(&reports),
+      ["next", "todo", "active", "handoffs", "ready", "due", "prio", "newest", "oldest"]
+    );
+    assert_eq!(reports[0].options, ViewOptions::default(), "next is today's default view");
+    let sort = |name: &str| reports.iter().find(|r| r.name == name).unwrap().options.sort;
+    // The former sort keys 1 to 5 keep their order as reports.
+    for (name, expected) in [
+      ("next", Sort::Execution),
+      ("due", Sort::Due),
+      ("prio", Sort::Priority),
+      ("newest", Sort::Newest),
+      ("oldest", Sort::Oldest),
+    ] {
+      assert_eq!(sort(name), expected, "{name}");
+    }
+    let handoffs = reports.iter().find(|r| r.name == "handoffs").unwrap();
+    assert!(handoffs.options.handoffs_only && handoffs.options.hide_empty);
+    assert!(reports.iter().find(|r| r.name == "ready").unwrap().options.ready_only);
+    assert!(reports.iter().all(|r| !r.collapsed));
+  }
+
+  #[test]
+  fn reports_read_settings_list_and_custom_names() {
+    let (get, defined) = settings(&[
+      (REPORT_LIST, "todo, mine ,next,todo,,bad name"),
+      ("uda.taskwarrior-tui.projects.report.todo.hide-status", "Backlog"),
+      ("uda.taskwarrior-tui.projects.report.mine.sort", "due"),
+      ("uda.taskwarrior-tui.projects.report.mine.hide-empty", "yes"),
+      ("uda.taskwarrior-tui.projects.report.mine.hide-local", "on"),
+      ("uda.taskwarrior-tui.projects.report.mine.collapsed", "true"),
+      ("uda.taskwarrior-tui.projects.report.next.sort", "sideways"),
+      ("uda.taskwarrior-tui.projects.report.next.ready-only", "maybe"),
+    ]);
+    let reports = reports(get, &defined);
+    assert_eq!(names(&reports), ["todo", "mine", "next"], "the list fixes order, once each");
+    assert_eq!(reports[0].options.hide_statuses, ["Backlog"]);
+    let mine = &reports[1];
+    assert_eq!(mine.options.sort, Sort::Due);
+    assert!(mine.options.hide_empty && mine.options.hide_local && mine.collapsed);
+    assert_eq!(reports[2].options, ViewOptions::default(), "invalid values keep the defaults");
+
+    let (get, defined) = settings(&[("uda.taskwarrior-tui.projects.report.mine.handoffs-only", "yes")]);
+    let reports = super::reports(get, &defined);
+    assert_eq!(reports.last().unwrap().name, "mine", "unlisted custom reports follow the built-ins");
+    assert!(reports.last().unwrap().options.handoffs_only);
+    assert_eq!(reports[0].name, "next");
+  }
+
+  fn header(id: u128, project: &str, key: &str) -> Task {
+    let mut header = task(id, Some(project), &["view"]);
+    view(&mut header, "view_key", key);
+    view(&mut header, "view_kind", "project");
+    header
+  }
+
+  #[test]
+  fn report_filters_hide_rows_and_projects() {
+    let mut triage = task(11, Some("ci"), &["view"]);
+    view(&mut triage, "view_key", "issue:CI-1");
+    view(&mut triage, "linear_status", "triage");
+    let mut started = task(12, Some("ci"), &["work"]);
+    view(&mut started, "linear_status", "In Progress");
+    let mut blocked = task(21, Some("docs"), &["work"]);
+    depends(&mut blocked, &[22]);
+    let mut prerequisite = task(22, Some("other"), &["work"]);
+    view(&mut prerequisite, "linear_status", "Backlog");
+    let context = vec![
+      header(1, "ci", "standing:ci"),
+      triage,
+      started,
+      header(2, "docs", "standing:docs"),
+      blocked,
+      header(3, "empty", "standing:empty"),
+      header(4, "ops", "local:ops"),
+      task(41, Some("ops"), &["piotr"]),
+      prerequisite,
+    ];
+    let builtin = |name: &str| builtin_reports().into_iter().find(|r| r.name == name).unwrap().options;
+    assert_eq!(
+      ids(&arrange(context.clone(), &ViewOptions::default())),
+      vec![1, 11, 12, 2, 21, 3, 4, 41, 22]
+    );
+
+    let todo = arrange(context.clone(), &builtin("todo"));
+    assert_eq!(
+      ids(&todo),
+      vec![1, 12, 2, 21, 3, 4, 41],
+      "Triage and Backlog rows hide, whatever the case"
+    );
+
+    let active = arrange(context.clone(), &builtin("active"));
+    assert_eq!(
+      ids(&active),
+      vec![1, 11, 12, 2, 21, 4, 41, 22],
+      "an empty project hides; a blocked step keeps docs"
+    );
+
+    let handoffs = arrange(context.clone(), &builtin("handoffs"));
+    assert_eq!(ids(&handoffs), vec![4, 41], "only projects with handoffs remain");
+
+    let local = arrange(
+      context.clone(),
+      &ViewOptions {
+        hide_local: true,
+        ..Default::default()
+      },
+    );
+    assert_eq!(
+      ids(&local),
+      vec![1, 11, 12, 2, 21, 3, 22],
+      "a hidden local project takes its rows, not Unsorted"
+    );
+  }
+
+  #[test]
+  fn action_names_what_s_runs() {
+    let mut triage = task(1, Some("ci"), &["view"]);
+    view(&mut triage, "view_key", "issue:CI-1");
+    view(&mut triage, "linear_status", "Triage");
+    assert_eq!(action(&triage), "triage");
+    view(&mut triage, "linear_status", "Todo");
+    assert_eq!(action(&triage), "open");
+    let mut handoff = task(2, Some("ci"), &["piotr"]);
+    assert_eq!(action(&handoff), "start");
+    view(&mut handoff, "kind", "pr");
+    assert_eq!(action(&handoff), "pr");
+    handoff.set_start(Some(date(2020)));
+    assert_eq!(action(&handoff), "stop");
+    assert_eq!(action(&header(3, "ci", "standing:ci")), "");
+  }
+
   #[test]
   fn presentation_uses_columns_without_changing_native_task_data() {
     let mut linked = task(2, Some("admin"), &["piotr"]);
@@ -698,13 +1005,13 @@ mod tests {
     assert_eq!(rows[0].description, "task 1");
     assert_eq!(rows[1].project, "");
     assert_eq!(rows[1].kind, "handoff");
-    assert_eq!(rows[1].mapping, "");
+    assert_eq!(rows[0].action, "", "headers have no s action");
+    assert_eq!(rows[1].action, "start", "a handoff without a kind starts");
     assert_eq!(rows[1].description, "  ↳ task 2");
     assert_eq!(arranged[1].project().map(String::as_str), Some("admin"));
     assert_eq!(arranged[1].description(), "task 2");
     assert!(rows[2..].iter().all(|row| row.project == "Unsorted"));
-    assert_eq!(rows[2].mapping, "no overview");
-    assert_eq!(rows[3].mapping, "unmapped");
+    assert_eq!(rows[2].action, "start");
     assert_eq!(arranged[3].project().map(String::as_str), Some("ai"));
   }
 
