@@ -389,6 +389,7 @@ pub struct TaskwarriorTui {
   last_write_seq: u64,
   export_in_flight: Option<u64>,
   report_export_floor: u64,
+  sync_status: Option<(u64, String, bool)>,
   project_filter_before: Option<String>,
   refresh_again: bool,
   // Rows removed before their write ran, keyed to the write's queue position.
@@ -592,6 +593,7 @@ impl TaskwarriorTui {
       last_write_seq: 0,
       export_in_flight: None,
       report_export_floor: 0,
+      sync_status: None,
       project_filter_before: None,
       refresh_again: false,
       hidden_tasks: HashMap::new(),
@@ -825,6 +827,7 @@ impl TaskwarriorTui {
       Err(job) => {
         if let Job::Write(mut write) = *job {
           let output = write.run();
+          self.finish_sync(self.job_seq + 1, write.label, output.as_ref().is_ok_and(|output| output.status.success()));
           self.apply_write_result(write.label, write.report_errors, write.select, output);
         }
       }
@@ -846,6 +849,18 @@ impl TaskwarriorTui {
         if let Err(e) = self.export_tasks() {
           self.error = Some(e.to_string());
         }
+      }
+    }
+  }
+
+  fn finish_sync(&mut self, seq: u64, label: &str, success: bool) {
+    if label == "Sync issue" && self.sync_status.as_ref().is_some_and(|(current, _, _)| *current == seq) {
+      if success {
+        if let Some((_, _, pending)) = self.sync_status.as_mut() {
+          *pending = false;
+        }
+      } else {
+        self.sync_status = None;
       }
     }
   }
@@ -907,6 +922,7 @@ impl TaskwarriorTui {
         output,
       } => {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
+        self.finish_sync(seq, label, output.as_ref().is_ok_and(|output| output.status.success()));
         self.apply_write_result(
           label,
           report_errors,
@@ -1125,17 +1141,25 @@ impl TaskwarriorTui {
       n if n > 0 && self.report == "myprojects" => format!("{workspace} ↑{n} moved up"),
       _ => workspace,
     };
-    let context = Line::from(vec![
-      Span::from(workspace),
-      Span::from(" "),
-      Span::from("["),
-      Span::from(if self.current_context.is_empty() {
-        "none"
+    let context = if let Some((_, issue, pending)) = &self.sync_status {
+      Line::from(if *pending {
+        format!("Syncing {issue}…")
       } else {
-        &self.current_context
-      }),
-      Span::from("]"),
-    ]);
+        format!("Synced {issue}")
+      })
+    } else {
+      Line::from(vec![
+        Span::from(workspace),
+        Span::from(" "),
+        Span::from("["),
+        Span::from(if self.current_context.is_empty() {
+          "none"
+        } else {
+          &self.current_context
+        }),
+        Span::from("]"),
+      ])
+    };
     let tabs = Tabs::new(tab_names)
       .block(navbar_block.clone())
       .select(selected_tab)
@@ -3703,6 +3727,18 @@ impl TaskwarriorTui {
     let program = shellexpand::tilde(&args[0]);
     let mut command = std::process::Command::new(program.as_ref());
     command.args(&args[1..]).arg(task.uuid().to_string()).stdin(std::process::Stdio::null());
+    let issue = ["linear_issue_id", "view_issue"]
+      .iter()
+      .find_map(|name| match task.uda().get(*name) {
+        Some(UDAValue::Str(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
+      })
+      .or_else(|| match task.uda().get("view_key") {
+        Some(UDAValue::Str(key)) => key.strip_prefix("issue:").filter(|key| !key.trim().is_empty()).map(str::to_string),
+        _ => None,
+      })
+      .unwrap_or_else(|| task.uuid().to_string());
+    self.sync_status = Some((self.job_seq + 1, issue, true));
     self.queue_write(TaskWrite::new("Sync issue", true, Select::Nothing, (command, None)), &[]);
     Ok(())
   }
@@ -6936,6 +6972,13 @@ mod tests {
     app.tasks[0].uda_mut().remove("view_key");
     app.tasks[0].uda_mut().insert("view_issue".into(), UDAValue::Str("DEVOPS-123".into()));
     assert!(app.task_sync_issue().is_ok());
+    let latest = app.sync_status.clone().unwrap();
+    app.finish_sync(latest.0 - 1, "Sync issue", true);
+    assert_eq!(app.sync_status.as_ref(), Some(&latest));
+    app.finish_sync(latest.0, "Other write", true);
+    assert_eq!(app.sync_status.as_ref(), Some(&latest));
+    app.finish_sync(latest.0, "Sync issue", true);
+    assert_eq!(app.sync_status, Some((latest.0, "DEVOPS-123".into(), false)));
     app.tasks[0].uda_mut().insert("view_kind".into(), UDAValue::Str("project".into()));
     assert!(app.task_sync_issue().is_err());
   }
@@ -6959,6 +7002,17 @@ mod tests {
     app.handle_input(KeyCode::Char('S')).await.unwrap();
     assert!(start.elapsed() < Duration::from_millis(500));
     assert_eq!(app.mode, Mode::Tasks(Action::Report));
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+      for report in ["next", "myprojects"] {
+        app.report = report.into();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = buffer_view(terminal.backend().buffer());
+        assert!(screen.contains("Syncing DEVOPS-123…"), "{screen}");
+        assert!(screen.contains("S sync"), "{screen}");
+      }
+    }
+    app.report = "next".into();
     for _ in 0..2 {
       let result = tokio::time::timeout(Duration::from_secs(30), app.worker.as_mut().unwrap().results.recv())
         .await
@@ -6969,13 +7023,22 @@ mod tests {
     assert_eq!(app.task_current().unwrap().uuid(), &uuid);
     assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("--task\n{uuid}\n"));
     assert!(app.error.is_none(), "{:?}", app.error);
+    for width in [80, 160] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+      terminal.draw(|frame| app.draw(frame)).unwrap();
+      assert!(buffer_view(terminal.backend().buffer()).contains("Synced DEVOPS-123"));
+    }
     app.tasks[app.current_selection]
       .uda_mut()
       .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
     app.config.uda_sync_issue_command = "/bin/false".into();
-    app.task_sync_issue().unwrap();
+    app.keyconfig = KeyConfig::new("uda.taskwarrior-tui.keyconfig.sync-issue Ctrl+s\n").unwrap();
+    app.handle_input(KeyCode::Ctrl('s')).await.unwrap();
+    assert!(app.sync_status.as_ref().is_some_and(|(_, _, pending)| *pending));
     app.wait_for_writes();
     assert!(app.error.as_ref().is_some_and(|error| error.contains("Sync issue failed")));
+    assert!(app.sync_status.is_none());
+    assert_eq!(app.mode, Mode::Tasks(Action::Error));
     std::fs::remove_dir_all(dir).unwrap();
   }
 

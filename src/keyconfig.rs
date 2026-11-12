@@ -257,30 +257,27 @@ impl KeyConfig {
   }
 
   fn get_config(config: &str, data: &str) -> Option<KeyCode> {
+    let alias = config.replace('-', "_");
     for line in data.split('\n') {
-      if line.starts_with(config) {
-        let line = line.trim_start_matches(config).trim_start().trim_end().to_string();
-        if has_just_one_char(&line) {
-          return Some(KeyCode::Char(line.chars().next().unwrap()));
-        } else {
-          error!("Found multiple characters in {} for {}", line, config);
+      let value = line.strip_prefix(config).or_else(|| line.strip_prefix(&alias));
+      if let Some(value) = value {
+        let value = value.trim();
+        if let Some((prefix, letter)) = value.split_once('+')
+          && prefix.eq_ignore_ascii_case("ctrl")
+          && letter.len() == 1
+          && letter.as_bytes()[0].is_ascii_alphabetic()
+        {
+          return Some(KeyCode::Ctrl((letter.as_bytes()[0] as char).to_ascii_lowercase()));
         }
-      } else if line.starts_with(&config.replace('-', "_")) {
-        let line = line.trim_start_matches(&config.replace('-', "_")).trim_start().trim_end().to_string();
-        if has_just_one_char(&line) {
-          return Some(KeyCode::Char(line.chars().next().unwrap()));
-        } else {
-          error!("Found multiple characters in {} for {}", line, config);
+        let mut chars = value.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+          return Some(KeyCode::Char(ch));
         }
+        error!("Invalid key {} for {}", value, config);
       }
     }
     None
   }
-}
-
-fn has_just_one_char(s: &str) -> bool {
-  let mut chars = s.chars();
-  chars.next().is_some() && chars.next().is_none()
 }
 
 #[cfg(test)]
@@ -299,6 +296,22 @@ mod tests {
           "hardcoded binding uses Ctrl+{key}"
         );
       }
+    }
+  }
+
+  #[test]
+  fn control_key_config_accepts_one_ascii_letter_and_aliases() {
+    for value in ["Ctrl+s", "Ctrl+S", "cTrL+S"] {
+      let data = format!("uda.taskwarrior-tui.keyconfig.sync-issue {value}\n");
+      assert_eq!(KeyConfig::new(&data).unwrap().sync_issue, KeyCode::Ctrl('s'));
+    }
+    assert_eq!(
+      KeyConfig::new("uda.taskwarrior_tui.keyconfig.sync_issue CTRL+S\n").unwrap().sync_issue,
+      KeyCode::Ctrl('s')
+    );
+    for value in ["Ctrl+ss", "Ctrl+1", "Ctrl+", "Ctrl+é"] {
+      let data = format!("uda.taskwarrior-tui.keyconfig.sync-issue {value}\n");
+      assert_eq!(KeyConfig::new(&data).unwrap().sync_issue, KeyCode::Char('S'));
     }
   }
 
