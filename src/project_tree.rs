@@ -180,7 +180,7 @@ fn is_local(task: &Task) -> bool {
 // Use the configured shortcuts rather than starting an issue merely to open
 // its spawn dialog or source. The jump helper owns the live-session check.
 pub fn start_shortcut(task: &Task) -> Option<usize> {
-  if is_overview(task) || has_tag(task, "piotr") {
+  if task.start().is_some() || is_overview(task) || has_tag(task, "piotr") {
     return None;
   }
   if has_tag(task, "view") && matches!(task.uda().get("view_key"), Some(UDAValue::Str(key)) if key.starts_with("issue:") || key.starts_with("ask:")) {
@@ -205,6 +205,9 @@ pub fn start_shortcut(task: &Task) -> Option<usize> {
 // What `s` does on a row, named the way the boards name it. The column and the
 // key share start_shortcut(), so they cannot disagree. Headers have no action.
 pub fn action(task: &Task) -> String {
+  if task.start().is_some() {
+    return "stop".into();
+  }
   if is_overview(task) {
     return "brief".into();
   }
@@ -817,6 +820,26 @@ mod tests {
   }
 
   #[test]
+  fn default_projects_order_keeps_headers_groups_dependencies_and_unmatched() {
+    let alpha = task(1, Some("alpha"), &["view"]);
+    let zulu = task(2, Some("zulu"), &["view"]);
+    let mut dependent = task(3, Some("alpha"), &["work"]);
+    view(&mut dependent, "view_rank", "1");
+    depends(&mut dependent, &[4]);
+    let mut prerequisite = task(4, Some("alpha"), &["work"]);
+    view(&mut prerequisite, "view_rank", "9");
+    let mut handoff = task(5, Some("alpha"), &["piotr"]);
+    view(&mut handoff, "view_rank", "5");
+    let zulu_child = task(6, Some("zulu"), &["work"]);
+    let unmatched = task(7, Some("other"), &["work"]);
+    let rows = arrange(
+      vec![unmatched, zulu_child, zulu, dependent, prerequisite, handoff, alpha],
+      &ViewOptions::default(),
+    );
+    assert_eq!(ids(&rows), vec![1, 5, 4, 3, 2, 6, 7]);
+  }
+
+  #[test]
   fn blocked_tag_stays_visible_and_unready_and_other_sorts_ignore_ranks() {
     let mut blocked = task(2, Some("ci"), &["work", "BLOCKED"]);
     blocked.uda_mut().insert("view_rank".into(), UDAValue::U64(10));
@@ -1406,9 +1429,11 @@ mod tests {
       let mut source = task(1, Some("ci"), &["view", "ACTIVE"]);
       source.uda_mut().insert("view_key".into(), UDAValue::Str(key.into()));
       source.uda_mut().insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
-      source.set_start(Some(chrono::Utc::now().naive_utc()));
       source.set_annotations::<_, Annotation>(Some(vec![Annotation::new(source.entry().clone(), "tmux session test-worker".into())]));
       assert_eq!(start_shortcut(&source), Some(1));
+      source.set_start(Some(chrono::Utc::now().naive_utc()));
+      assert_eq!(start_shortcut(&source), None);
+      assert_eq!(action(&source), "stop");
       source.tags_mut().as_mut().unwrap().push("piotr".into());
       assert_eq!(start_shortcut(&source), None, "handoff hook keeps precedence");
     }
