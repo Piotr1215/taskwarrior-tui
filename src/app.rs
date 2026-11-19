@@ -2814,6 +2814,9 @@ impl TaskwarriorTui {
         let sync = match &self.sync_status {
           Some((_, issue, None)) => format!("{} sync [Syncing {issue}…]", key(self.keyconfig.sync_issue)),
           Some((_, issue, Some(_))) => format!("{} sync [Synced {issue}]", key(self.keyconfig.sync_issue)),
+          None if self.keyconfig.sync_issue == KeyCode::Char('S') && self.task_current().is_some_and(|task| has_tag(&task, "piotr")) => {
+            "S handoff".into()
+          }
           None => format!("{} sync", key(self.keyconfig.sync_issue)),
         };
         let mut items = vec![
@@ -3949,13 +3952,22 @@ impl TaskwarriorTui {
     // A project header has nothing to start; s opens its brief, as b does.
     if self.report == "myprojects"
       && self.marked.is_empty()
-      && self.task_current().is_some_and(|task| is_overview(&task))
+      && self.task_current().is_some_and(|task| is_overview(&task) && task.start().is_none())
       && let Some(command) = self.handoff_floater_toggle_command()
     {
       self.queue_write(TaskWrite::new("Brief", true, Select::Nothing, (command, None)), &[]);
       return Ok(());
     }
-    let selected = self.actionable_task_uuids()?;
+    let selected = self.selected_task_uuids();
+    let selected = if selected
+      .iter()
+      .all(|uuid| self.task_by_uuid(*uuid).is_some_and(|task| task.start().is_some()))
+      && !selected.is_empty()
+    {
+      selected
+    } else {
+      self.actionable_task_uuids()?
+    };
     if self.report == "myprojects"
       && let Some(shortcut) = self
         .tasks
@@ -3976,7 +3988,16 @@ impl TaskwarriorTui {
       return Ok(());
     }
 
-    let task_uuids = self.actionable_task_uuids()?;
+    let selected = self.selected_task_uuids();
+    let task_uuids = if !selected.is_empty()
+      && selected
+        .iter()
+        .all(|uuid| self.task_by_uuid(*uuid).is_some_and(|task| task.start().is_some()))
+    {
+      selected
+    } else {
+      self.actionable_task_uuids()?
+    };
 
     for task_uuid in &task_uuids {
       let command = match self.task_by_uuid(*task_uuid) {
@@ -3984,7 +4005,13 @@ impl TaskwarriorTui {
         _ => "start",
       };
 
-      let cmd = self.task_command(&[QUIET], &[*task_uuid], &[command.to_string()]);
+      let mut cmd = self.task_command(&[QUIET], &[*task_uuid], &[command.to_string()]);
+      if command == "stop" && self.task_by_uuid(*task_uuid).is_some_and(|task| has_tag(&task, "piotr")) {
+        cmd.0.env("HANDOFF_SWITCH", "1");
+        if let Some(retry) = &mut cmd.1 {
+          retry.env("HANDOFF_SWITCH", "1");
+        }
+      }
       self.queue_write(TaskWrite::new("Start/stop", false, Select::Nothing, cmd), &[]);
     }
 
@@ -4418,6 +4445,16 @@ impl TaskwarriorTui {
     if let Mode::Tasks(task_mode) = &self.mode {
       match task_mode {
         Action::Report => {
+          if input == KeyCode::Char('S')
+            && let Some(command) = self.handoff_navigation_command()
+          {
+            self.queue_write(TaskWrite::new("Handoff", true, Select::Nothing, (command, None)), &[]);
+            // The default sync key shares S. Prefer the handoff action on handoff rows;
+            // sync remains available there when configured to another key.
+            if input == self.keyconfig.sync_issue {
+              return Ok(());
+            }
+          }
           if input == KeyCode::Char('b')
             && let Some(command) = self.handoff_floater_toggle_command()
           {
@@ -6989,11 +7026,27 @@ mod tests {
     let (_sender, results) = tokio::sync::mpsc::unbounded_channel();
     app.worker = Some(Worker { jobs, results });
     app.current_selection = 0;
+    add_tag(&mut app.tasks[0], "piotr".into());
+    app.handle_input(KeyCode::Char('S')).await.unwrap();
+    let writes: Vec<_> = queue
+      .try_iter()
+      .filter_map(|(_, job)| if let Job::Write(write) = job { Some(write) } else { None })
+      .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].label, "Handoff");
+    app.keyconfig.sync_issue = KeyCode::Ctrl('s');
     app.tasks[0]
       .uda_mut()
       .insert("linear_issue_id".into(), UDAValue::Str("DEVOPS-123".into()));
     assert!(app.task_sync_issue().is_err());
     app.config.uda_sync_issue_command = "~/sync --task".into();
+    app.handle_input(KeyCode::Ctrl('s')).await.unwrap();
+    assert!(
+      queue
+        .try_iter()
+        .any(|(_, job)| matches!(job, Job::Write(write) if write.label == "Sync issue"))
+    );
+    queue.try_iter().for_each(drop);
     let uuid = *app.tasks[0].uuid();
     app.marked.insert(*app.tasks[1].uuid());
     app.task_sync_issue().unwrap();
@@ -7164,7 +7217,43 @@ mod tests {
       let args: Vec<_> = write.cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
       assert!(args.iter().any(|a| a == action));
       assert!(args.iter().any(|a| a == &uuid || a == &format!("uuid:{uuid}")));
+      assert_eq!(
+        write
+          .cmd
+          .get_envs()
+          .any(|(key, value)| key == "HANDOFF_SWITCH" && value == Some(std::ffi::OsStr::new("1"))),
+        active
+      );
+      assert!(
+        queue.try_iter().all(|(_, job)| !matches!(job, Job::Write(_))),
+        "start/stop must not queue navigation"
+      );
     }
+    // A started Projects source or header must stop instead of opening a shortcut.
+    app.report = "myprojects".into();
+    app.tasks[0].tags_mut().as_mut().unwrap().retain(|tag| tag != "piotr");
+    add_tag(&mut app.tasks[0], "view".into());
+    app.tasks[0]
+      .uda_mut()
+      .insert("view_key".into(), task_hookrs::uda::UDAValue::Str("issue:example".into()));
+    app.handle_input(KeyCode::Char('s')).await.unwrap();
+    let writes: Vec<_> = queue
+      .try_iter()
+      .filter_map(|(_, job)| if let Job::Write(write) = job { Some(write) } else { None })
+      .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].label, "Start/stop");
+    assert!(writes[0].cmd.get_args().any(|arg| arg == "stop"));
+    assert!(!writes[0].cmd.get_envs().any(|(key, _)| key == "HANDOFF_SWITCH"));
+    app.tasks[0].uda_mut().insert("view_kind".into(), UDAValue::Str("project".into()));
+    app.handle_input(KeyCode::Char('s')).await.unwrap();
+    let writes: Vec<_> = queue
+      .try_iter()
+      .filter_map(|(_, job)| if let Job::Write(write) = job { Some(write) } else { None })
+      .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].label, "Start/stop");
+    assert!(writes[0].cmd.get_args().any(|arg| arg == "stop"));
   }
 
   async fn test_grouped_handoffs_and_dispatch() {
@@ -7501,6 +7590,7 @@ mod tests {
           "s act",
           "b brief",
           "S sync",
+          "S handoff",
           "x ack",
           "^O zoom",
           "O collapse",
@@ -7516,7 +7606,8 @@ mod tests {
         assert!(legend.width() <= usize::from(width));
         if width == 250 {
           assert_eq!(
-            footer, "R report: next  s act  b brief  S sync  x ack  ^O zoom  O collapse  / filter  [/] views  ? help  0 jump  3 brief  6 ack+comment",
+            footer,
+            "R report: next  s act  b brief  S handoff  x ack  ^O zoom  O collapse  / filter  [/] views  ? help  0 jump  3 brief  6 ack+comment",
             "a handoff row lists the handoffs digits"
           );
         }
@@ -7698,16 +7789,16 @@ mod tests {
     let uuid = *app.tasks[0].uuid();
     for (report, tag, key, linked, recorded, active, expected, label) in [
       ("myprojects", "work", "", true, false, false, Some(4), "spawn"),
-      ("myprojects", "work", "", true, true, true, Some(0), "jump"),
+      ("myprojects", "work", "", true, true, true, None, "stop"),
       ("myprojects", "work", "", true, true, false, Some(4), "spawn"),
-      ("myprojects", "work", "", true, false, true, Some(4), "spawn"),
+      ("myprojects", "work", "", true, false, true, None, "stop"),
       ("myprojects", "piotr", "", true, true, true, None, "stop"),
       ("myprojects", "view", "issue:source-id", false, false, false, Some(1), "open"),
       ("myprojects", "view", "ask:source-id", false, false, false, Some(1), "review"),
-      ("myprojects", "view", "issue:source-id", true, true, true, Some(1), "open"),
-      ("myprojects", "view", "ask:source-id", true, true, true, Some(1), "review"),
+      ("myprojects", "view", "issue:source-id", true, true, true, None, "stop"),
+      ("myprojects", "view", "ask:source-id", true, true, true, None, "stop"),
       ("myprojects", "work", "", false, false, false, None, "start"),
-      ("next", "work", "", true, true, true, None, "jump"),
+      ("next", "work", "", true, true, true, None, "stop"),
     ] {
       app.report = report.into();
       app.mode = Mode::Tasks(Action::Report);
@@ -7776,6 +7867,8 @@ mod tests {
     // through to start or spawns a substitute after a failed jump.
     app.report = "myprojects".into();
     app.config.uda_shortcuts[0].clear();
+    app.tasks[0].set_start(None::<chrono::NaiveDateTime>);
+    add_tag(&mut app.tasks[0], "ACTIVE".into());
     app.mode = Mode::Tasks(Action::Report);
     app.handle_input(app.keyconfig.start_stop).await.unwrap();
     assert_eq!(app.mode, Mode::Tasks(Action::Error));

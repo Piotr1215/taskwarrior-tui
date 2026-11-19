@@ -72,8 +72,8 @@ the cursor to the end of the line. Ctrl+h, Ctrl+j, Ctrl+k and Ctrl+l are reserve
 for terminal pane navigation. In Projects, Ctrl+o zooms into a project,
 O toggles the header-only view and R moves to the next Projects report.
 Number keys run the configured shortcuts there as in any other report.
-`s` runs the action named in the Action column, and opens the brief on a
-project header. A step that moved ahead of another in its project's queue
+`s` stops a started row. Otherwise it runs the action named in the Action
+column, or opens the brief on a project header. A step that moved ahead of another in its project's queue
 since the last refresh shows ↑ in State, and the title counts such steps,
 until the cursor reaches the row.
 
@@ -81,6 +81,9 @@ Press `S` to sync the selected issue from Linear and refresh the report in
 the background. You can keep using the TUI during the sync. The configured
 helper receives only the selected task's UUID, regardless of marked rows.
 It supports linked tasks and issue rows in Projects. Configure it in `.taskrc`:
+
+On a `+piotr` handoff, `S` opens the handoff instead. Configure sync to a
+different key to sync a linked handoff.
 
 ```.taskrc
 uda.taskwarrior-tui.sync-issue.command=~/bin/sync-linear-issue --task
